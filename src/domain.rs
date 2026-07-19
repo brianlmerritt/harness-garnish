@@ -385,6 +385,35 @@ pub struct SchedulerTick {
     pub capacity: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct SchedulerDaemonConfig {
+    pub instance_id: String,
+    pub hostname: String,
+    pub adapter: String,
+    pub provider: String,
+    pub account: String,
+    pub max_active_claims: usize,
+    pub poll_interval: std::time::Duration,
+    pub leader_ttl: std::time::Duration,
+    pub claim_ttl: std::time::Duration,
+    pub max_ticks: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerDaemonSummary {
+    pub instance_id: String,
+    pub leader_generation: i64,
+    pub started_at: DateTime<Utc>,
+    pub stopped_at: DateTime<Utc>,
+    pub ticks: usize,
+    pub claims_created: usize,
+    pub claims_renewed: usize,
+    pub scheduler_claims_recovered: usize,
+    pub run_leases_recovered: usize,
+    pub released_task_ids: Vec<String>,
+    pub shutdown_reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {
     pub run_id: String,

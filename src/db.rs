@@ -33,6 +33,7 @@ impl Database {
         }
         let conn = Connection::open(&path)
             .with_context(|| format!("opening database {}", path.display()))?;
+        secure_database_file(&path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -80,6 +81,7 @@ impl Database {
             .with_extension(format!("v{version}.{stamp}.backup.db"));
         self.conn
             .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+        secure_database_file(&backup)?;
         let check = Connection::open(&backup)?;
         let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         if integrity != "ok" {
@@ -701,6 +703,43 @@ impl Database {
             |row| row.get(0),
         )?;
         usize::try_from(count).map_err(Into::into)
+    }
+
+    pub fn heartbeat_scheduler_claims(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+    ) -> Result<usize> {
+        let expires_at =
+            now + chrono::Duration::from_std(ttl).context("scheduler claim TTL is too large")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_scheduler_leader_tx(&tx, instance_id, leader_generation, now)?;
+        expire_scheduler_claims_tx(&tx, now)?;
+        let changed = tx.execute(
+            "UPDATE scheduler_claims SET expires_at = ?4
+             WHERE instance_id = ?1 AND leader_generation = ?2
+               AND status = 'active' AND expires_at > ?3",
+            params![
+                instance_id,
+                leader_generation,
+                now.to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            "UPDATE resource_locks SET expires_at = ?3
+             WHERE claim_id IN (
+                 SELECT id FROM scheduler_claims
+                 WHERE instance_id = ?1 AND leader_generation = ?2 AND status = 'active'
+             ) AND released_at IS NULL",
+            params![instance_id, leader_generation, expires_at.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(changed)
     }
 
     pub fn recover_expired_scheduler_claims(&mut self, now: DateTime<Utc>) -> Result<Vec<String>> {
@@ -1423,6 +1462,18 @@ impl Database {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn secure_database_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_database_file(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn validate_percentage(value: Option<f64>, label: &str) -> Result<()> {

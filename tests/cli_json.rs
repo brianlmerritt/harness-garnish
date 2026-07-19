@@ -83,3 +83,38 @@ fn cli_success_and_failure_are_stable_json() {
     assert_eq!(value["ok"], false);
     assert!(value["error"].as_str().unwrap().contains("task not found"));
 }
+
+#[test]
+fn scheduler_daemon_can_run_one_diagnostic_tick_and_stop_cleanly() {
+    let dir = tempdir().unwrap();
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "scheduler",
+            "daemon",
+            "--instance",
+            "cli-daemon",
+            "--hostname",
+            "fixture",
+            "--poll-milliseconds",
+            "1",
+            "--leader-ttl-seconds",
+            "2",
+            "--claim-ttl-seconds",
+            "2",
+            "--max-ticks",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["instance_id"], "cli-daemon");
+    assert_eq!(value["ticks"], 1);
+    assert_eq!(value["shutdown_reason"], "max_ticks");
+}

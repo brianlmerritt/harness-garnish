@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "error: this checkpoint must run on Linux" >&2
+  exit 1
+fi
+
+if [[ "$(id -u)" == "0" ]]; then
+  echo "error: run the Linux checkpoint as the dedicated non-root user" >&2
+  exit 1
+fi
+
+test_state_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$test_state_dir"
+}
+trap cleanup EXIT
+
+echo "kernel: $(uname -srmo)"
+echo "rustc: $(rustc --version)"
+echo "cargo: $(cargo --version)"
+
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build --locked
+cargo test --workspace
+
+target/debug/garnish --data-dir "$test_state_dir/state" init
+target/debug/garnish \
+  --data-dir "$test_state_dir/state" \
+  scheduler daemon \
+  --instance linux-bounded \
+  --hostname "$(hostname)" \
+  --poll-milliseconds 50 \
+  --leader-ttl-seconds 2 \
+  --claim-ttl-seconds 2 \
+  --max-ticks 2
+
+timeout --preserve-status --signal=TERM 1s \
+  target/debug/garnish \
+  --data-dir "$test_state_dir/signal-state" \
+  scheduler daemon \
+  --instance linux-signal \
+  --hostname "$(hostname)" \
+  --poll-milliseconds 50 \
+  --leader-ttl-seconds 2 \
+  --claim-ttl-seconds 2
+
+data_mode="$(stat -c '%a' "$test_state_dir/state")"
+database_mode="$(stat -c '%a' "$test_state_dir/state/state.db")"
+[[ "$data_mode" == "700" ]]
+[[ "$database_mode" == "600" ]]
+echo "state permissions: directory=$data_mode database=$database_mode"
+
+if command -v podman >/dev/null 2>&1; then
+  podman info >/dev/null
+  rootless="$(podman info --format '{{.Host.Security.Rootless}}')"
+  [[ "$rootless" == "true" ]]
+  echo "podman: healthy rootless runtime"
+else
+  echo "podman: not installed (runtime probe skipped)"
+fi
+
+if command -v docker >/dev/null 2>&1; then
+  if docker info >/dev/null 2>&1; then
+    echo "docker: healthy runtime"
+  else
+    echo "docker: client present but daemon unavailable"
+  fi
+else
+  echo "docker: not installed (runtime probe skipped)"
+fi
+
+echo "Linux midpoint checkpoint passed"

@@ -4,7 +4,8 @@ use crate::{
     domain::{
         CalendarException, CalendarProfile, DayKind, NewTask, Project, ProjectLink, QuotaSurface,
         RouteCandidate, RouteDecision, RunSummary, ScheduleEvaluation, SchedulerClaim,
-        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
+        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
+        SchedulerTick, SchedulerWake, Task, TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -18,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use ulid::Ulid;
 
@@ -39,6 +41,7 @@ impl Garnish {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
+        secure_directory(&data_dir)?;
         let db = Database::open(data_dir.join("state.db"))?;
         Ok(Self {
             data_dir,
@@ -412,6 +415,125 @@ impl Garnish {
         self.db.scheduler_wakes()
     }
 
+    pub fn run_scheduler_daemon(
+        &mut self,
+        config: &SchedulerDaemonConfig,
+        shutdown: &AtomicBool,
+    ) -> Result<SchedulerDaemonSummary> {
+        self.run_scheduler_daemon_with(config, shutdown, Utc::now, std::thread::sleep)
+    }
+
+    fn run_scheduler_daemon_with<N, S>(
+        &mut self,
+        config: &SchedulerDaemonConfig,
+        shutdown: &AtomicBool,
+        mut now: N,
+        mut sleep: S,
+    ) -> Result<SchedulerDaemonSummary>
+    where
+        N: FnMut() -> DateTime<Utc>,
+        S: FnMut(std::time::Duration),
+    {
+        if config.max_active_claims == 0 {
+            bail!("scheduler concurrency limit must be greater than zero");
+        }
+        if config.poll_interval.is_zero()
+            || config.leader_ttl.is_zero()
+            || config.claim_ttl.is_zero()
+        {
+            bail!("scheduler poll interval and TTLs must be greater than zero");
+        }
+        if config.leader_ttl <= config.poll_interval {
+            bail!("scheduler leader TTL must be greater than the poll interval");
+        }
+        if config.claim_ttl <= config.poll_interval {
+            bail!("scheduler claim TTL must be greater than the poll interval");
+        }
+        if config.max_ticks == Some(0) {
+            bail!("scheduler max ticks must be greater than zero when specified");
+        }
+
+        let started_at = now();
+        self.register_scheduler(
+            &config.instance_id,
+            &config.hostname,
+            std::process::id(),
+            started_at,
+        )?;
+        let leader =
+            self.acquire_scheduler_leader(&config.instance_id, started_at, config.leader_ttl)?;
+        let mut ticks = 0;
+        let mut claims_created = 0;
+        let mut claims_renewed = 0;
+        let mut scheduler_claims_recovered = self.recover_scheduler(started_at)?.len();
+        let mut run_leases_recovered = self.recover_at(started_at)?.len();
+        let mut shutdown_reason = "signal".to_owned();
+
+        let loop_result: Result<()> = (|| {
+            loop {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let tick_at = now();
+                self.heartbeat_scheduler_leader(
+                    &config.instance_id,
+                    leader.generation,
+                    tick_at,
+                    config.leader_ttl,
+                )?;
+                claims_renewed += self.db.heartbeat_scheduler_claims(
+                    &config.instance_id,
+                    leader.generation,
+                    tick_at,
+                    config.claim_ttl,
+                )?;
+                scheduler_claims_recovered += self.recover_scheduler(tick_at)?.len();
+                run_leases_recovered += self.recover_at(tick_at)?.len();
+                let tick = self.scheduler_tick_at(
+                    &config.instance_id,
+                    leader.generation,
+                    &config.adapter,
+                    &config.provider,
+                    &config.account,
+                    tick_at,
+                    config.max_active_claims,
+                    config.claim_ttl,
+                )?;
+                ticks += 1;
+                claims_created += tick.claims.len();
+                if config.max_ticks.is_some_and(|limit| ticks >= limit) {
+                    shutdown_reason = "max_ticks".to_owned();
+                    break;
+                }
+                sleep(config.poll_interval);
+            }
+            Ok(())
+        })();
+
+        let stopped_at = now();
+        let stop_result = self.stop_scheduler(&config.instance_id, stopped_at);
+        match (loop_result, stop_result) {
+            (Err(error), Ok(_)) => Err(error),
+            (Err(error), Err(stop_error)) => {
+                Err(error.context(format!("also failed to stop scheduler: {stop_error:#}")))
+            }
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(released_task_ids)) => Ok(SchedulerDaemonSummary {
+                instance_id: config.instance_id.clone(),
+                leader_generation: leader.generation,
+                started_at,
+                stopped_at,
+                ticks,
+                claims_created,
+                claims_renewed,
+                scheduler_claims_recovered,
+                run_leases_recovered,
+                released_task_ids,
+                shutdown_reason,
+            }),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn scheduler_tick_at(
         &mut self,
@@ -747,7 +869,11 @@ impl Garnish {
     }
 
     pub fn recover(&mut self) -> Result<Vec<String>> {
-        let recovered = self.db.recover_expired_leases(Utc::now())?;
+        self.recover_at(Utc::now())
+    }
+
+    pub fn recover_at(&mut self, now: DateTime<Utc>) -> Result<Vec<String>> {
+        let recovered = self.db.recover_expired_leases(now)?;
         for task_id in &recovered {
             let task = self.db.task(task_id)?;
             let project = self.db.project(&task.project_id)?;
@@ -797,6 +923,18 @@ fn validate_slug(slug: &str) -> Result<()> {
     {
         bail!("project slug must contain only lowercase ASCII letters, digits, and hyphens");
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -1083,5 +1221,93 @@ mod tests {
         assert_eq!(wakes.len(), 1);
         assert_eq!(wakes[0].task_id, off_task.id);
         assert_eq!(wakes[0].reason_code, "schedule.ineligible_workday");
+    }
+
+    #[test]
+    fn daemon_renews_claims_and_requeues_them_on_bounded_shutdown() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fake",
+                None,
+            )
+            .unwrap();
+        let config = SchedulerDaemonConfig {
+            instance_id: "daemon-test".into(),
+            hostname: "fixture".into(),
+            adapter: "fake".into(),
+            provider: "fake".into(),
+            account: "test".into(),
+            max_active_claims: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            leader_ttl: std::time::Duration::from_secs(10),
+            claim_ttl: std::time::Duration::from_secs(10),
+            max_ticks: Some(2),
+        };
+        let shutdown = AtomicBool::new(false);
+        let mut instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let summary = garnish
+            .run_scheduler_daemon_with(
+                &config,
+                &shutdown,
+                || {
+                    let current = instant;
+                    instant += Duration::seconds(1);
+                    current
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(summary.ticks, 2);
+        assert_eq!(summary.claims_created, 1);
+        assert_eq!(summary.claims_renewed, 1);
+        assert_eq!(summary.released_task_ids, vec![task.id.clone()]);
+        assert_eq!(summary.shutdown_reason, "max_ticks");
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_directory_and_database_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let data = dir.path().join("data");
+        Garnish::open(&data).unwrap();
+        assert_eq!(
+            fs::metadata(&data).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(data.join("state.db"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        for entry in fs::read_dir(&data).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                assert_eq!(
+                    entry.metadata().unwrap().permissions().mode() & 0o077,
+                    0,
+                    "{} was accessible outside the owning user",
+                    entry.path().display()
+                );
+            }
+        }
     }
 }

@@ -78,6 +78,24 @@ garnish --data-dir .garnish-state scheduler wakes
 
 Leadership is fenced by a monotonically increasing generation. Claims, concurrency checks, and project locks commit atomically; a stale leader cannot claim work.
 
+The continuous daemon owns and renews both the leader lease and its task claims. `TERM` or `INT` requests a bounded graceful stop that releases its claims and returns not-yet-started tasks to `ready`:
+
+```console
+garnish --data-dir .garnish-state scheduler daemon --instance local-1 --hostname my-mac
+```
+
+Claim-to-run execution remains the next Phase 2 milestone, so this daemon currently arbitrates and holds eligible work but does not launch an agent. `--max-ticks` provides a bounded diagnostic run.
+
+### Linux midpoint checkpoint
+
+After cloning the repository on an Ubuntu or Debian host, run the quota-free Linux checkpoint as a dedicated non-root user:
+
+```console
+./scripts/test-linux-midpoint
+```
+
+It runs formatting, lint, build and tests; exercises bounded and signal-driven daemon shutdown; verifies private state permissions; and reports rootless Podman and Docker health when installed. A container runtime is optional for this checkpoint, but rootless Podman conformance will be required before Linux runtime support is claimed.
+
 ## Repository authority
 
 The user manages branches and commits for this repository. Agents may edit the current checkout when explicitly asked, but must not create or switch branches, commit, push, open pull requests, merge, or alter remotes.

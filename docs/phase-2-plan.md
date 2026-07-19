@@ -59,6 +59,14 @@ Calendar examples:
 - WSL2 exit: before Phase 2 exit, run the WSL2 bundle for mounted-path policy, process cleanup, restart recovery, and runtime selection.
 - Native Windows is not a Phase 2 target; WSL2 is the Windows execution environment.
 
+## Current implementation checkpoint
+
+- Schema migrations, calendar scheduling, deterministic ready-set routing, leader fencing, atomic task claims, global concurrency, and exclusive project locks are implemented.
+- The local daemon now renews leadership and active claims, performs scheduler/run-lease recovery, handles `TERM`/`INT`, and releases unstarted claims on graceful shutdown.
+- State directories and SQLite database files are restricted to the owning user on Unix.
+- `scripts/test-linux-midpoint` is the reproducible Linux proof bundle. The Linux milestone remains pending until its output is captured on Ubuntu or Debian.
+- Claim-to-run execution, checkpoint supervision, retries/circuit breakers, and live-change responses remain pending.
+
 ## Explicit non-goals
 
 Phase 2 does not enable real API spending, remote workers, Tailscale/SSH approvals, automatic updates, or autonomous Git integration. Real provider and AoE smoke tests remain individually opt-in.

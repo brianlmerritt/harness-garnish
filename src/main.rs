@@ -4,11 +4,18 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use harness_garnish::{
     Garnish,
     adapters::AgentKind,
-    domain::{DayAffinity, DayKind, NewTask},
+    domain::{DayAffinity, DayKind, NewTask, SchedulerDaemonConfig},
 };
 use serde::Serialize;
 use serde_json::json;
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::PathBuf,
+    str::FromStr,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration as StdDuration,
+};
+
+static SCHEDULER_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
 #[command(
@@ -207,6 +214,7 @@ enum ScheduleCommand {
 
 #[derive(Subcommand)]
 enum SchedulerCommand {
+    Daemon(SchedulerDaemonArgs),
     Register {
         #[arg(long)]
         instance: String,
@@ -254,6 +262,33 @@ enum SchedulerCommand {
         instance: String,
     },
     Wakes,
+}
+
+#[derive(Args)]
+struct SchedulerDaemonArgs {
+    #[arg(long)]
+    instance: String,
+    #[arg(long, default_value = "local")]
+    hostname: String,
+    #[arg(long, default_value = "fake")]
+    adapter: String,
+    #[arg(long, default_value = "fake")]
+    provider: String,
+    #[arg(long, default_value = "default")]
+    account: String,
+    #[arg(long, default_value_t = 1)]
+    max_active: usize,
+    #[arg(long, default_value_t = 1000)]
+    poll_milliseconds: u64,
+    #[arg(long, default_value_t = 30)]
+    leader_ttl_seconds: u64,
+    #[arg(long, default_value_t = 300)]
+    claim_ttl_seconds: u64,
+    #[arg(
+        long,
+        help = "Stop cleanly after this many ticks (primarily for diagnostics)"
+    )]
+    max_ticks: Option<usize>,
 }
 
 #[derive(Args)]
@@ -492,6 +527,23 @@ fn run() -> Result<()> {
             }
         },
         Command::Scheduler { command } => match command {
+            SchedulerCommand::Daemon(args) => {
+                SCHEDULER_SHUTDOWN.store(false, Ordering::SeqCst);
+                install_scheduler_signal_handlers()?;
+                let config = SchedulerDaemonConfig {
+                    instance_id: args.instance,
+                    hostname: args.hostname,
+                    adapter: args.adapter,
+                    provider: args.provider,
+                    account: args.account,
+                    max_active_claims: args.max_active,
+                    poll_interval: StdDuration::from_millis(args.poll_milliseconds),
+                    leader_ttl: StdDuration::from_secs(args.leader_ttl_seconds),
+                    claim_ttl: StdDuration::from_secs(args.claim_ttl_seconds),
+                    max_ticks: args.max_ticks,
+                };
+                print_json(&garnish.run_scheduler_daemon(&config, &SCHEDULER_SHUTDOWN)?)
+            }
             SchedulerCommand::Register { instance, hostname } => {
                 let now = Utc::now();
                 garnish.register_scheduler(&instance, &hostname, std::process::id(), now)?;
@@ -618,5 +670,34 @@ fn parse_optional_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
 
 fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+#[cfg(unix)]
+extern "C" fn scheduler_signal_handler(_signal: libc::c_int) {
+    SCHEDULER_SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+fn install_scheduler_signal_handlers() -> Result<()> {
+    // SAFETY: the handler only performs an atomic store, which is async-signal-safe.
+    unsafe {
+        if libc::signal(
+            libc::SIGINT,
+            scheduler_signal_handler as *const () as libc::sighandler_t,
+        ) == libc::SIG_ERR
+            || libc::signal(
+                libc::SIGTERM,
+                scheduler_signal_handler as *const () as libc::sighandler_t,
+            ) == libc::SIG_ERR
+        {
+            bail!("failed to install scheduler shutdown signal handlers");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_scheduler_signal_handlers() -> Result<()> {
     Ok(())
 }
