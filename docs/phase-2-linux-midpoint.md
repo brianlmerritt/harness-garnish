@@ -21,3 +21,7 @@ The Linux scheduler/daemon midpoint passed on a user-provided VPS on 2026-07-19.
 Neither Podman nor Docker was installed on the VPS, so the script recorded both runtime probes as skipped. This does not invalidate the scheduler, signal, process-cleanup, filesystem-permission, or restart midpoint. It does mean Harness Garnish does not yet claim Linux container-runtime conformance. Rootless Podman and/or Docker capability and sandbox conformance must be run later on a host where the selected runtime is installed.
 
 The opt-in real-Docker test remained ignored by design because no healthy daemon and digest-pinned fixture image were supplied.
+
+## Podman follow-up
+
+A follow-up run used Linux `6.8.0-107-generic` on `x86_64` with Rust/Cargo `1.97.1`. It exposed a Linux timing race in the quota-free adapter fixture: the fixture exited without consuming Codex's stdin prompt, so the supervisor correctly reported `EPIPE`. The fixture now drains stdin before returning its result; the focused regression, full suite, formatting, and lint all pass locally. The follow-up run stopped before reaching the Podman probe, so rootless Podman evidence remains pending until the corrected fixture is rerun on the VPS.

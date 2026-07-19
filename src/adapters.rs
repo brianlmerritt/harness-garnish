@@ -1015,7 +1015,7 @@ mod tests {
         let executable = dir.path().join("fake-agent");
         fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"fixture\":true}'\n",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"result\",\"fixture\":true}'\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
