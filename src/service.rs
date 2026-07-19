@@ -2,16 +2,18 @@ use crate::{
     adapters::{AgentKind, FakeSandbox, ProbeResult, probe_aoe, probe_docker, safe_write},
     db::Database,
     domain::{
-        NewTask, Project, ProjectLink, QuotaSurface, RouteCandidate, RouteDecision, RunSummary,
-        Task, TaskStatus,
+        CalendarException, CalendarProfile, DayKind, NewTask, Project, ProjectLink, QuotaSurface,
+        RouteCandidate, RouteDecision, RunSummary, ScheduleEvaluation, SchedulerPreview, Task,
+        TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
     policy::{EffectivePolicy, PolicyDecision},
     projections::Projector,
+    schedule,
 };
 use anyhow::{Result, bail};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -56,7 +58,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 1,
+            schema_version: 2,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -91,6 +93,45 @@ impl Garnish {
 
     pub fn project_links(&self) -> Result<Vec<ProjectLink>> {
         self.db.list_project_links()
+    }
+
+    pub fn configure_calendar(
+        &mut self,
+        slug: &str,
+        timezone: &str,
+        weekly_pattern: &str,
+    ) -> Result<CalendarProfile> {
+        self.db.configure_calendar(slug, timezone, weekly_pattern)
+    }
+
+    pub fn assign_project_calendar(
+        &mut self,
+        project: &str,
+        calendar: &str,
+    ) -> Result<CalendarProfile> {
+        self.db.assign_project_calendar(project, calendar)
+    }
+
+    pub fn set_calendar_exception(
+        &mut self,
+        calendar: &str,
+        local_date: NaiveDate,
+        day_kind: DayKind,
+        reason: &str,
+    ) -> Result<CalendarException> {
+        self.db
+            .set_calendar_exception(calendar, local_date, day_kind, reason)
+    }
+
+    pub fn evaluate_task_schedule_at(
+        &self,
+        task_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduleEvaluation> {
+        let task = self.db.task(task_id)?;
+        let calendar = self.db.project_calendar(&task.project_id)?;
+        let exceptions = self.db.calendar_exceptions(&calendar.id)?;
+        schedule::evaluate(&calendar, &exceptions, task.day_affinity, now)
     }
 
     pub fn add_task(&mut self, task: &NewTask) -> Result<Task> {
@@ -186,6 +227,17 @@ impl Garnish {
         provider: &str,
         account: &str,
     ) -> Result<RouteDecision> {
+        self.route_task_at(task_id, adapter, provider, account, Utc::now())
+    }
+
+    pub fn route_task_at(
+        &mut self,
+        task_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RouteDecision> {
         let task = self.db.task(task_id)?;
         if task.status != TaskStatus::Ready {
             bail!(
@@ -196,6 +248,7 @@ impl Garnish {
         if !self.db.dependencies_satisfied(task_id)? {
             bail!("task dependencies are not complete");
         }
+        let schedule = self.evaluate_task_schedule_at(task_id, now)?;
         let quota: Vec<_> = self
             .db
             .list_quota()?
@@ -207,7 +260,7 @@ impl Garnish {
             .iter()
             .map(|surface| surface.reserve_percent + forecast)
             .fold(self.policy.reserve_percent + forecast, f64::max);
-        let (allowed, reason) = if quota.is_empty() {
+        let (quota_allowed, quota_reason) = if quota.is_empty() {
             (
                 self.policy.unknown_quota_unattended,
                 "no quota surfaces are available for the selected account".to_owned(),
@@ -238,10 +291,28 @@ impl Garnish {
                 "all quota surfaces satisfy reserve plus forecast".to_owned(),
             )
         };
+        let allowed = schedule.eligible && quota_allowed;
+        let reason = if !schedule.eligible {
+            format!(
+                "{}: task affinity {} does not match {} day {}",
+                schedule.reason_code, schedule.affinity, schedule.day_kind, schedule.local_date
+            )
+        } else {
+            quota_reason
+        };
         let selected_adapter = allowed.then(|| adapter.to_owned());
-        let next_wake_at = (!allowed)
-            .then(|| quota.iter().filter_map(|surface| surface.reset_at).min())
+        let quota_wake = (!quota_allowed)
+            .then(|| quota.iter().filter_map(|surface| surface.reset_at).max())
             .flatten();
+        let schedule_wake = (!schedule.eligible)
+            .then_some(schedule.next_eligible_at)
+            .flatten();
+        let next_wake_at = match (schedule_wake, quota_wake) {
+            (Some(schedule), Some(quota)) => Some(schedule.max(quota)),
+            (Some(schedule), None) => Some(schedule),
+            (None, Some(quota)) => Some(quota),
+            (None, None) => None,
+        };
         let minimum_effective_remaining_percent = quota
             .iter()
             .filter_map(|surface| surface.effective_remaining_percent)
@@ -263,12 +334,39 @@ impl Garnish {
                 minimum_effective_remaining_percent,
             }],
             next_wake_at,
+            schedule: Some(schedule),
             quota,
             policy_hash: self.policy.hash(),
-            created_at: Utc::now(),
+            created_at: now,
         };
         self.db.record_route(&decision)?;
         Ok(decision)
+    }
+
+    pub fn scheduler_preview_at(
+        &mut self,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SchedulerPreview> {
+        let ready = self
+            .db
+            .list_tasks(None)?
+            .into_iter()
+            .filter(|task| task.status == TaskStatus::Ready)
+            .collect::<Vec<_>>();
+        let mut decisions = Vec::with_capacity(ready.len());
+        for task in ready {
+            decisions.push(self.route_task_at(&task.id, adapter, provider, account, now)?);
+        }
+        Ok(SchedulerPreview {
+            evaluated_at: now,
+            adapter: adapter.into(),
+            provider: provider.into(),
+            account: account.into(),
+            decisions,
+        })
     }
 
     pub fn run_task(
@@ -632,6 +730,7 @@ mod tests {
             estimated_seconds: 60,
             uncertainty_percent: 20,
             checkpoint_seconds: 60,
+            day_affinity: crate::domain::DayAffinity::Both,
             fake_write_path: Some("result.txt".into()),
             fake_write_content: Some("done\n".into()),
         }
@@ -731,5 +830,98 @@ mod tests {
                 .join(&task.id)
                 .exists()
         );
+    }
+
+    #[test]
+    fn project_calendar_and_exception_control_task_day_eligibility() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        garnish
+            .configure_calendar("uk-week", "Europe/London", "WWWWWOO")
+            .unwrap();
+        garnish
+            .assign_project_calendar(&project.id, "uk-week")
+            .unwrap();
+        let mut scheduled = task(project.id);
+        scheduled.day_affinity = crate::domain::DayAffinity::Off;
+        let scheduled = garnish.add_task(&scheduled).unwrap();
+        let monday = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let ordinary = garnish
+            .evaluate_task_schedule_at(&scheduled.id, monday)
+            .unwrap();
+        assert!(!ordinary.eligible);
+        assert_eq!(ordinary.reason_code, "schedule.ineligible_workday");
+        assert_eq!(
+            ordinary.next_eligible_at,
+            Some(chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 24, 23, 0, 0).unwrap())
+        );
+        garnish
+            .set_calendar_exception(
+                "uk-week",
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap(),
+                DayKind::Off,
+                "annual leave",
+            )
+            .unwrap();
+        let exception = garnish
+            .evaluate_task_schedule_at(&scheduled.id, monday)
+            .unwrap();
+        assert!(exception.eligible);
+        assert_eq!(exception.day_source, "exception:annual leave");
+    }
+
+    #[test]
+    fn scheduler_preview_is_priority_ordered_and_day_aware() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        garnish
+            .configure_calendar("uk-week", "Europe/London", "WWWWWOO")
+            .unwrap();
+        garnish
+            .assign_project_calendar(&project.id, "uk-week")
+            .unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let mut work_task = task(project.id.clone());
+        work_task.title = "workday task".into();
+        work_task.priority = 20;
+        work_task.day_affinity = crate::domain::DayAffinity::Work;
+        let work_task = garnish.add_task(&work_task).unwrap();
+        let mut off_task = task(project.id);
+        off_task.title = "off-day task".into();
+        off_task.priority = 10;
+        off_task.day_affinity = crate::domain::DayAffinity::Off;
+        let off_task = garnish.add_task(&off_task).unwrap();
+        let monday = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let preview = garnish
+            .scheduler_preview_at("fake", "fake", "test", monday)
+            .unwrap();
+        assert_eq!(preview.decisions.len(), 2);
+        assert_eq!(preview.decisions[0].task_id, work_task.id);
+        assert!(preview.decisions[0].allowed);
+        assert_eq!(preview.decisions[1].task_id, off_task.id);
+        assert!(!preview.decisions[1].allowed);
+        assert!(
+            preview.decisions[1]
+                .reason
+                .starts_with("schedule.ineligible_workday")
+        );
+        assert!(preview.decisions[1].next_wake_at.is_some());
     }
 }

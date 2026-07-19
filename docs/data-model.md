@@ -16,6 +16,8 @@
 ```mermaid
 erDiagram
     PROJECT ||--o{ TASK : owns
+    CALENDAR_PROFILE ||--o{ PROJECT : schedules
+    CALENDAR_PROFILE ||--o{ CALENDAR_EXCEPTION : overrides
     PROJECT ||--o{ PROJECT_REPOSITORY : contains
     PROJECT ||--o{ POLICY_REVISION : governed_by
     PROJECT ||--o{ API_BUDGET : permits
@@ -62,6 +64,7 @@ Required fields:
 - intent: `title`, `goal`, `rationale`, `scope_json`, `non_scope_json`;
 - contract: `acceptance_json`, `verification_commands_json`;
 - scheduling: `priority`, `deadline_at`, `deadline_timezone`, `expected_benefit`, `risk_class`;
+- day scheduling: `day_affinity` (`W`, `O`, or `B`; default `B`) resolved against the project's calendar profile;
 - forecast: `estimated_wall_seconds_low/high`, `uncertainty`, `expected_context_bytes`, `checkpoint_strategy_json`, `checkpoint_max_seconds`;
 - constraints: allowed/disallowed agents, models, skills, MCP servers, networks, secret references, path globs, commands, and backends as validated JSON or normalised child tables;
 - Git: worktree, branch, base/head commit, repository/submodule revision manifest;
@@ -75,6 +78,14 @@ Required fields:
 ### `task_dependencies`
 
 `task_id`, `depends_on_task_id`, `kind`, `created_at` with a unique pair and no self-edge. Adding an edge performs cycle detection in the same transaction.
+
+### `calendar_profiles` and `calendar_exceptions`
+
+`calendar_profiles`: `id`, `slug`, `timezone`, `weekly_pattern`, `created_at`, `updated_at`, `version`. `weekly_pattern` contains seven `W`/`O` characters ordered Monday through Sunday and defaults to `WWWWWOO`.
+
+`calendar_exceptions`: `profile_id`, `local_date`, `day_kind`, `reason`, `created_at`, with a unique profile/date pair. An exception overrides the weekly class for exactly one date. Projects reference a calendar profile; the global default is used when no project-specific selection exists.
+
+Scheduler decisions retain the profile ID/version, timezone, local date, resolved class, exception reference where applicable, task affinity, eligibility reason, and next eligible UTC instant so later calendar edits cannot rewrite history.
 
 ### `runs`
 
@@ -212,4 +223,3 @@ Only documented fields in `PROJECT.md` and `MEMORY.md` are importable initially.
 - Export includes schema/version manifest, database backup, selected artifacts, projection hashes, and checksums. Encryption is mandatory when secrets could be inferred from metadata or logs.
 - Default retention keeps task summaries, patches, decisions, verification, approvals, quota rationale, and digests; verbose terminal logs rotate and age out according to policy.
 - Deletion is a Class 3 effect when it removes persistent evidence still inside retention.
-

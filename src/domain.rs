@@ -4,6 +4,107 @@ use std::{fmt, str::FromStr};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DayKind {
+    #[serde(rename = "W")]
+    Work,
+    #[serde(rename = "O")]
+    Off,
+}
+
+impl fmt::Display for DayKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Work => "W",
+            Self::Off => "O",
+        })
+    }
+}
+
+impl FromStr for DayKind {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_uppercase().as_str() {
+            "W" => Ok(Self::Work),
+            "O" => Ok(Self::Off),
+            _ => Err(DomainError::InvalidSchedule(
+                "day kind must be W or O".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DayAffinity {
+    #[serde(rename = "W")]
+    Work,
+    #[serde(rename = "O")]
+    Off,
+    #[serde(rename = "B")]
+    Both,
+}
+
+impl fmt::Display for DayAffinity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Work => "W",
+            Self::Off => "O",
+            Self::Both => "B",
+        })
+    }
+}
+
+impl FromStr for DayAffinity {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_uppercase().as_str() {
+            "W" => Ok(Self::Work),
+            "O" => Ok(Self::Off),
+            "B" => Ok(Self::Both),
+            _ => Err(DomainError::InvalidSchedule(
+                "day affinity must be W, O, or B".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarProfile {
+    pub id: String,
+    pub slug: String,
+    pub timezone: String,
+    pub weekly_pattern: String,
+    pub version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarException {
+    pub profile_id: String,
+    pub local_date: chrono::NaiveDate,
+    pub day_kind: DayKind,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleEvaluation {
+    pub profile_id: String,
+    pub profile_version: i64,
+    pub timezone: String,
+    pub evaluated_at: DateTime<Utc>,
+    pub local_date: chrono::NaiveDate,
+    pub day_kind: DayKind,
+    pub day_source: String,
+    pub affinity: DayAffinity,
+    pub eligible: bool,
+    pub reason_code: String,
+    pub next_eligible_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Draft,
@@ -118,6 +219,7 @@ pub struct Task {
     pub estimated_seconds: u64,
     pub uncertainty_percent: u8,
     pub checkpoint_seconds: u64,
+    pub day_affinity: DayAffinity,
     pub fake_write_path: Option<String>,
     pub fake_write_content: Option<String>,
     pub status: TaskStatus,
@@ -142,6 +244,7 @@ pub struct NewTask {
     pub estimated_seconds: u64,
     pub uncertainty_percent: u8,
     pub checkpoint_seconds: u64,
+    pub day_affinity: DayAffinity,
     pub fake_write_path: Option<String>,
     pub fake_write_content: Option<String>,
 }
@@ -217,6 +320,7 @@ pub struct RouteDecision {
     pub quota: Vec<QuotaSurface>,
     pub candidates: Vec<RouteCandidate>,
     pub next_wake_at: Option<DateTime<Utc>>,
+    pub schedule: Option<ScheduleEvaluation>,
     pub policy_hash: String,
     pub created_at: DateTime<Utc>,
 }
@@ -230,6 +334,15 @@ pub struct RouteCandidate {
     pub filter_reason: String,
     pub forecast_percent: f64,
     pub minimum_effective_remaining_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerPreview {
+    pub evaluated_at: DateTime<Utc>,
+    pub adapter: String,
+    pub provider: String,
+    pub account: String,
+    pub decisions: Vec<RouteDecision>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,6 +367,8 @@ pub enum DomainError {
     InvalidTask(String),
     #[error("invalid task status: {0}")]
     InvalidTaskStatus(String),
+    #[error("invalid schedule: {0}")]
+    InvalidSchedule(String),
     #[error("illegal task transition: {from} -> {to}")]
     IllegalTransition { from: TaskStatus, to: TaskStatus },
     #[error("dependency cycle detected")]

@@ -65,6 +65,7 @@ fn task(
         estimated_seconds: 60,
         uncertainty_percent: 20,
         checkpoint_seconds: 60,
+        day_affinity: harness_garnish::domain::DayAffinity::Both,
         fake_write_path: Some(write_path.into()),
         fake_write_content: Some("done\n".into()),
     }

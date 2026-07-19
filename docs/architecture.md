@@ -142,6 +142,12 @@ The scheduler calculates the ready set from status, dependencies, project pause,
 
 Manual pinning is a hard preference only if all safety filters pass. Paid API fallback is never automatic unless the project explicitly enables the provider and budget.
 
+### Day-aware calendars
+
+Each project selects a calendar profile with an IANA timezone and a Monday-to-Sunday `W`/`O` weekly pattern. Tasks declare affinity `W` (workdays), `O` (off days), or `B` (both). Dated exceptions override the weekly class for holidays, leave, or unusual working days. The scheduler records the resolved local date, calendar source, day class, task affinity, eligibility, and next eligible instant.
+
+Calendar changes re-evaluate queued work immediately. A running task that becomes day-ineligible checkpoints and pauses at its next safe checkpoint; day rollover alone does not cause an abrupt kill.
+
 ## Quota model and live changes
 
 A subscription/account may expose several simultaneous surfaces, such as five-hour and weekly percentages plus monthly credits. Each is evaluated independently. User overrides create a new effective layer and never alter the observed snapshot.
@@ -194,4 +200,3 @@ Each registered project may contain `.harness-garnish/PROJECT.md`, `MEMORY.md`, 
 ## Updates
 
 `garnish update check` verifies signed metadata without changing the installation. Manual activation is default. Automatic mode may stage a compatible release, then activate only when no unsafe run is active. It creates a database backup, applies migrations transactionally where possible, runs a health check, and rolls back binary/schema compatibility on failure. Update events and provenance are retained.
-

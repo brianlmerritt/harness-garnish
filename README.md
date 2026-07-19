@@ -4,6 +4,8 @@ Harness Garnish is a local control plane for quota-aware, policy-controlled AI-a
 
 Phase 0 established the architecture under [`docs/`](docs/README.md). The Phase 1 Rust vertical slice is now implemented and locally verified; its exact evidence, limitations, and deferred smoke tests are recorded in [`docs/phase-1-exit-report.md`](docs/phase-1-exit-report.md).
 
+Phase 2 is in progress. Its durable-scheduler design now includes timezone-aware work/off calendars, `W`/`O`/`B` task affinity, dated calendar exceptions, and explicit Linux/WSL2 proof milestones in [`docs/phase-2-plan.md`](docs/phase-2-plan.md).
+
 ## Confirmed direction
 
 - `garnish` will be a small Rust control plane with SQLite as canonical state.
@@ -50,6 +52,20 @@ garnish --data-dir .garnish-state task add --project example --title "Bounded ch
 ```
 
 `task run` is deliberately limited to deterministic fake adapters in the normal path. Real Codex, Claude Code, Antigravity, AoE, and runtime smoke tests remain individually opt-in and are never part of default CI.
+
+### Day-aware scheduling
+
+Weekly patterns are Monday through Sunday. `W` means a user workday and `O` an off day; the default is `WWWWWOO`. Tasks use `--day-affinity W`, `O`, or `B` (both, the default).
+
+```console
+garnish --data-dir .garnish-state schedule configure --slug uk-week --timezone Europe/London --weekly-pattern WWWWWOO
+garnish --data-dir .garnish-state schedule assign --project example --calendar uk-week
+garnish --data-dir .garnish-state schedule exception --calendar uk-week --date 2026-12-25 --kind O --reason "holiday"
+garnish --data-dir .garnish-state schedule evaluate --task TASK_ID
+garnish --data-dir .garnish-state schedule preview --provider fake --account test
+```
+
+Calendar gating is external to the agents. An ineligible task remains ready with an explained next wake time; a running task that crosses a day boundary will checkpoint and pause at the next safe boundary once the Phase 2 daemon is connected.
 
 ## Repository authority
 

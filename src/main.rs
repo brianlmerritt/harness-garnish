@@ -1,7 +1,11 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use harness_garnish::{Garnish, adapters::AgentKind, domain::NewTask};
+use harness_garnish::{
+    Garnish,
+    adapters::AgentKind,
+    domain::{DayAffinity, DayKind, NewTask},
+};
 use serde::Serialize;
 use serde_json::json;
 use std::{path::PathBuf, str::FromStr};
@@ -34,6 +38,10 @@ enum Command {
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
+    },
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
     },
     Agent {
         #[command(subcommand)]
@@ -73,7 +81,7 @@ struct ProjectAdd {
 
 #[derive(Subcommand)]
 enum TaskCommand {
-    Add(TaskAdd),
+    Add(Box<TaskAdd>),
     List {
         #[arg(long)]
         project: Option<String>,
@@ -123,6 +131,8 @@ struct TaskAdd {
     uncertainty_percent: u8,
     #[arg(long, default_value_t = 300)]
     checkpoint_seconds: u64,
+    #[arg(long, default_value = "B", help = "Day affinity: W, O, or B")]
+    day_affinity: String,
     #[arg(long)]
     fake_write_path: Option<String>,
     #[arg(long)]
@@ -145,6 +155,50 @@ enum QuotaCommand {
     Set(QuotaSet),
     Override(QuotaOverride),
     Status,
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    Configure {
+        #[arg(long, default_value = "default")]
+        slug: String,
+        #[arg(long)]
+        timezone: String,
+        #[arg(long, default_value = "WWWWWOO")]
+        weekly_pattern: String,
+    },
+    Assign {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        calendar: String,
+    },
+    Exception {
+        #[arg(long, default_value = "default")]
+        calendar: String,
+        #[arg(long, help = "Local date in YYYY-MM-DD form")]
+        date: String,
+        #[arg(long, help = "Day kind: W or O")]
+        kind: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Evaluate {
+        #[arg(long)]
+        task: String,
+        #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
+        at: Option<String>,
+    },
+    Preview {
+        #[arg(long, default_value = "fake")]
+        adapter: String,
+        #[arg(long, default_value = "fake")]
+        provider: String,
+        #[arg(long, default_value = "default")]
+        account: String,
+        #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
+        at: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -298,6 +352,7 @@ fn run() -> Result<()> {
                     estimated_seconds: args.estimated_seconds,
                     uncertainty_percent: args.uncertainty_percent,
                     checkpoint_seconds: args.checkpoint_seconds,
+                    day_affinity: DayAffinity::from_str(&args.day_affinity)?,
                     fake_write_path: args.fake_write_path,
                     fake_write_content: args.fake_write_content,
                 })?;
@@ -346,6 +401,40 @@ fn run() -> Result<()> {
                 parse_optional_time(args.expires_at.as_deref())?,
             )?),
             QuotaCommand::Status => print_json(&garnish.quota()?),
+        },
+        Command::Schedule { command } => match command {
+            ScheduleCommand::Configure {
+                slug,
+                timezone,
+                weekly_pattern,
+            } => print_json(&garnish.configure_calendar(&slug, &timezone, &weekly_pattern)?),
+            ScheduleCommand::Assign { project, calendar } => {
+                print_json(&garnish.assign_project_calendar(&project, &calendar)?)
+            }
+            ScheduleCommand::Exception {
+                calendar,
+                date,
+                kind,
+                reason,
+            } => {
+                let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                    .context("--date must be YYYY-MM-DD")?;
+                let kind = DayKind::from_str(&kind)?;
+                print_json(&garnish.set_calendar_exception(&calendar, date, kind, &reason)?)
+            }
+            ScheduleCommand::Evaluate { task, at } => {
+                let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
+                print_json(&garnish.evaluate_task_schedule_at(&task, at)?)
+            }
+            ScheduleCommand::Preview {
+                adapter,
+                provider,
+                account,
+                at,
+            } => {
+                let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
+                print_json(&garnish.scheduler_preview_at(&adapter, &provider, &account, at)?)
+            }
         },
         Command::Agent { command } => match command {
             AgentCommand::Probe => print_json(&garnish.doctor().probes),

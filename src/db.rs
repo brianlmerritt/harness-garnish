@@ -1,4 +1,10 @@
-use crate::domain::{NewTask, Project, ProjectLink, QuotaSurface, RouteDecision, Task, TaskStatus};
+use crate::{
+    domain::{
+        CalendarException, CalendarProfile, DayKind, NewTask, Project, ProjectLink, QuotaSurface,
+        RouteDecision, Task, TaskStatus,
+    },
+    schedule,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -11,7 +17,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Database {
     path: PathBuf,
@@ -55,8 +61,11 @@ impl Database {
         let tx = self.conn.transaction()?;
         if current < 1 {
             tx.execute_batch(MIGRATION_1)?;
-            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        if current < 2 {
+            tx.execute_batch(MIGRATION_2)?;
+        }
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
     }
@@ -189,6 +198,191 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn configure_calendar(
+        &mut self,
+        slug: &str,
+        timezone: &str,
+        weekly_pattern: &str,
+    ) -> Result<CalendarProfile> {
+        if slug.is_empty()
+            || !slug
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            bail!("calendar slug must contain lowercase ASCII letters, digits, or hyphens");
+        }
+        schedule::validate_profile(timezone, weekly_pattern)?;
+        let existing_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM calendar_profiles WHERE slug = ?1",
+                [slug],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = existing_id.unwrap_or_else(|| Ulid::new().to_string());
+        let now = Utc::now();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO calendar_profiles(
+                id, slug, timezone, weekly_pattern, version, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
+             ON CONFLICT(slug) DO UPDATE SET
+                timezone = excluded.timezone,
+                weekly_pattern = excluded.weekly_pattern,
+                version = calendar_profiles.version + 1,
+                updated_at = excluded.updated_at",
+            params![id, slug, timezone, weekly_pattern, now.to_rfc3339()],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "calendar.configured",
+            "user",
+            &serde_json::json!({
+                "calendar_id": id,
+                "slug": slug,
+                "timezone": timezone,
+                "weekly_pattern": weekly_pattern,
+            }),
+        )?;
+        tx.commit()?;
+        self.calendar(&id)
+    }
+
+    pub fn calendar(&self, id_or_slug: &str) -> Result<CalendarProfile> {
+        self.conn
+            .query_row(
+                "SELECT id, slug, timezone, weekly_pattern, version, created_at, updated_at
+                 FROM calendar_profiles WHERE id = ?1 OR slug = ?1",
+                [id_or_slug],
+                map_calendar,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("calendar not found: {id_or_slug}"))
+    }
+
+    pub fn assign_project_calendar(
+        &mut self,
+        project_id_or_slug: &str,
+        calendar_id_or_slug: &str,
+    ) -> Result<CalendarProfile> {
+        let project = self.project(project_id_or_slug)?;
+        let calendar = self.calendar(calendar_id_or_slug)?;
+        let changed = self.conn.execute(
+            "UPDATE projects SET calendar_profile_id = ?2, version = version + 1,
+             updated_at = ?3 WHERE id = ?1",
+            params![project.id, calendar.id, Utc::now().to_rfc3339()],
+        )?;
+        if changed != 1 {
+            bail!("project calendar assignment failed");
+        }
+        Ok(calendar)
+    }
+
+    pub fn project_calendar(&self, project_id_or_slug: &str) -> Result<CalendarProfile> {
+        let project = self.project(project_id_or_slug)?;
+        self.conn
+            .query_row(
+                "SELECT c.id, c.slug, c.timezone, c.weekly_pattern, c.version,
+                    c.created_at, c.updated_at
+             FROM projects p
+             JOIN calendar_profiles c ON c.id = COALESCE(p.calendar_profile_id, 'default')
+             WHERE p.id = ?1",
+                [project.id],
+                map_calendar,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_calendar_exception(
+        &mut self,
+        calendar_id_or_slug: &str,
+        local_date: chrono::NaiveDate,
+        day_kind: DayKind,
+        reason: &str,
+    ) -> Result<CalendarException> {
+        if reason.trim().is_empty() {
+            bail!("calendar exception reason is required");
+        }
+        let calendar = self.calendar(calendar_id_or_slug)?;
+        let now = Utc::now();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO calendar_exceptions(profile_id, local_date, day_kind, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(profile_id, local_date) DO UPDATE SET
+                day_kind = excluded.day_kind,
+                reason = excluded.reason,
+                created_at = excluded.created_at",
+            params![
+                calendar.id,
+                local_date.to_string(),
+                day_kind.to_string(),
+                reason,
+                now.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "calendar.exception_set",
+            "user",
+            &serde_json::json!({
+                "calendar_id": calendar.id,
+                "local_date": local_date,
+                "day_kind": day_kind,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(CalendarException {
+            profile_id: calendar.id,
+            local_date,
+            day_kind,
+            reason: reason.into(),
+            created_at: now,
+        })
+    }
+
+    pub fn calendar_exceptions(&self, profile_id: &str) -> Result<Vec<CalendarException>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT profile_id, local_date, day_kind, reason, created_at
+             FROM calendar_exceptions WHERE profile_id = ?1 ORDER BY local_date",
+        )?;
+        let rows = stmt.query_map([profile_id], |row| {
+            let date: String = row.get(1)?;
+            let kind: String = row.get(2)?;
+            Ok(CalendarException {
+                profile_id: row.get(0)?,
+                local_date: chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(
+                    |error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            date.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    },
+                )?,
+                day_kind: DayKind::from_str(&kind).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        kind.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                reason: row.get(3)?,
+                created_at: parse_time(row.get(4)?)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn add_task(&mut self, new: &NewTask) -> Result<Task> {
         new.validate()?;
         let project = self.project(&new.project_id)?;
@@ -203,11 +397,11 @@ impl Database {
             "INSERT INTO tasks(
                 id, project_id, title, goal, rationale, scope_json, non_scope_json,
                 acceptance_json, verification_argv_json, priority, risk_class,
-                estimated_seconds, uncertainty_percent, checkpoint_seconds,
+                estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
                 fake_write_path, fake_write_content, status, version, created_at, updated_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, 'draft', 1, ?17, ?17
+                ?15, ?16, ?17, 'draft', 1, ?18, ?18
              )",
             params![
                 id,
@@ -224,6 +418,7 @@ impl Database {
                 estimated_seconds,
                 new.uncertainty_percent,
                 checkpoint_seconds,
+                new.day_affinity.to_string(),
                 new.fake_write_path,
                 new.fake_write_content,
                 now.to_rfc3339(),
@@ -581,8 +776,8 @@ impl Database {
         tx.execute(
             "INSERT INTO route_decisions(
                 id, task_id, selected_adapter, allowed, reason,
-                required_headroom_percent, quota_json, policy_hash, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                required_headroom_percent, quota_json, schedule_json, policy_hash, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 decision.id,
                 decision.task_id,
@@ -591,6 +786,7 @@ impl Database {
                 decision.reason,
                 decision.required_headroom_percent,
                 to_json(&decision.quota)?,
+                to_json(&decision.schedule)?,
                 decision.policy_hash,
                 decision.created_at.to_rfc3339(),
             ],
@@ -894,18 +1090,19 @@ fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 const TASK_SELECT: &str = "SELECT
     id, project_id, title, goal, rationale, scope_json, non_scope_json,
     acceptance_json, verification_argv_json, priority, risk_class,
-    estimated_seconds, uncertainty_percent, checkpoint_seconds,
+    estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
     fake_write_path, fake_write_content, status, version, created_at, updated_at
     FROM tasks";
 const TASK_SELECT_BY_ID: &str = "SELECT
     id, project_id, title, goal, rationale, scope_json, non_scope_json,
     acceptance_json, verification_argv_json, priority, risk_class,
-    estimated_seconds, uncertainty_percent, checkpoint_seconds,
+    estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
     fake_write_path, fake_write_content, status, version, created_at, updated_at
     FROM tasks WHERE id = ?1";
 
 fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
-    let status: String = row.get(16)?;
+    let affinity: String = row.get(14)?;
+    let status: String = row.get(17)?;
     Ok(Task {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -921,8 +1118,15 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         estimated_seconds: nonnegative_u64(row, 11)?,
         uncertainty_percent: row.get(12)?,
         checkpoint_seconds: nonnegative_u64(row, 13)?,
-        fake_write_path: row.get(14)?,
-        fake_write_content: row.get(15)?,
+        day_affinity: crate::domain::DayAffinity::from_str(&affinity).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                affinity.len(),
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?,
+        fake_write_path: row.get(15)?,
+        fake_write_content: row.get(16)?,
         status: TaskStatus::from_str(&status).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 status.len(),
@@ -930,9 +1134,21 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
                 Box::new(err),
             )
         })?,
-        version: row.get(17)?,
-        created_at: parse_time(row.get(18)?)?,
-        updated_at: parse_time(row.get(19)?)?,
+        version: row.get(18)?,
+        created_at: parse_time(row.get(19)?)?,
+        updated_at: parse_time(row.get(20)?)?,
+    })
+}
+
+fn map_calendar(row: &rusqlite::Row<'_>) -> rusqlite::Result<CalendarProfile> {
+    Ok(CalendarProfile {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        timezone: row.get(2)?,
+        weekly_pattern: row.get(3)?,
+        version: row.get(4)?,
+        created_at: parse_time(row.get(5)?)?,
+        updated_at: parse_time(row.get(6)?)?,
     })
 }
 
@@ -1258,6 +1474,43 @@ CREATE INDEX idx_leases_expiry ON leases(expires_at) WHERE released_at IS NULL;
 CREATE INDEX idx_quota_override_surface ON quota_overrides(surface_id, created_at DESC);
 "#;
 
+const MIGRATION_2: &str = r#"
+CREATE TABLE calendar_profiles (
+    id TEXT PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    timezone TEXT NOT NULL,
+    weekly_pattern TEXT NOT NULL CHECK(length(weekly_pattern) = 7),
+    version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+ALTER TABLE projects ADD COLUMN calendar_profile_id TEXT REFERENCES calendar_profiles(id);
+ALTER TABLE tasks ADD COLUMN day_affinity TEXT NOT NULL DEFAULT 'B'
+    CHECK(day_affinity IN ('W', 'O', 'B'));
+ALTER TABLE route_decisions ADD COLUMN schedule_json TEXT;
+
+CREATE TABLE calendar_exceptions (
+    profile_id TEXT NOT NULL REFERENCES calendar_profiles(id) ON DELETE CASCADE,
+    local_date TEXT NOT NULL,
+    day_kind TEXT NOT NULL CHECK(day_kind IN ('W', 'O')),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(profile_id, local_date)
+);
+
+INSERT INTO calendar_profiles(
+    id, slug, timezone, weekly_pattern, version, created_at, updated_at
+) VALUES (
+    'default', 'default', 'Etc/UTC', 'WWWWWOO', 1,
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+);
+
+CREATE INDEX idx_calendar_exception_date
+    ON calendar_exceptions(profile_id, local_date);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1285,6 +1538,7 @@ mod tests {
             estimated_seconds: 60,
             uncertainty_percent: 10,
             checkpoint_seconds: 60,
+            day_affinity: crate::domain::DayAffinity::Both,
             fake_write_path: None,
             fake_write_content: None,
         }
@@ -1354,6 +1608,7 @@ mod tests {
                 estimated_seconds: 60,
                 uncertainty_percent: 10,
                 checkpoint_seconds: 60,
+                day_affinity: crate::domain::DayAffinity::Both,
                 fake_write_path: None,
                 fake_write_content: None,
             })
@@ -1432,6 +1687,7 @@ mod tests {
             quota: vec![],
             candidates: vec![],
             next_wake_at: None,
+            schedule: None,
             policy_hash: "fixture-policy".into(),
             created_at: Utc::now(),
         };
@@ -1469,5 +1725,56 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn schema_one_migration_creates_verified_backup_and_preserves_data() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("state.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO projects(id, slug, title, root_path, created_at, updated_at, version)
+                 VALUES ('phase1-project', 'phase1', 'Phase 1', '/fixture/phase1', ?1, ?1, 1)",
+                [&now],
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = Database::open(&database_path).unwrap();
+        assert_eq!(migrated.project("phase1").unwrap().id, "phase1-project");
+        assert_eq!(
+            migrated.calendar("default").unwrap().weekly_pattern,
+            "WWWWWOO"
+        );
+        let version: i64 = migrated
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("state.v1.") && name.ends_with(".backup.db")
+                    })
+            })
+            .expect("version-1 migration backup");
+        let backup = Connection::open(backup).unwrap();
+        let integrity: String = backup
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let backup_version: i64 = backup
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, 1);
     }
 }

@@ -12,6 +12,7 @@ These documents contain the Phase 0 design baseline and the Phase 1 implementati
 | [Adapter contracts](adapter-contracts.md) | Execution-plane, agent, sandbox, quota, API, notification, and updater interfaces |
 | [MVP acceptance](mvp-acceptance.md) | Measurable vertical-slice and Phase 1 exit criteria |
 | [Phase 1 exit report](phase-1-exit-report.md) | Implemented scope, test evidence, waivers, and residual risks |
+| [Phase 2 plan](phase-2-plan.md) | Durable scheduler, day-aware calendars, recovery, and cross-platform acceptance |
 | [ADRs](decisions/README.md) | Decisions that constrain implementation |
 
 Every material change to these boundaries requires an ADR amendment or a superseding ADR. Documentation may describe a future capability only when it is clearly labelled as planned.

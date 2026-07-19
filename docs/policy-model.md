@@ -68,6 +68,11 @@ quota:
   unknown_unattended: deny
   max_phase_seconds: 2700
   max_checkpoint_seconds: 300
+scheduling:
+  calendar: default
+  weekly_pattern: WWWWWOO
+  timezone: Europe/London
+  day_boundary: checkpoint_then_pause
 updates:
   mode: manual
   channel: stable
@@ -218,4 +223,3 @@ expiry/re-evaluation time
 ```
 
 The caller must present the same action digest when claiming an allow/approval. All decisions are events, including denials.
-
