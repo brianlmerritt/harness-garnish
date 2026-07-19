@@ -2,7 +2,7 @@
 
 Harness Garnish is a local control plane for quota-aware, policy-controlled AI-assisted software development. It coordinates existing coding-agent CLIs and optional API-backed agents, while keeping scheduling, approvals, canonical state, verification, and recovery outside the agents themselves.
 
-The project is in architecture and discovery. Phase 0 is documented under [`docs/`](docs/README.md); no executable has been scaffolded yet.
+Phase 0 established the architecture under [`docs/`](docs/README.md). The Phase 1 Rust vertical slice is now implemented and locally verified; its exact evidence, limitations, and deferred smoke tests are recorded in [`docs/phase-1-exit-report.md`](docs/phase-1-exit-report.md).
 
 ## Confirmed direction
 
@@ -28,7 +28,29 @@ Harness Garnish is not an API proxy, a provider-limit bypass, an autonomous merg
 - [MVP acceptance tests](docs/mvp-acceptance.md)
 - [Architecture decision records](docs/decisions/README.md)
 
+## Phase 1 quick start
+
+Rust 1.97 or newer and Git are required. All normal tests use fake agents and consume no provider quota or API budget.
+
+```console
+cargo build --locked
+cargo test --workspace
+cargo run -- --data-dir /tmp/garnish-state doctor
+```
+
+The CLI emits JSON on stdout for success and JSON on stderr for failure. Exit code `0` means the command completed; exit code `1` means validation, policy, quota, adapter, runtime, or state handling rejected or failed the command. Argument syntax errors are emitted by Clap with exit code `2`.
+
+Typical local flow:
+
+```console
+garnish --data-dir .garnish-state init
+garnish --data-dir .garnish-state project add --slug example --title Example --path /absolute/path/to/repository
+garnish --data-dir .garnish-state quota set --provider fake --account test --surface five_hour --remaining-percent 90
+garnish --data-dir .garnish-state task add --project example --title "Bounded change" --goal "Create result.txt" --accept "result.txt contains done" --verify-argv '["grep","-q","done","result.txt"]' --scope result.txt --non-scope "remote Git" --fake-write-path result.txt --fake-write-content done
+```
+
+`task run` is deliberately limited to deterministic fake adapters in the normal path. Real Codex, Claude Code, Antigravity, AoE, and runtime smoke tests remain individually opt-in and are never part of default CI.
+
 ## Repository authority
 
 The user manages branches and commits for this repository. Agents may edit the current checkout when explicitly asked, but must not create or switch branches, commit, push, open pull requests, merge, or alter remotes.
-

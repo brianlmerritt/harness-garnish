@@ -1,0 +1,33 @@
+[package]
+name = "harness-garnish"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Local control plane for policy- and quota-aware coding agents"
+
+[lib]
+name = "harness_garnish"
+path = "src/lib.rs"
+
+[[bin]]
+name = "garnish"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+directories = "6.0"
+hex = "0.4"
+libc = "0.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+ulid = { version = "1.2", features = ["serde"] }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.20"

@@ -1,1 +1,7 @@
 .env
+/target/
+/.harness-garnish/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
