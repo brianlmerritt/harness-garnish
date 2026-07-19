@@ -3,8 +3,8 @@ use crate::{
     db::Database,
     domain::{
         CalendarException, CalendarProfile, DayKind, NewTask, Project, ProjectLink, QuotaSurface,
-        RouteCandidate, RouteDecision, RunSummary, ScheduleEvaluation, SchedulerPreview, Task,
-        TaskStatus,
+        RouteCandidate, RouteDecision, RunSummary, ScheduleEvaluation, SchedulerClaim,
+        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -58,7 +58,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 2,
+            schema_version: 3,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -366,6 +366,138 @@ impl Garnish {
             provider: provider.into(),
             account: account.into(),
             decisions,
+        })
+    }
+
+    pub fn register_scheduler(
+        &mut self,
+        instance_id: &str,
+        hostname: &str,
+        process_id: u32,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.db
+            .register_scheduler_instance(instance_id, hostname, process_id, now)
+    }
+
+    pub fn acquire_scheduler_leader(
+        &mut self,
+        instance_id: &str,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+    ) -> Result<SchedulerLeader> {
+        self.db.acquire_scheduler_leader(instance_id, now, ttl)
+    }
+
+    pub fn heartbeat_scheduler_leader(
+        &mut self,
+        instance_id: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+    ) -> Result<SchedulerLeader> {
+        self.db
+            .heartbeat_scheduler_leader(instance_id, generation, now, ttl)
+    }
+
+    pub fn recover_scheduler(&mut self, now: DateTime<Utc>) -> Result<Vec<String>> {
+        self.db.recover_expired_scheduler_claims(now)
+    }
+
+    pub fn stop_scheduler(&mut self, instance_id: &str, now: DateTime<Utc>) -> Result<Vec<String>> {
+        self.db.stop_scheduler_instance(instance_id, now)
+    }
+
+    pub fn scheduler_wakes(&self) -> Result<Vec<SchedulerWake>> {
+        self.db.scheduler_wakes()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scheduler_tick_at(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+        max_active_claims: usize,
+        claim_ttl: std::time::Duration,
+    ) -> Result<SchedulerTick> {
+        self.db.recover_expired_scheduler_claims(now)?;
+        let ready = self
+            .db
+            .list_tasks(None)?
+            .into_iter()
+            .filter(|task| task.status == TaskStatus::Ready)
+            .collect::<Vec<_>>();
+        let mut decisions = Vec::with_capacity(ready.len());
+        let mut claims: Vec<SchedulerClaim> = Vec::new();
+        for task in ready {
+            let decision = self.route_task_at(&task.id, adapter, provider, account, now)?;
+            if !decision.allowed {
+                let reason_code = decision
+                    .schedule
+                    .as_ref()
+                    .filter(|evaluation| !evaluation.eligible)
+                    .map(|evaluation| evaluation.reason_code.as_str())
+                    .unwrap_or("quota.unavailable");
+                self.db.record_scheduler_wake(
+                    &task.id,
+                    reason_code,
+                    decision.next_wake_at,
+                    &serde_json::json!({
+                        "route_decision_id": &decision.id,
+                        "reason": &decision.reason,
+                    }),
+                    now,
+                )?;
+                decisions.push(decision);
+                continue;
+            }
+            match self.db.claim_task_for_scheduler(
+                instance_id,
+                leader_generation,
+                &task.id,
+                task.version,
+                now,
+                claim_ttl,
+                max_active_claims,
+                &[],
+            ) {
+                Ok(claim) => claims.push(claim),
+                Err(error) => {
+                    let message = error.to_string();
+                    let reason_code = if message.contains("concurrency limit") {
+                        "scheduler.capacity"
+                    } else if message.contains("resource lock") {
+                        "scheduler.resource_locked"
+                    } else {
+                        "scheduler.claim_conflict"
+                    };
+                    self.db.record_scheduler_wake(
+                        &task.id,
+                        reason_code,
+                        None,
+                        &serde_json::json!({
+                            "route_decision_id": &decision.id,
+                            "reason": message,
+                        }),
+                        now,
+                    )?;
+                }
+            }
+            decisions.push(decision);
+        }
+        let active_claims = self.db.active_scheduler_claim_count(now)?;
+        Ok(SchedulerTick {
+            evaluated_at: now,
+            instance_id: instance_id.into(),
+            leader_generation,
+            claims,
+            decisions,
+            active_claims,
+            capacity: max_active_claims.saturating_sub(active_claims),
         })
     }
 
@@ -923,5 +1055,33 @@ mod tests {
                 .starts_with("schedule.ineligible_workday")
         );
         assert!(preview.decisions[1].next_wake_at.is_some());
+        garnish
+            .register_scheduler("scheduler-test", "fixture-host", 42, monday)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("scheduler-test", monday, std::time::Duration::from_secs(60))
+            .unwrap();
+        let tick = garnish
+            .scheduler_tick_at(
+                "scheduler-test",
+                leader.generation,
+                "fake",
+                "fake",
+                "test",
+                monday,
+                2,
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        assert_eq!(tick.claims[0].task_id, work_task.id);
+        assert_eq!(
+            garnish.task(&work_task.id).unwrap().status,
+            TaskStatus::Leased
+        );
+        let wakes = garnish.scheduler_wakes().unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].task_id, off_task.id);
+        assert_eq!(wakes[0].reason_code, "schedule.ineligible_workday");
     }
 }

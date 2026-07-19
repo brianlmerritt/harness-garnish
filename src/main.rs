@@ -43,6 +43,10 @@ enum Command {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    Scheduler {
+        #[command(subcommand)]
+        command: SchedulerCommand,
+    },
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -199,6 +203,57 @@ enum ScheduleCommand {
         #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
         at: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SchedulerCommand {
+    Register {
+        #[arg(long)]
+        instance: String,
+        #[arg(long, default_value = "local")]
+        hostname: String,
+    },
+    AcquireLeader {
+        #[arg(long)]
+        instance: String,
+        #[arg(long, default_value_t = 30)]
+        ttl_seconds: u64,
+    },
+    Heartbeat {
+        #[arg(long)]
+        instance: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long, default_value_t = 30)]
+        ttl_seconds: u64,
+    },
+    Tick {
+        #[arg(long)]
+        instance: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long, default_value = "fake")]
+        adapter: String,
+        #[arg(long, default_value = "fake")]
+        provider: String,
+        #[arg(long, default_value = "default")]
+        account: String,
+        #[arg(long, default_value_t = 1)]
+        max_active: usize,
+        #[arg(long, default_value_t = 300)]
+        claim_ttl_seconds: u64,
+        #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
+        at: Option<String>,
+    },
+    Recover {
+        #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
+        at: Option<String>,
+    },
+    Stop {
+        #[arg(long)]
+        instance: String,
+    },
+    Wakes,
 }
 
 #[derive(Args)]
@@ -435,6 +490,68 @@ fn run() -> Result<()> {
                 let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
                 print_json(&garnish.scheduler_preview_at(&adapter, &provider, &account, at)?)
             }
+        },
+        Command::Scheduler { command } => match command {
+            SchedulerCommand::Register { instance, hostname } => {
+                let now = Utc::now();
+                garnish.register_scheduler(&instance, &hostname, std::process::id(), now)?;
+                print_json(&json!({
+                    "instance_id": instance,
+                    "hostname": hostname,
+                    "process_id": std::process::id(),
+                    "registered_at": now,
+                }))
+            }
+            SchedulerCommand::AcquireLeader {
+                instance,
+                ttl_seconds,
+            } => print_json(&garnish.acquire_scheduler_leader(
+                &instance,
+                Utc::now(),
+                std::time::Duration::from_secs(ttl_seconds),
+            )?),
+            SchedulerCommand::Heartbeat {
+                instance,
+                generation,
+                ttl_seconds,
+            } => print_json(&garnish.heartbeat_scheduler_leader(
+                &instance,
+                generation,
+                Utc::now(),
+                std::time::Duration::from_secs(ttl_seconds),
+            )?),
+            SchedulerCommand::Tick {
+                instance,
+                generation,
+                adapter,
+                provider,
+                account,
+                max_active,
+                claim_ttl_seconds,
+                at,
+            } => {
+                let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
+                print_json(&garnish.scheduler_tick_at(
+                    &instance,
+                    generation,
+                    &adapter,
+                    &provider,
+                    &account,
+                    at,
+                    max_active,
+                    std::time::Duration::from_secs(claim_ttl_seconds),
+                )?)
+            }
+            SchedulerCommand::Recover { at } => {
+                let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
+                print_json(&json!({"recovered_task_ids": garnish.recover_scheduler(at)?}))
+            }
+            SchedulerCommand::Stop { instance } => print_json(&json!({
+                "instance_id": instance,
+                "status": "stopped",
+                "released_task_ids": garnish.stop_scheduler(&instance, Utc::now())?,
+            })),
+            SchedulerCommand::Wakes => print_json(&garnish.scheduler_wakes()?),
         },
         Command::Agent { command } => match command {
             AgentCommand::Probe => print_json(&garnish.doctor().probes),

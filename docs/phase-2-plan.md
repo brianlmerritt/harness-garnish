@@ -26,7 +26,7 @@ Calendar examples:
 
 ## Implementation stages
 
-1. Schema version 2: calendar profiles, project-to-calendar selection, dated exceptions, task affinity, scheduler instances, durable wake records, retry state, and resource locks. Prove version-1 backup and migration integrity.
+1. Schema versions 2–3: calendar profiles, project-to-calendar selection, dated exceptions, task affinity, scheduler instances, leader fencing, durable wake records, task claims, and resource locks. Prove version-1 backup and migration integrity. Ordered development migrations remain separate so an early Phase 2 database can advance safely.
 2. Pure scheduler kernel: injected clock, ready-set calculation, deterministic ordering, eligibility reasons, next wake, concurrency ceilings, and atomic lease claims.
 3. Local daemon: singleton leader lease, heartbeats, graceful shutdown, stale-leader recovery, orphan cleanup, and idempotency claims around external actions.
 4. Runtime supervision: checkpoint timers, cancellation, retry budgets, stable failure categories, exponential backoff with jitter derived from persisted state, and adapter circuit breakers.
@@ -37,7 +37,7 @@ Calendar examples:
 
 | ID | Assertion |
 | --- | --- |
-| P2-01 | Opening a schema-1 fixture creates and integrity-checks a backup, migrates exactly once to schema 2, and preserves every Phase 1 row/event. |
+| P2-01 | Opening a schema-1 fixture creates and integrity-checks a backup, applies every ordered Phase 2 migration exactly once, and preserves every Phase 1 row/event. |
 | P2-02 | All 21 combinations of weekday class (`W`/`O`), task affinity (`W`/`O`/`B`), and representative weekdays yield deterministic eligibility. |
 | P2-03 | IANA timezone and DST fixtures compute the correct local date and next eligible instant; a dated exception overrides only its target date. |
 | P2-04 | Dependency, project pause, calendar, quota, policy, retry, deadline, lock, and capability exclusions are all recorded with stable reason codes. |

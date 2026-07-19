@@ -35,6 +35,38 @@ fn cli_success_and_failure_are_stable_json() {
     assert_eq!(value["timezone"], "Europe/London");
     assert_eq!(value["weekly_pattern"], "WWWWWOO");
 
+    let registered = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "scheduler",
+            "register",
+            "--instance",
+            "cli-test",
+            "--hostname",
+            "fixture",
+        ])
+        .output()
+        .unwrap();
+    assert!(registered.status.success());
+    let leader = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "scheduler",
+            "acquire-leader",
+            "--instance",
+            "cli-test",
+            "--ttl-seconds",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(leader.status.success());
+    let value: Value = serde_json::from_slice(&leader.stdout).unwrap();
+    assert_eq!(value["instance_id"], "cli-test");
+    assert_eq!(value["generation"], 1);
+
     let failure = cargo_bin_cmd!("garnish")
         .args([
             "--data-dir",

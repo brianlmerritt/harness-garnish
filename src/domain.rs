@@ -346,6 +346,46 @@ pub struct SchedulerPreview {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerLeader {
+    pub instance_id: String,
+    pub generation: i64,
+    pub acquired_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerClaim {
+    pub id: String,
+    pub task_id: String,
+    pub instance_id: String,
+    pub task_version: i64,
+    pub acquired_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub resource_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerWake {
+    pub task_id: String,
+    pub reason_code: String,
+    pub wake_at: Option<DateTime<Utc>>,
+    pub detail: serde_json::Value,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerTick {
+    pub evaluated_at: DateTime<Utc>,
+    pub instance_id: String,
+    pub leader_generation: i64,
+    pub claims: Vec<SchedulerClaim>,
+    pub decisions: Vec<RouteDecision>,
+    pub active_claims: usize,
+    pub capacity: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {
     pub run_id: String,
     pub task_id: String,

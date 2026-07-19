@@ -1,13 +1,13 @@
 use crate::{
     domain::{
         CalendarException, CalendarProfile, DayKind, NewTask, Project, ProjectLink, QuotaSurface,
-        RouteDecision, Task, TaskStatus,
+        RouteDecision, SchedulerClaim, SchedulerLeader, SchedulerWake, Task, TaskStatus,
     },
     schedule,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,7 +17,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub struct Database {
     path: PathBuf,
@@ -64,6 +64,9 @@ impl Database {
         }
         if current < 2 {
             tx.execute_batch(MIGRATION_2)?;
+        }
+        if current < 3 {
+            tx.execute_batch(MIGRATION_3)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -377,6 +380,386 @@ impl Database {
                 })?,
                 reason: row.get(3)?,
                 created_at: parse_time(row.get(4)?)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn register_scheduler_instance(
+        &mut self,
+        instance_id: &str,
+        hostname: &str,
+        process_id: u32,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        if instance_id.trim().is_empty() || hostname.trim().is_empty() {
+            bail!("scheduler instance ID and hostname are required");
+        }
+        self.conn.execute(
+            "INSERT INTO scheduler_instances(
+                id, hostname, process_id, started_at, heartbeat_at, status
+             ) VALUES (?1, ?2, ?3, ?4, ?4, 'active')
+             ON CONFLICT(id) DO UPDATE SET
+                hostname = excluded.hostname,
+                process_id = excluded.process_id,
+                heartbeat_at = excluded.heartbeat_at,
+                status = 'active'",
+            params![
+                instance_id,
+                hostname,
+                i64::from(process_id),
+                now.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn acquire_scheduler_leader(
+        &mut self,
+        instance_id: &str,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+    ) -> Result<SchedulerLeader> {
+        let expires_at =
+            now + chrono::Duration::from_std(ttl).context("scheduler leader TTL is too large")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let instance_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduler_instances WHERE id = ?1 AND status = 'active')",
+            [instance_id],
+            |row| row.get(0),
+        )?;
+        if !instance_exists {
+            bail!("scheduler instance is not registered: {instance_id}");
+        }
+        let current: Option<(String, i64, String)> = tx
+            .query_row(
+                "SELECT instance_id, generation, expires_at FROM scheduler_leader WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let generation = match current {
+            None => 1,
+            Some((owner, generation, _)) if owner == instance_id => generation,
+            Some((_, generation, expiry)) if parse_time(expiry.clone())? <= now => generation + 1,
+            Some((owner, _, expiry)) => {
+                bail!("scheduler leader is held by {owner} until {expiry}")
+            }
+        };
+        tx.execute(
+            "INSERT INTO scheduler_leader(
+                singleton, instance_id, generation, acquired_at, heartbeat_at, expires_at
+             ) VALUES (1, ?1, ?2, ?3, ?3, ?4)
+             ON CONFLICT(singleton) DO UPDATE SET
+                instance_id = excluded.instance_id,
+                generation = excluded.generation,
+                acquired_at = CASE
+                    WHEN scheduler_leader.instance_id = excluded.instance_id
+                    THEN scheduler_leader.acquired_at ELSE excluded.acquired_at END,
+                heartbeat_at = excluded.heartbeat_at,
+                expires_at = excluded.expires_at",
+            params![
+                instance_id,
+                generation,
+                now.to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "scheduler.leader_acquired",
+            "scheduler",
+            &serde_json::json!({
+                "instance_id": instance_id,
+                "generation": generation,
+                "expires_at": expires_at,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(SchedulerLeader {
+            instance_id: instance_id.into(),
+            generation,
+            acquired_at: now,
+            heartbeat_at: now,
+            expires_at,
+        })
+    }
+
+    pub fn heartbeat_scheduler_leader(
+        &mut self,
+        instance_id: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+    ) -> Result<SchedulerLeader> {
+        let expires_at =
+            now + chrono::Duration::from_std(ttl).context("scheduler leader TTL is too large")?;
+        let changed = self.conn.execute(
+            "UPDATE scheduler_leader SET heartbeat_at = ?3, expires_at = ?4
+             WHERE singleton = 1 AND instance_id = ?1 AND generation = ?2 AND expires_at > ?3",
+            params![
+                instance_id,
+                generation,
+                now.to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        if changed != 1 {
+            bail!("scheduler leadership was lost or expired");
+        }
+        self.conn.execute(
+            "UPDATE scheduler_instances SET heartbeat_at = ?2 WHERE id = ?1",
+            params![instance_id, now.to_rfc3339()],
+        )?;
+        let acquired_at: String = self.conn.query_row(
+            "SELECT acquired_at FROM scheduler_leader WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(SchedulerLeader {
+            instance_id: instance_id.into(),
+            generation,
+            acquired_at: parse_time(acquired_at)?,
+            heartbeat_at: now,
+            expires_at,
+        })
+    }
+
+    pub fn stop_scheduler_instance(
+        &mut self,
+        instance_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE scheduler_instances SET status = 'stopped', heartbeat_at = ?2
+             WHERE id = ?1 AND status = 'active'",
+            params![instance_id, now.to_rfc3339()],
+        )?;
+        if changed != 1 {
+            bail!("scheduler instance is missing or already stopped");
+        }
+        tx.execute(
+            "UPDATE scheduler_leader SET heartbeat_at = ?2, expires_at = ?2
+             WHERE singleton = 1 AND instance_id = ?1",
+            params![instance_id, now.to_rfc3339()],
+        )?;
+        let released = release_scheduler_claims_for_instance_tx(&tx, instance_id, now)?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "scheduler.stopped",
+            "scheduler",
+            &serde_json::json!({
+                "instance_id": instance_id,
+                "released_task_ids": &released,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(released)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_task_for_scheduler(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        task_id: &str,
+        expected_task_version: i64,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+        max_active_claims: usize,
+        resources: &[(String, String)],
+    ) -> Result<SchedulerClaim> {
+        if max_active_claims == 0 {
+            bail!("scheduler concurrency limit must be greater than zero");
+        }
+        let expires_at =
+            now + chrono::Duration::from_std(ttl).context("scheduler claim TTL is too large")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_scheduler_leader_tx(&tx, instance_id, leader_generation, now)?;
+        expire_scheduler_claims_tx(&tx, now)?;
+        let active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM scheduler_claims WHERE status = 'active' AND expires_at > ?1",
+            [now.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        if active >= i64::try_from(max_active_claims)? {
+            bail!("scheduler concurrency limit reached ({max_active_claims})");
+        }
+        let (status, version, project_id): (String, i64, String) = tx
+            .query_row(
+                "SELECT status, version, project_id FROM tasks WHERE id = ?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
+        if status != "ready" || version != expected_task_version {
+            bail!(
+                "task claim compare-and-swap failed: expected ready version {expected_task_version}, found {status} version {version}"
+            );
+        }
+        let dependencies_satisfied: bool = tx.query_row(
+            "SELECT NOT EXISTS(
+                SELECT 1 FROM task_dependencies d
+                JOIN tasks dependency ON dependency.id = d.depends_on_task_id
+                WHERE d.task_id = ?1 AND dependency.status != 'completed'
+             )",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if !dependencies_satisfied {
+            bail!("task dependencies are not complete");
+        }
+        let claim_id = Ulid::new().to_string();
+        tx.execute(
+            "INSERT INTO scheduler_claims(
+                id, task_id, instance_id, leader_generation, task_version,
+                status, acquired_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+            params![
+                claim_id,
+                task_id,
+                instance_id,
+                leader_generation,
+                expected_task_version,
+                now.to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        let mut resource_keys = Vec::new();
+        let mut all_resources = vec![("project".to_owned(), project_id.clone())];
+        all_resources.extend_from_slice(resources);
+        for (kind, key) in all_resources {
+            tx.execute(
+                "INSERT INTO resource_locks(
+                    id, resource_kind, resource_key, claim_id, mode, acquired_at, expires_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'exclusive', ?5, ?6)",
+                params![
+                    Ulid::new().to_string(),
+                    kind,
+                    key,
+                    claim_id,
+                    now.to_rfc3339(),
+                    expires_at.to_rfc3339(),
+                ],
+            )
+            .with_context(|| format!("resource lock is unavailable: {kind}:{key}"))?;
+            resource_keys.push(format!("{kind}:{key}"));
+        }
+        transition_task_tx(
+            &tx,
+            task_id,
+            TaskStatus::Ready,
+            TaskStatus::Leased,
+            "scheduler_claimed",
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&project_id),
+            Some(task_id),
+            None,
+            "scheduler.task_claimed",
+            "scheduler",
+            &serde_json::json!({
+                "claim_id": claim_id,
+                "instance_id": instance_id,
+                "leader_generation": leader_generation,
+                "expires_at": expires_at,
+                "resources": resource_keys,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(SchedulerClaim {
+            id: claim_id,
+            task_id: task_id.into(),
+            instance_id: instance_id.into(),
+            task_version: expected_task_version,
+            acquired_at: now,
+            expires_at,
+            resource_keys,
+        })
+    }
+
+    pub fn active_scheduler_claim_count(&self, now: DateTime<Utc>) -> Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM scheduler_claims WHERE status = 'active' AND expires_at > ?1",
+            [now.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).map_err(Into::into)
+    }
+
+    pub fn recover_expired_scheduler_claims(&mut self, now: DateTime<Utc>) -> Result<Vec<String>> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let recovered = expire_scheduler_claims_tx(&tx, now)?;
+        tx.commit()?;
+        Ok(recovered)
+    }
+
+    pub fn record_scheduler_wake(
+        &mut self,
+        task_id: &str,
+        reason_code: &str,
+        wake_at: Option<DateTime<Utc>>,
+        detail: &serde_json::Value,
+        now: DateTime<Utc>,
+    ) -> Result<SchedulerWake> {
+        self.task(task_id)?;
+        self.conn.execute(
+            "INSERT INTO scheduler_wakes(task_id, reason_code, wake_at, detail_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(task_id) DO UPDATE SET
+                reason_code = excluded.reason_code,
+                wake_at = excluded.wake_at,
+                detail_json = excluded.detail_json,
+                updated_at = excluded.updated_at",
+            params![
+                task_id,
+                reason_code,
+                wake_at.map(|value| value.to_rfc3339()),
+                serde_json::to_string(detail)?,
+                now.to_rfc3339(),
+            ],
+        )?;
+        Ok(SchedulerWake {
+            task_id: task_id.into(),
+            reason_code: reason_code.into(),
+            wake_at,
+            detail: detail.clone(),
+            updated_at: now,
+        })
+    }
+
+    pub fn scheduler_wakes(&self) -> Result<Vec<SchedulerWake>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, reason_code, wake_at, detail_json, updated_at
+             FROM scheduler_wakes ORDER BY wake_at IS NULL, wake_at, task_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let wake_at: Option<String> = row.get(2)?;
+            let detail: String = row.get(3)?;
+            Ok(SchedulerWake {
+                task_id: row.get(0)?,
+                reason_code: row.get(1)?,
+                wake_at: wake_at.map(parse_time).transpose()?,
+                detail: parse_json(detail)?,
+                updated_at: parse_time(row.get(4)?)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1051,6 +1434,131 @@ fn validate_percentage(value: Option<f64>, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn assert_scheduler_leader_tx(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    generation: i64,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let valid: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM scheduler_leader
+            WHERE singleton = 1 AND instance_id = ?1 AND generation = ?2 AND expires_at > ?3
+         )",
+        params![instance_id, generation, now.to_rfc3339()],
+        |row| row.get(0),
+    )?;
+    if !valid {
+        bail!("scheduler leadership is missing, expired, or fenced by a newer generation");
+    }
+    Ok(())
+}
+
+fn expire_scheduler_claims_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT id, task_id FROM scheduler_claims
+         WHERE status = 'active' AND expires_at <= ?1 ORDER BY acquired_at, id",
+    )?;
+    let expired = stmt
+        .query_map([now.to_rfc3339()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (claim_id, task_id) in &expired {
+        let status: String =
+            tx.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })?;
+        if status == "leased" {
+            transition_task_tx(
+                tx,
+                task_id,
+                TaskStatus::Leased,
+                TaskStatus::Paused,
+                "scheduler_claim_expired",
+            )?;
+            transition_task_tx(
+                tx,
+                task_id,
+                TaskStatus::Paused,
+                TaskStatus::Ready,
+                "scheduler_requeued",
+            )?;
+        }
+        tx.execute(
+            "UPDATE scheduler_claims SET status = 'expired', released_at = ?2
+             WHERE id = ?1 AND status = 'active'",
+            params![claim_id, now.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE resource_locks SET released_at = ?2
+             WHERE claim_id = ?1 AND released_at IS NULL",
+            params![claim_id, now.to_rfc3339()],
+        )?;
+        append_event_tx(
+            tx,
+            None,
+            Some(task_id),
+            None,
+            "scheduler.claim_expired",
+            "recovery",
+            &serde_json::json!({"claim_id": claim_id, "requeued": status == "leased"}),
+        )?;
+    }
+    Ok(expired.into_iter().map(|(_, task_id)| task_id).collect())
+}
+
+fn release_scheduler_claims_for_instance_tx(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT id, task_id FROM scheduler_claims
+         WHERE instance_id = ?1 AND status = 'active' ORDER BY acquired_at, id",
+    )?;
+    let claims = stmt
+        .query_map([instance_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (claim_id, task_id) in &claims {
+        let status: String =
+            tx.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })?;
+        if status == "leased" {
+            transition_task_tx(
+                tx,
+                task_id,
+                TaskStatus::Leased,
+                TaskStatus::Paused,
+                "scheduler_graceful_stop",
+            )?;
+            transition_task_tx(
+                tx,
+                task_id,
+                TaskStatus::Paused,
+                TaskStatus::Ready,
+                "scheduler_requeued",
+            )?;
+        }
+        tx.execute(
+            "UPDATE scheduler_claims SET status = 'released', released_at = ?2
+             WHERE id = ?1 AND status = 'active'",
+            params![claim_id, now.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE resource_locks SET released_at = ?2
+             WHERE claim_id = ?1 AND released_at IS NULL",
+            params![claim_id, now.to_rfc3339()],
+        )?;
+    }
+    Ok(claims.into_iter().map(|(_, task_id)| task_id).collect())
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(Into::into)
 }
@@ -1511,9 +2019,75 @@ CREATE INDEX idx_calendar_exception_date
     ON calendar_exceptions(profile_id, local_date);
 "#;
 
+const MIGRATION_3: &str = r#"
+CREATE TABLE scheduler_instances (
+    id TEXT PRIMARY KEY,
+    hostname TEXT NOT NULL,
+    process_id INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'stopped', 'lost'))
+);
+
+CREATE TABLE scheduler_leader (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    instance_id TEXT NOT NULL REFERENCES scheduler_instances(id),
+    generation INTEGER NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE TABLE scheduler_claims (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    instance_id TEXT NOT NULL REFERENCES scheduler_instances(id),
+    leader_generation INTEGER NOT NULL,
+    task_version INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active', 'consumed', 'released', 'expired')),
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    released_at TEXT
+);
+
+CREATE UNIQUE INDEX idx_scheduler_claim_active_task
+    ON scheduler_claims(task_id) WHERE status = 'active';
+CREATE INDEX idx_scheduler_claim_expiry
+    ON scheduler_claims(expires_at) WHERE status = 'active';
+
+CREATE TABLE resource_locks (
+    id TEXT PRIMARY KEY,
+    resource_kind TEXT NOT NULL,
+    resource_key TEXT NOT NULL,
+    claim_id TEXT NOT NULL REFERENCES scheduler_claims(id),
+    mode TEXT NOT NULL CHECK(mode IN ('exclusive')),
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT
+);
+
+CREATE UNIQUE INDEX idx_resource_lock_active
+    ON resource_locks(resource_kind, resource_key) WHERE released_at IS NULL;
+CREATE INDEX idx_resource_lock_expiry
+    ON resource_locks(expires_at) WHERE released_at IS NULL;
+
+CREATE TABLE scheduler_wakes (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    reason_code TEXT NOT NULL,
+    wake_at TEXT,
+    detail_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
     use tempfile::tempdir;
 
     fn database() -> (tempfile::TempDir, Database) {
@@ -1754,7 +2328,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -1776,5 +2350,176 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(backup_version, 1);
+    }
+
+    #[test]
+    fn leader_fencing_resource_locks_and_expired_claim_recovery_are_durable() {
+        let (dir, mut db) = database();
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let project = db.add_project("one", "One", &root).unwrap();
+        let first = db
+            .add_task(&new_task(&project.id, "first", vec![]))
+            .unwrap();
+        let second = db
+            .add_task(&new_task(&project.id, "second", vec![]))
+            .unwrap();
+        let now = Utc::now();
+        db.register_scheduler_instance("scheduler-a", "host", 1, now)
+            .unwrap();
+        db.register_scheduler_instance("scheduler-b", "host", 2, now)
+            .unwrap();
+        let leader_a = db
+            .acquire_scheduler_leader("scheduler-a", now, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            db.acquire_scheduler_leader(
+                "scheduler-b",
+                now + chrono::Duration::seconds(1),
+                std::time::Duration::from_secs(30),
+            )
+            .is_err()
+        );
+        let takeover_at = now + chrono::Duration::seconds(31);
+        let leader_b = db
+            .acquire_scheduler_leader(
+                "scheduler-b",
+                takeover_at,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(leader_b.generation, leader_a.generation + 1);
+        assert!(
+            db.claim_task_for_scheduler(
+                "scheduler-a",
+                leader_a.generation,
+                &first.id,
+                first.version,
+                takeover_at,
+                std::time::Duration::from_secs(10),
+                2,
+                &[],
+            )
+            .is_err()
+        );
+        let claim = db
+            .claim_task_for_scheduler(
+                "scheduler-b",
+                leader_b.generation,
+                &first.id,
+                first.version,
+                takeover_at,
+                std::time::Duration::from_secs(10),
+                2,
+                &[],
+            )
+            .unwrap();
+        assert!(
+            claim
+                .resource_keys
+                .contains(&format!("project:{}", project.id))
+        );
+        let lock_error = db
+            .claim_task_for_scheduler(
+                "scheduler-b",
+                leader_b.generation,
+                &second.id,
+                second.version,
+                takeover_at,
+                std::time::Duration::from_secs(10),
+                2,
+                &[],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(lock_error.contains("resource lock"));
+        assert_eq!(db.task(&second.id).unwrap().status, TaskStatus::Ready);
+        let recovered = db
+            .recover_expired_scheduler_claims(takeover_at + chrono::Duration::seconds(11))
+            .unwrap();
+        assert_eq!(recovered, vec![first.id.clone()]);
+        let first = db.task(&first.id).unwrap();
+        assert_eq!(first.status, TaskStatus::Ready);
+        db.claim_task_for_scheduler(
+            "scheduler-b",
+            leader_b.generation,
+            &second.id,
+            second.version,
+            takeover_at + chrono::Duration::seconds(11),
+            std::time::Duration::from_secs(10),
+            2,
+            &[],
+        )
+        .unwrap();
+        let stop_at = takeover_at + chrono::Duration::seconds(12);
+        let released = db.stop_scheduler_instance("scheduler-b", stop_at).unwrap();
+        assert_eq!(released, vec![second.id.clone()]);
+        assert_eq!(db.task(&second.id).unwrap().status, TaskStatus::Ready);
+        assert!(
+            db.heartbeat_scheduler_leader(
+                "scheduler-b",
+                leader_b.generation,
+                stop_at,
+                std::time::Duration::from_secs(30),
+            )
+            .is_err()
+        );
+        let leader_a_again = db
+            .acquire_scheduler_leader("scheduler-a", stop_at, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(leader_a_again.generation, leader_b.generation + 1);
+    }
+
+    #[test]
+    fn racing_claims_respect_atomic_global_concurrency_limit() {
+        let (dir, mut db) = database();
+        let database_path = db.path().to_path_buf();
+        let root_a = dir.path().join("project-a");
+        let root_b = dir.path().join("project-b");
+        fs::create_dir(&root_a).unwrap();
+        fs::create_dir(&root_b).unwrap();
+        let project_a = db.add_project("a", "A", &root_a).unwrap();
+        let project_b = db.add_project("b", "B", &root_b).unwrap();
+        let task_a = db.add_task(&new_task(&project_a.id, "a", vec![])).unwrap();
+        let task_b = db.add_task(&new_task(&project_b.id, "b", vec![])).unwrap();
+        let now = Utc::now();
+        db.register_scheduler_instance("scheduler", "host", 1, now)
+            .unwrap();
+        let leader = db
+            .acquire_scheduler_leader("scheduler", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for task in [task_a, task_b] {
+            let barrier = barrier.clone();
+            let path = database_path.clone();
+            let generation = leader.generation;
+            handles.push(thread::spawn(move || {
+                let mut db = Database::open(path).unwrap();
+                barrier.wait();
+                db.claim_task_for_scheduler(
+                    "scheduler",
+                    generation,
+                    &task.id,
+                    task.version,
+                    now,
+                    std::time::Duration::from_secs(30),
+                    1,
+                    &[],
+                )
+                .is_ok()
+            }));
+        }
+        barrier.wait();
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1);
+        let reopened = Database::open(database_path).unwrap();
+        assert_eq!(reopened.active_scheduler_claim_count(now).unwrap(), 1);
     }
 }

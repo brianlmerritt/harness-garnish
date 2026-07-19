@@ -67,6 +67,17 @@ garnish --data-dir .garnish-state schedule preview --provider fake --account tes
 
 Calendar gating is external to the agents. An ineligible task remains ready with an explained next wake time; a running task that crosses a day boundary will checkpoint and pause at the next safe boundary once the Phase 2 daemon is connected.
 
+The scheduler arbitration commands are deliberately explicit while the daemon is being built:
+
+```console
+garnish --data-dir .garnish-state scheduler register --instance local-1 --hostname my-mac
+garnish --data-dir .garnish-state scheduler acquire-leader --instance local-1
+garnish --data-dir .garnish-state scheduler tick --instance local-1 --generation 1 --provider fake --account test --max-active 2
+garnish --data-dir .garnish-state scheduler wakes
+```
+
+Leadership is fenced by a monotonically increasing generation. Claims, concurrency checks, and project locks commit atomically; a stale leader cannot claim work.
+
 ## Repository authority
 
 The user manages branches and commits for this repository. Agents may edit the current checkout when explicitly asked, but must not create or switch branches, commit, push, open pull requests, merge, or alter remotes.
