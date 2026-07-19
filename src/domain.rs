@@ -363,6 +363,17 @@ pub struct SchedulerClaim {
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub resource_keys: Vec<String>,
+    pub route_decision_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimedRunStart {
+    pub claim_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub route_decision_id: String,
+    pub action_key: String,
+    pub started_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,6 +408,7 @@ pub struct SchedulerDaemonConfig {
     pub leader_ttl: std::time::Duration,
     pub claim_ttl: std::time::Duration,
     pub max_ticks: Option<usize>,
+    pub execute_fake_claims: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +420,7 @@ pub struct SchedulerDaemonSummary {
     pub ticks: usize,
     pub claims_created: usize,
     pub claims_renewed: usize,
+    pub runs_completed: usize,
     pub scheduler_claims_recovered: usize,
     pub run_leases_recovered: usize,
     pub released_task_ids: Vec<String>,

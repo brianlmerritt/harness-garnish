@@ -289,6 +289,11 @@ struct SchedulerDaemonArgs {
         help = "Stop cleanly after this many ticks (primarily for diagnostics)"
     )]
     max_ticks: Option<usize>,
+    #[arg(
+        long,
+        help = "Execute claimed work with the quota-free fake adapter (real agents remain disabled)"
+    )]
+    execute_fake: bool,
 }
 
 #[derive(Args)]
@@ -541,6 +546,7 @@ fn run() -> Result<()> {
                     leader_ttl: StdDuration::from_secs(args.leader_ttl_seconds),
                     claim_ttl: StdDuration::from_secs(args.claim_ttl_seconds),
                     max_ticks: args.max_ticks,
+                    execute_fake_claims: args.execute_fake,
                 };
                 print_json(&garnish.run_scheduler_daemon(&config, &SCHEDULER_SHUTDOWN)?)
             }

@@ -61,7 +61,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 3,
+            schema_version: 4,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -294,12 +294,33 @@ impl Garnish {
                 "all quota surfaces satisfy reserve plus forecast".to_owned(),
             )
         };
-        let allowed = schedule.eligible && quota_allowed;
+        let (policy_allowed, policy_reason) = if !self.policy.allow_branch_changes {
+            (
+                false,
+                "policy.git_branch_denied: project policy denies automated branch and worktree creation"
+                    .to_owned(),
+            )
+        } else {
+            match self.policy.authorize(task.risk_class, true) {
+                PolicyDecision::Allow => (true, "policy allows the task".to_owned()),
+                PolicyDecision::RequireApproval => (
+                    false,
+                    format!(
+                        "policy.approval_required: task risk class {} requires approval",
+                        task.risk_class
+                    ),
+                ),
+                PolicyDecision::Deny(reason) => (false, format!("policy.denied: {reason}")),
+            }
+        };
+        let allowed = schedule.eligible && policy_allowed && quota_allowed;
         let reason = if !schedule.eligible {
             format!(
                 "{}: task affinity {} does not match {} day {}",
                 schedule.reason_code, schedule.affinity, schedule.day_kind, schedule.local_date
             )
+        } else if !policy_allowed {
+            policy_reason
         } else {
             quota_reason
         };
@@ -465,6 +486,7 @@ impl Garnish {
         let mut ticks = 0;
         let mut claims_created = 0;
         let mut claims_renewed = 0;
+        let mut runs_completed = 0;
         let mut scheduler_claims_recovered = self.recover_scheduler(started_at)?.len();
         let mut run_leases_recovered = self.recover_at(started_at)?.len();
         let mut shutdown_reason = "signal".to_owned();
@@ -501,6 +523,34 @@ impl Garnish {
                 )?;
                 ticks += 1;
                 claims_created += tick.claims.len();
+                if config.execute_fake_claims {
+                    for claim in &tick.claims {
+                        let route_decision_id =
+                            claim.route_decision_id.as_deref().ok_or_else(|| {
+                                anyhow::anyhow!("claim {} has no route decision", claim.id)
+                            })?;
+                        let route = tick
+                            .decisions
+                            .iter()
+                            .find(|decision| decision.id == route_decision_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "claim {} route decision is missing from its scheduler tick",
+                                    claim.id
+                                )
+                            })?;
+                        self.run_scheduler_claim(
+                            claim,
+                            &config.instance_id,
+                            leader.generation,
+                            &config.adapter,
+                            route,
+                            tick_at,
+                        )?;
+                        runs_completed += 1;
+                    }
+                }
                 if config.max_ticks.is_some_and(|limit| ticks >= limit) {
                     shutdown_reason = "max_ticks".to_owned();
                     break;
@@ -526,6 +576,7 @@ impl Garnish {
                 ticks,
                 claims_created,
                 claims_renewed,
+                runs_completed,
                 scheduler_claims_recovered,
                 run_leases_recovered,
                 released_task_ids,
@@ -563,7 +614,14 @@ impl Garnish {
                     .as_ref()
                     .filter(|evaluation| !evaluation.eligible)
                     .map(|evaluation| evaluation.reason_code.as_str())
-                    .unwrap_or("quota.unavailable");
+                    .unwrap_or_else(|| {
+                        decision
+                            .reason
+                            .split_once(':')
+                            .map(|(code, _)| code)
+                            .filter(|code| code.starts_with("policy."))
+                            .unwrap_or("quota.unavailable")
+                    });
                 self.db.record_scheduler_wake(
                     &task.id,
                     reason_code,
@@ -585,6 +643,7 @@ impl Garnish {
                 now,
                 claim_ttl,
                 max_active_claims,
+                Some(&decision.id),
                 &[],
             ) {
                 Ok(claim) => claims.push(claim),
@@ -720,6 +779,94 @@ impl Garnish {
             &worktree.base_commit,
             checkpoint_due,
         )?;
+        self.finish_fake_run(task, project, adapter, route, worktree, run_id)
+    }
+
+    fn run_scheduler_claim(
+        &mut self,
+        claim: &SchedulerClaim,
+        instance_id: &str,
+        leader_generation: i64,
+        adapter: &str,
+        route: RouteDecision,
+        now: DateTime<Utc>,
+    ) -> Result<RunSummary> {
+        if !adapter.starts_with("fake") {
+            bail!("scheduler claim execution only supports the quota-free fake adapter");
+        }
+        if claim.route_decision_id.as_deref() != Some(route.id.as_str()) {
+            bail!("scheduler claim and route decision do not match");
+        }
+        if !self.policy.allow_branch_changes {
+            bail!("project policy denies automated branch and worktree creation");
+        }
+        let task = self.db.task(&claim.task_id)?;
+        if task.status != TaskStatus::Leased {
+            bail!(
+                "scheduler claim task must be leased; current status is {}",
+                task.status
+            );
+        }
+        let project = self.db.project(&task.project_id)?;
+        let worktree_destination = self
+            .data_dir
+            .join("worktrees")
+            .join(&project.slug)
+            .join(&task.id);
+        let worktree = match git::create_or_reuse_task_worktree(
+            Path::new(&project.root_path),
+            &worktree_destination,
+            &task.id,
+        ) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                self.db.transition_task(
+                    &task.id,
+                    TaskStatus::Leased,
+                    TaskStatus::Failed,
+                    "worktree_failed",
+                )?;
+                return Err(error);
+            }
+        };
+        let sandbox = FakeSandbox::attest(Path::new(&worktree.path));
+        match self
+            .policy
+            .authorize(task.risk_class, sandbox.secure_container)
+        {
+            PolicyDecision::Allow => {}
+            PolicyDecision::RequireApproval => bail!(
+                "task risk class {} requires approval before claim consumption",
+                task.risk_class
+            ),
+            PolicyDecision::Deny(reason) => bail!("policy denied task: {reason}"),
+        }
+        let run_id = Ulid::new().to_string();
+        self.db.begin_claimed_run(
+            &claim.id,
+            instance_id,
+            leader_generation,
+            &run_id,
+            adapter,
+            &worktree.path,
+            &worktree.branch,
+            &worktree.base_commit,
+            now,
+            std::time::Duration::from_secs(task.checkpoint_seconds),
+        )?;
+        self.finish_fake_run(task, project, adapter, route, worktree, run_id)
+    }
+
+    fn finish_fake_run(
+        &mut self,
+        task: Task,
+        project: Project,
+        adapter: &str,
+        route: RouteDecision,
+        worktree: crate::git::Worktree,
+        run_id: String,
+    ) -> Result<RunSummary> {
+        let sandbox = FakeSandbox::attest(Path::new(&worktree.path));
         let evidence = RunEvidence::create(&self.data_dir, &run_id)?;
         let manifest = RunManifest {
             schema_version: 1,
@@ -745,7 +892,7 @@ impl Garnish {
                 content.as_bytes(),
             )?;
             self.db.append_run_event(
-                task_id,
+                &task.id,
                 &run_id,
                 "agent.file_written",
                 "fake_agent",
@@ -753,14 +900,14 @@ impl Garnish {
             )?;
         }
         self.db.append_run_event(
-            task_id,
+            &task.id,
             &run_id,
             "run.checkpointed",
             "control_plane",
             &serde_json::json!({"checkpoint_seconds": task.checkpoint_seconds}),
         )?;
         self.db.transition_task(
-            task_id,
+            &task.id,
             TaskStatus::Running,
             TaskStatus::Verifying,
             "agent_exited",
@@ -825,7 +972,7 @@ impl Garnish {
         evidence.write_summary(&task, adapter, &changed_files, &verification)?;
         if verification.passed {
             self.db.transition_task(
-                task_id,
+                &task.id,
                 TaskStatus::Verifying,
                 TaskStatus::Review,
                 "verification_passed",
@@ -834,7 +981,7 @@ impl Garnish {
                 .finish_run(&run_id, "review", Some(&head_commit), exit_code)?;
         } else {
             self.db.transition_task(
-                task_id,
+                &task.id,
                 TaskStatus::Verifying,
                 TaskStatus::Failed,
                 "verification_failed",
@@ -1091,6 +1238,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("denies automated branch"));
+        let now = Utc::now();
+        garnish
+            .register_scheduler("policy-scheduler", "fixture", 1, now)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("policy-scheduler", now, std::time::Duration::from_secs(30))
+            .unwrap();
+        let tick = garnish
+            .scheduler_tick_at(
+                "policy-scheduler",
+                leader.generation,
+                "fake",
+                "fake",
+                "test",
+                now,
+                1,
+                std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(tick.claims.is_empty());
+        let wakes = garnish.scheduler_wakes().unwrap();
+        assert_eq!(wakes.len(), 1);
+        assert_eq!(wakes[0].reason_code, "policy.git_branch_denied");
         let after = git::snapshot(&source).unwrap();
         assert_eq!(before.base_commit, after.base_commit);
         assert_eq!(before.branch, after.branch);
@@ -1254,6 +1424,7 @@ mod tests {
             leader_ttl: std::time::Duration::from_secs(10),
             claim_ttl: std::time::Duration::from_secs(10),
             max_ticks: Some(2),
+            execute_fake_claims: false,
         };
         let shutdown = AtomicBool::new(false);
         let mut instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
@@ -1276,6 +1447,68 @@ mod tests {
         assert_eq!(summary.released_task_ids, vec![task.id.clone()]);
         assert_eq!(summary.shutdown_reason, "max_ticks");
         assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Ready);
+    }
+
+    #[test]
+    fn daemon_can_consume_a_claim_and_complete_quota_free_fake_execution() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fake",
+                None,
+            )
+            .unwrap();
+        let config = SchedulerDaemonConfig {
+            instance_id: "daemon-executor".into(),
+            hostname: "fixture".into(),
+            adapter: "fake".into(),
+            provider: "fake".into(),
+            account: "test".into(),
+            max_active_claims: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            leader_ttl: std::time::Duration::from_secs(10),
+            claim_ttl: std::time::Duration::from_secs(10),
+            max_ticks: Some(1),
+            execute_fake_claims: true,
+        };
+        let shutdown = AtomicBool::new(false);
+        let mut instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let summary = garnish
+            .run_scheduler_daemon_with(
+                &config,
+                &shutdown,
+                || {
+                    let current = instant;
+                    instant += Duration::seconds(1);
+                    current
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(summary.ticks, 1);
+        assert_eq!(summary.claims_created, 1);
+        assert_eq!(summary.runs_completed, 1);
+        assert!(summary.released_task_ids.is_empty());
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Review);
+        assert!(
+            dir.path()
+                .join("data/worktrees/fixture")
+                .join(&task.id)
+                .join("result.txt")
+                .exists()
+        );
     }
 
     #[cfg(unix)]

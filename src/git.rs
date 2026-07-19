@@ -175,6 +175,48 @@ pub fn create_task_worktree(
     })
 }
 
+pub fn create_or_reuse_task_worktree(
+    repository: &Path,
+    destination: &Path,
+    task_id: &str,
+) -> Result<Worktree> {
+    if !destination.exists() {
+        return create_task_worktree(repository, destination, task_id);
+    }
+    let source = snapshot(repository)?;
+    if has_user_changes(&source.status_porcelain_v2) {
+        bail!("source checkout is dirty; refusing to adopt a prepared task worktree");
+    }
+    let prepared = snapshot(destination)?;
+    let suffix: String = task_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(16)
+        .collect();
+    if suffix.is_empty() {
+        bail!("task id cannot form a branch name");
+    }
+    let expected_branch = format!("garnish/task-{suffix}");
+    let canonical_destination = destination.canonicalize()?;
+    if Path::new(&prepared.root) != canonical_destination {
+        bail!("prepared worktree root does not match its expected destination");
+    }
+    if prepared.branch.as_deref() != Some(expected_branch.as_str()) {
+        bail!("prepared worktree branch does not match task {task_id}");
+    }
+    if prepared.base_commit != source.base_commit {
+        bail!("prepared worktree base no longer matches the source checkout");
+    }
+    if has_user_changes(&prepared.status_porcelain_v2) {
+        bail!("prepared worktree contains changes and cannot be adopted before claim consumption");
+    }
+    Ok(Worktree {
+        path: canonical_destination.to_string_lossy().into_owned(),
+        branch: expected_branch,
+        base_commit: source.base_commit,
+    })
+}
+
 fn has_user_changes(status: &str) -> bool {
     status.lines().any(|line| {
         let path = line.split_whitespace().last().unwrap_or_default();
@@ -312,6 +354,20 @@ mod tests {
         init_repo(&source);
         fs::write(source.join("dirty.txt"), "dirty").unwrap();
         assert!(create_task_worktree(&source, &dir.path().join("worktree"), "01ABC").is_err());
+    }
+
+    #[test]
+    fn safely_reuses_only_a_clean_prepared_task_worktree() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        init_repo(&source);
+        let destination = dir.path().join("worktree");
+        let created = create_task_worktree(&source, &destination, "01REUSE").unwrap();
+        let reused = create_or_reuse_task_worktree(&source, &destination, "01REUSE").unwrap();
+        assert_eq!(reused.path, created.path);
+        assert_eq!(reused.branch, created.branch);
+        fs::write(destination.join("unexpected.txt"), "unsafe\n").unwrap();
+        assert!(create_or_reuse_task_worktree(&source, &destination, "01REUSE").is_err());
     }
 
     #[test]

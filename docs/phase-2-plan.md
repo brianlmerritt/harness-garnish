@@ -26,7 +26,7 @@ Calendar examples:
 
 ## Implementation stages
 
-1. Schema versions 2–3: calendar profiles, project-to-calendar selection, dated exceptions, task affinity, scheduler instances, leader fencing, durable wake records, task claims, and resource locks. Prove version-1 backup and migration integrity. Ordered development migrations remain separate so an early Phase 2 database can advance safely.
+1. Schema versions 2–4: calendar profiles, project-to-calendar selection, dated exceptions, task affinity, scheduler instances, leader fencing, durable wake records, task claims, resource locks, and claim-to-run bindings. Prove version-1 backup and migration integrity. Ordered development migrations remain separate so an early Phase 2 database can advance safely.
 2. Pure scheduler kernel: injected clock, ready-set calculation, deterministic ordering, eligibility reasons, next wake, concurrency ceilings, and atomic lease claims.
 3. Local daemon: singleton leader lease, heartbeats, graceful shutdown, stale-leader recovery, orphan cleanup, and idempotency claims around external actions.
 4. Runtime supervision: checkpoint timers, cancellation, retry budgets, stable failure categories, exponential backoff with jitter derived from persisted state, and adapter circuit breakers.
@@ -64,8 +64,9 @@ Calendar examples:
 - Schema migrations, calendar scheduling, deterministic ready-set routing, leader fencing, atomic task claims, global concurrency, and exclusive project locks are implemented.
 - The local daemon now renews leadership and active claims, performs scheduler/run-lease recovery, handles `TERM`/`INT`, and releases unstarted claims on graceful shutdown.
 - State directories and SQLite database files are restricted to the owning user on Unix.
-- `scripts/test-linux-midpoint` is the reproducible Linux proof bundle. The Linux milestone remains pending until its output is captured on Ubuntu or Debian.
-- Claim-to-run execution, checkpoint supervision, retries/circuit breakers, and live-change responses remain pending.
+- `scripts/test-linux-midpoint` passed the scheduler, signal, cleanup, and permission bundle on a Linux VPS; see `phase-2-linux-midpoint.md`. Container-runtime conformance remains pending because that host had neither Podman nor Docker installed.
+- The opt-in quota-free fake path now binds a route and scheduler claim atomically to one run and one single-use external-action key. Completed and orphaned runs release project locks, and clean prepared worktrees can be adopted after a pre-consumption restart.
+- Real-agent claim execution, checkpoint/cancellation supervision, retries/circuit breakers, and live-change responses remain pending.
 
 ## Explicit non-goals
 

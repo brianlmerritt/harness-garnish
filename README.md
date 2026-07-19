@@ -84,7 +84,11 @@ The continuous daemon owns and renews both the leader lease and its task claims.
 garnish --data-dir .garnish-state scheduler daemon --instance local-1 --hostname my-mac
 ```
 
-Claim-to-run execution remains the next Phase 2 milestone, so this daemon currently arbitrates and holds eligible work but does not launch an agent. `--max-ticks` provides a bounded diagnostic run.
+By default the daemon only arbitrates and holds eligible work. `--execute-fake` additionally exercises the quota-free fake claim-to-run path: the route, claim, single-use action key, run, run lease, and project lock are bound durably before fake execution begins. Real agents remain disabled here until runtime checkpoint/cancellation supervision is connected. `--max-ticks` provides a bounded diagnostic run.
+
+```console
+garnish --data-dir .garnish-state scheduler daemon --instance local-1 --hostname my-mac --execute-fake --max-ticks 1
+```
 
 ### Linux midpoint checkpoint
 
