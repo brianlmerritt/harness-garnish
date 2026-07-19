@@ -1,0 +1,13 @@
+# Architecture decision records
+
+| ADR | Decision | Status |
+| --- | --- | --- |
+| [0001](0001-compose-aoe.md) | Compose with Agent of Empires behind a replaceable execution-plane adapter | Accepted |
+| [0002](0002-rust-sqlite.md) | Rust control plane with SQLite canonical state | Accepted |
+| [0003](0003-portable-sandbox-backends.md) | Separate Docker, rootless Podman, and Apple Container backends | Accepted |
+| [0004](0004-quota-surfaces-and-checkpoints.md) | Multi-surface quota policy and five-minute checkpoints | Accepted |
+| [0005](0005-layered-project-policy.md) | Layered, project-specific policy with secure-container autonomy | Accepted |
+| [0006](0006-api-providers-and-updates.md) | Opt-in budgeted APIs and rollback-safe self-update | Accepted |
+
+ADRs describe decisions, not implementation completion. A changed decision is recorded by a new ADR that supersedes the old one.
+
