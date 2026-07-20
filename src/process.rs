@@ -32,6 +32,14 @@ pub struct ProcessOutcome {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub elapsed_ms: u128,
+    pub termination: Option<TerminationEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminationEvidence {
+    pub term_sent: bool,
+    pub kill_sent: bool,
+    pub escalation_after_ms: Option<u128>,
 }
 
 pub struct ProcessSpec<'a> {
@@ -46,6 +54,28 @@ pub struct ProcessSpec<'a> {
 }
 
 pub fn supervise(spec: ProcessSpec<'_>, cancelled: Arc<AtomicBool>) -> Result<ProcessOutcome> {
+    supervise_inner(spec, cancelled, None)
+}
+
+pub fn supervise_with_tick(
+    spec: ProcessSpec<'_>,
+    cancelled: Arc<AtomicBool>,
+    tick_interval: Duration,
+    mut on_tick: impl FnMut() -> Result<bool>,
+) -> Result<ProcessOutcome> {
+    if tick_interval.is_zero() {
+        bail!("supervision tick interval must be greater than zero");
+    }
+    supervise_inner(spec, cancelled, Some((tick_interval, &mut on_tick)))
+}
+
+type SupervisionTick<'a> = (Duration, &'a mut dyn FnMut() -> Result<bool>);
+
+fn supervise_inner(
+    spec: ProcessSpec<'_>,
+    cancelled: Arc<AtomicBool>,
+    mut tick: Option<SupervisionTick<'_>>,
+) -> Result<ProcessOutcome> {
     if spec.output_limit == 0 {
         bail!("process output limit must be greater than zero");
     }
@@ -72,23 +102,47 @@ pub fn supervise(spec: ProcessSpec<'_>, cancelled: Arc<AtomicBool>) -> Result<Pr
         input.write_all(spec.stdin)?;
     }
 
-    let classification = loop {
+    let mut next_tick = tick
+        .as_ref()
+        .map(|(interval, _)| Instant::now() + *interval);
+    let mut tick_error = None;
+
+    let (classification, termination) = loop {
         if let Some(status) = child.try_wait()? {
-            break if status.success() {
-                ExitClassification::Success
-            } else if status.code().is_none() {
-                ExitClassification::Signalled
-            } else {
-                ExitClassification::Failed
-            };
+            break (
+                if status.success() {
+                    ExitClassification::Success
+                } else if status.code().is_none() {
+                    ExitClassification::Signalled
+                } else {
+                    ExitClassification::Failed
+                },
+                None,
+            );
         }
         if cancelled.load(Ordering::SeqCst) {
-            terminate_tree(pid, &mut child, spec.termination_grace)?;
-            break ExitClassification::Cancelled;
+            let evidence = terminate_tree(pid, &mut child, spec.termination_grace)?;
+            break (ExitClassification::Cancelled, Some(evidence));
         }
         if started.elapsed() >= spec.timeout {
-            terminate_tree(pid, &mut child, spec.termination_grace)?;
-            break ExitClassification::TimedOut;
+            let evidence = terminate_tree(pid, &mut child, spec.termination_grace)?;
+            break (ExitClassification::TimedOut, Some(evidence));
+        }
+        if next_tick.is_some_and(|due| Instant::now() >= due)
+            && let Some((interval, callback)) = tick.as_mut()
+        {
+            match callback() {
+                Ok(true) => {
+                    let evidence = terminate_tree(pid, &mut child, spec.termination_grace)?;
+                    break (ExitClassification::Cancelled, Some(evidence));
+                }
+                Ok(false) => next_tick = Some(Instant::now() + *interval),
+                Err(error) => {
+                    tick_error = Some(error);
+                    let evidence = terminate_tree(pid, &mut child, spec.termination_grace)?;
+                    break (ExitClassification::Cancelled, Some(evidence));
+                }
+            }
         }
         thread::sleep(Duration::from_millis(10));
     };
@@ -99,7 +153,7 @@ pub fn supervise(spec: ProcessSpec<'_>, cancelled: Arc<AtomicBool>) -> Result<Pr
     let (stderr, stderr_truncated) = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
-    Ok(ProcessOutcome {
+    let outcome = ProcessOutcome {
         classification,
         exit_code: status.code(),
         stdout,
@@ -107,7 +161,12 @@ pub fn supervise(spec: ProcessSpec<'_>, cancelled: Arc<AtomicBool>) -> Result<Pr
         stdout_truncated,
         stderr_truncated,
         elapsed_ms: started.elapsed().as_millis(),
-    })
+        termination,
+    };
+    if let Some(error) = tick_error {
+        return Err(error.context("runtime supervision tick failed after process termination"));
+    }
+    Ok(outcome)
 }
 
 fn bounded_reader(
@@ -141,32 +200,53 @@ fn configure_process_group(command: &mut Command) {
 fn configure_process_group(_command: &mut Command) {}
 
 #[cfg(unix)]
-fn terminate_tree(pid: u32, child: &mut std::process::Child, grace: Duration) -> Result<()> {
+fn terminate_tree(
+    pid: u32,
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Result<TerminationEvidence> {
     // The child was placed in its own process group, so negative PID signals include descendants.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGTERM);
     }
+    let term_sent = Instant::now();
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
         if child.try_wait()?.is_some() {
-            return Ok(());
+            return Ok(TerminationEvidence {
+                term_sent: true,
+                kill_sent: false,
+                escalation_after_ms: None,
+            });
         }
         thread::sleep(Duration::from_millis(10));
     }
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
-    Ok(())
+    Ok(TerminationEvidence {
+        term_sent: true,
+        kill_sent: true,
+        escalation_after_ms: Some(term_sent.elapsed().as_millis()),
+    })
 }
 
 #[cfg(not(unix))]
-fn terminate_tree(_pid: u32, child: &mut std::process::Child, grace: Duration) -> Result<()> {
+fn terminate_tree(
+    _pid: u32,
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Result<TerminationEvidence> {
     child.kill()?;
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline && child.try_wait()?.is_none() {
         thread::sleep(Duration::from_millis(10));
     }
-    Ok(())
+    Ok(TerminationEvidence {
+        term_sent: false,
+        kill_sent: true,
+        escalation_after_ms: Some(0),
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -204,10 +284,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.classification, ExitClassification::TimedOut);
+        assert!(
+            outcome
+                .termination
+                .as_ref()
+                .is_some_and(|value| value.term_sent)
+        );
         thread::sleep(Duration::from_millis(500));
         assert!(
             !marker.exists(),
             "descendant survived process-group cancellation"
+        );
+    }
+
+    #[test]
+    fn supervision_tick_requests_bounded_process_tree_termination() {
+        let dir = tempdir().unwrap();
+        let argv = vec!["-c".into(), "sleep 5".into()];
+        let environment = BTreeMap::new();
+        let mut ticks = 0;
+        let outcome = supervise_with_tick(
+            spec(dir.path(), &argv, &environment),
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(20),
+            || {
+                ticks += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(ticks, 1);
+        assert_eq!(outcome.classification, ExitClassification::Cancelled);
+        assert!(
+            outcome
+                .termination
+                .as_ref()
+                .is_some_and(|evidence| evidence.term_sent)
         );
     }
 
@@ -224,6 +336,12 @@ mod tests {
         });
         let outcome = supervise(spec(dir.path(), &argv, &environment), cancelled).unwrap();
         assert_eq!(outcome.classification, ExitClassification::Cancelled);
+        assert!(
+            outcome
+                .termination
+                .as_ref()
+                .is_some_and(|value| value.term_sent)
+        );
         assert_eq!(outcome.stdout.len(), 128);
         assert!(outcome.stdout_truncated);
     }

@@ -54,6 +54,10 @@ enum Command {
         #[command(subcommand)]
         command: SchedulerCommand,
     },
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -262,6 +266,37 @@ enum SchedulerCommand {
         instance: String,
     },
     Wakes,
+}
+
+#[derive(Subcommand)]
+enum RuntimeCommand {
+    Checkpoint {
+        #[arg(long)]
+        run: String,
+        #[arg(long, default_value = "fake")]
+        provider: String,
+        #[arg(long, default_value = "default")]
+        account: String,
+        #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
+        at: Option<String>,
+    },
+    Cancel {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        reason: String,
+    },
+    RetryState {
+        #[arg(long)]
+        task: String,
+    },
+    RetryLimit {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        limit: u32,
+    },
+    Circuits,
 }
 
 #[derive(Args)]
@@ -610,6 +645,27 @@ fn run() -> Result<()> {
                 "released_task_ids": garnish.stop_scheduler(&instance, Utc::now())?,
             })),
             SchedulerCommand::Wakes => print_json(&garnish.scheduler_wakes()?),
+        },
+        Command::Runtime { command } => match command {
+            RuntimeCommand::Checkpoint {
+                run,
+                provider,
+                account,
+                at,
+            } => {
+                let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
+                print_json(&garnish.checkpoint_run_at(&run, &provider, &account, at)?)
+            }
+            RuntimeCommand::Cancel { run, reason } => print_json(&json!({
+                "run_id": run,
+                "cancellation_requested": garnish.request_run_cancellation(&run, &reason)?,
+                "reason": reason,
+            })),
+            RuntimeCommand::RetryState { task } => print_json(&garnish.retry_state(&task)?),
+            RuntimeCommand::RetryLimit { task, limit } => {
+                print_json(&garnish.set_retry_limit(&task, limit)?)
+            }
+            RuntimeCommand::Circuits => print_json(&garnish.adapter_circuits()?),
         },
         Command::Agent { command } => match command {
             AgentCommand::Probe => print_json(&garnish.doctor().probes),

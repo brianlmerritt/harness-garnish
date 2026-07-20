@@ -376,6 +376,116 @@ pub struct ClaimedRunStart {
     pub started_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    ProcessFailed,
+    TimedOut,
+    Cancelled,
+    Signalled,
+    AdapterTransient,
+    AdapterPermanent,
+    Infrastructure,
+    Sandbox,
+    Verification,
+    Policy,
+    Quota,
+    Unknown,
+}
+
+impl FailureCategory {
+    pub fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::ProcessFailed
+                | Self::TimedOut
+                | Self::Signalled
+                | Self::AdapterTransient
+                | Self::Infrastructure
+        )
+    }
+}
+
+impl fmt::Display for FailureCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = serde_json::to_value(self).map_err(|_| fmt::Error)?;
+        formatter.write_str(value.as_str().ok_or(fmt::Error)?)
+    }
+}
+
+impl FromStr for FailureCategory {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(value.to_owned()))
+            .map_err(|_| DomainError::InvalidSupervision(format!("failure category: {value}")))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointAction {
+    Continue,
+    ShortenCheckpoint,
+    Pause,
+    Cancel,
+}
+
+impl fmt::Display for CheckpointAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = serde_json::to_value(self).map_err(|_| fmt::Error)?;
+        formatter.write_str(value.as_str().ok_or(fmt::Error)?)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunCheckpoint {
+    pub id: String,
+    pub run_id: String,
+    pub sequence: i64,
+    pub evaluated_at: DateTime<Utc>,
+    pub action: CheckpointAction,
+    pub reason_code: String,
+    pub next_checkpoint_at: Option<DateTime<Utc>>,
+    pub detail: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryState {
+    pub task_id: String,
+    pub retry_limit: u32,
+    pub retries_used: u32,
+    pub retry_not_before: Option<DateTime<Utc>>,
+    pub last_failure_category: Option<FailureCategory>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPlan {
+    pub task_id: String,
+    pub run_id: String,
+    pub scheduled: bool,
+    pub reason_code: String,
+    pub retry_number: u32,
+    pub retry_at: Option<DateTime<Utc>>,
+    pub delay_seconds: Option<u64>,
+    pub failure_category: FailureCategory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreaker {
+    pub adapter: String,
+    pub provider: String,
+    pub account: String,
+    pub state: String,
+    pub consecutive_failures: u32,
+    pub last_failure_category: Option<FailureCategory>,
+    pub opened_at: Option<DateTime<Utc>>,
+    pub next_probe_at: Option<DateTime<Utc>>,
+    pub probe_claimed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerWake {
     pub task_id: String,
@@ -455,4 +565,6 @@ pub enum DomainError {
     IllegalTransition { from: TaskStatus, to: TaskStatus },
     #[error("dependency cycle detected")]
     DependencyCycle,
+    #[error("invalid supervision value: {0}")]
+    InvalidSupervision(String),
 }

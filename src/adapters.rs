@@ -1,4 +1,4 @@
-use crate::process::{ProcessOutcome, ProcessSpec, supervise};
+use crate::process::{ProcessOutcome, ProcessSpec, supervise, supervise_with_tick};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -40,6 +40,29 @@ pub fn run_invocation(
             output_limit: invocation.output_limit,
         },
         cancelled,
+    )
+}
+
+pub fn run_invocation_with_tick(
+    invocation: &Invocation,
+    cancelled: Arc<AtomicBool>,
+    tick_interval: Duration,
+    on_tick: impl FnMut() -> Result<bool>,
+) -> Result<ProcessOutcome> {
+    supervise_with_tick(
+        ProcessSpec {
+            executable: &invocation.executable,
+            argv: &invocation.argv,
+            cwd: &invocation.cwd,
+            environment: &invocation.environment,
+            stdin: &invocation.stdin,
+            timeout: invocation.timeout,
+            termination_grace: Duration::from_secs(3),
+            output_limit: invocation.output_limit,
+        },
+        cancelled,
+        tick_interval,
+        on_tick,
     )
 }
 

@@ -1,15 +1,20 @@
 use crate::{
-    adapters::{AgentKind, FakeSandbox, ProbeResult, probe_aoe, probe_docker, safe_write},
+    adapters::{
+        AgentKind, FakeSandbox, Invocation, ProbeResult, probe_aoe, probe_docker,
+        run_invocation_with_tick, safe_write,
+    },
     db::Database,
     domain::{
-        CalendarException, CalendarProfile, DayKind, NewTask, Project, ProjectLink, QuotaSurface,
-        RouteCandidate, RouteDecision, RunSummary, ScheduleEvaluation, SchedulerClaim,
-        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
-        SchedulerTick, SchedulerWake, Task, TaskStatus,
+        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, DayKind,
+        FailureCategory, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan, RetryState,
+        RouteCandidate, RouteDecision, RunCheckpoint, RunSummary, ScheduleEvaluation,
+        SchedulerClaim, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
+        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
     policy::{EffectivePolicy, PolicyDecision},
+    process::{ExitClassification, ProcessOutcome},
     projections::Projector,
     schedule,
 };
@@ -37,6 +42,14 @@ pub struct DoctorReport {
     pub probes: Vec<ProbeResult>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisedInvocationResult {
+    pub outcome: ProcessOutcome,
+    pub failure_category: Option<FailureCategory>,
+    pub retry: Option<RetryPlan>,
+    pub circuit: CircuitBreaker,
+}
+
 impl Garnish {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
@@ -61,7 +74,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 4,
+            schema_version: 5,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -223,6 +236,185 @@ impl Garnish {
         self.db.list_quota()
     }
 
+    pub fn retry_state(&self, task_id: &str) -> Result<RetryState> {
+        self.db.retry_state(task_id)
+    }
+
+    pub fn set_retry_limit(&mut self, task_id: &str, limit: u32) -> Result<RetryState> {
+        self.db.set_retry_limit(task_id, limit)
+    }
+
+    pub fn adapter_circuits(&self) -> Result<Vec<CircuitBreaker>> {
+        self.db.adapter_circuits()
+    }
+
+    pub fn request_run_cancellation(&mut self, run_id: &str, reason: &str) -> Result<bool> {
+        self.db.request_run_cancellation(run_id, reason, Utc::now())
+    }
+
+    pub fn checkpoint_run_at(
+        &mut self,
+        run_id: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RunCheckpoint> {
+        let (task_id, owner, generation) = self.db.run_lease_context(run_id)?;
+        let task = self.db.task(&task_id)?;
+        let schedule = self.evaluate_task_schedule_at(&task_id, now)?;
+        let cancellation_requested = self.db.run_cancellation_requested(run_id)?;
+        let quota = self
+            .db
+            .list_quota()?
+            .into_iter()
+            .filter(|surface| surface.provider == provider && surface.account == account)
+            .collect::<Vec<_>>();
+        let forecast = forecast_percent(&task);
+        let policy_allowed = self.policy.allow_branch_changes
+            && matches!(
+                self.policy.authorize(task.risk_class, true),
+                PolicyDecision::Allow
+            );
+        let quota_available = !quota.is_empty()
+            && quota.iter().all(|surface| {
+                surface
+                    .effective_remaining_percent
+                    .is_some_and(|remaining| remaining >= surface.reserve_percent + forecast)
+            });
+        let near_quota_boundary = quota_available
+            && quota.iter().any(|surface| {
+                surface
+                    .effective_remaining_percent
+                    .is_some_and(|remaining| remaining < surface.reserve_percent + (forecast * 2.0))
+            });
+        let (action, reason_code, interval_seconds) = if cancellation_requested {
+            (CheckpointAction::Cancel, "cancel.requested", None)
+        } else if !schedule.eligible {
+            (CheckpointAction::Pause, schedule.reason_code.as_str(), None)
+        } else if !policy_allowed {
+            (CheckpointAction::Pause, "policy.revoked", None)
+        } else if !quota_available {
+            (CheckpointAction::Pause, "quota.insufficient", None)
+        } else if near_quota_boundary {
+            (
+                CheckpointAction::ShortenCheckpoint,
+                "quota.near_reserve",
+                Some((task.checkpoint_seconds / 2).max(1)),
+            )
+        } else {
+            (
+                CheckpointAction::Continue,
+                "supervision.healthy",
+                Some(task.checkpoint_seconds),
+            )
+        };
+        let next_checkpoint_at =
+            interval_seconds.map(|seconds| now + Duration::seconds(seconds as i64));
+        self.db.apply_run_checkpoint(
+            run_id,
+            &owner,
+            generation,
+            now,
+            std::time::Duration::from_secs(task.checkpoint_seconds.max(1)),
+            action,
+            reason_code,
+            next_checkpoint_at,
+            &serde_json::json!({
+                "schedule": schedule,
+                "quota": quota,
+                "policy_hash": self.policy.hash(),
+                "forecast_percent": forecast,
+            }),
+        )
+    }
+
+    pub fn supervise_invocation_for_run(
+        &mut self,
+        run_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        invocation: &Invocation,
+        cancelled: std::sync::Arc<AtomicBool>,
+    ) -> Result<SupervisedInvocationResult> {
+        let (task_id, _, _) = self.db.run_lease_context(run_id)?;
+        let task = self.db.task(&task_id)?;
+        let mut checkpoint_due =
+            std::time::Instant::now() + std::time::Duration::from_secs(task.checkpoint_seconds);
+        let outcome = run_invocation_with_tick(
+            invocation,
+            cancelled,
+            std::time::Duration::from_secs(1),
+            || {
+                let cancellation_requested = self.db.run_cancellation_requested(run_id)?;
+                if !cancellation_requested && std::time::Instant::now() < checkpoint_due {
+                    return Ok(false);
+                }
+                let checkpoint = self.checkpoint_run_at(run_id, provider, account, Utc::now())?;
+                let interval = checkpoint
+                    .next_checkpoint_at
+                    .map(|next| (next - checkpoint.evaluated_at).num_seconds().max(1) as u64)
+                    .unwrap_or(task.checkpoint_seconds.max(1));
+                checkpoint_due =
+                    std::time::Instant::now() + std::time::Duration::from_secs(interval);
+                Ok(matches!(
+                    checkpoint.action,
+                    CheckpointAction::Pause | CheckpointAction::Cancel
+                ))
+            },
+        )?;
+        let failure_category = match outcome.classification {
+            ExitClassification::Success => None,
+            ExitClassification::Failed => Some(FailureCategory::ProcessFailed),
+            ExitClassification::TimedOut => Some(FailureCategory::TimedOut),
+            ExitClassification::Cancelled => Some(FailureCategory::Cancelled),
+            ExitClassification::Signalled => Some(FailureCategory::Signalled),
+        };
+        let now = Utc::now();
+        let outcome_json = serde_json::to_value(&outcome)?;
+        let termination_json = outcome
+            .termination
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?;
+        let task_id = self.db.record_process_outcome(
+            run_id,
+            failure_category,
+            outcome.exit_code,
+            &outcome_json,
+            termination_json.as_ref(),
+            now,
+        )?;
+        let circuit = self.db.record_adapter_outcome(
+            adapter,
+            provider,
+            account,
+            failure_category,
+            now,
+            3,
+            std::time::Duration::from_secs(300),
+        )?;
+        let retry = failure_category
+            .filter(|failure| *failure != FailureCategory::Cancelled)
+            .map(|failure| {
+                self.db.plan_retry(
+                    &task_id,
+                    run_id,
+                    failure,
+                    now,
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs(1_800),
+                )
+            })
+            .transpose()?;
+        Ok(SupervisedInvocationResult {
+            outcome,
+            failure_category,
+            retry,
+            circuit,
+        })
+    }
+
     pub fn route_task(
         &mut self,
         task_id: &str,
@@ -230,7 +422,7 @@ impl Garnish {
         provider: &str,
         account: &str,
     ) -> Result<RouteDecision> {
-        self.route_task_at(task_id, adapter, provider, account, Utc::now())
+        self.route_task_at_mode(task_id, adapter, provider, account, Utc::now(), true)
     }
 
     pub fn route_task_at(
@@ -240,6 +432,18 @@ impl Garnish {
         provider: &str,
         account: &str,
         now: DateTime<Utc>,
+    ) -> Result<RouteDecision> {
+        self.route_task_at_mode(task_id, adapter, provider, account, now, true)
+    }
+
+    fn route_task_at_mode(
+        &mut self,
+        task_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+        claim_circuit_probe: bool,
     ) -> Result<RouteDecision> {
         let task = self.db.task(task_id)?;
         if task.status != TaskStatus::Ready {
@@ -252,6 +456,13 @@ impl Garnish {
             bail!("task dependencies are not complete");
         }
         let schedule = self.evaluate_task_schedule_at(task_id, now)?;
+        let retry = self.db.retry_state(task_id)?;
+        let retry_allowed = retry
+            .retry_not_before
+            .is_none_or(|retry_at| retry_at <= now);
+        let (mut circuit_allowed, mut circuit_wake, mut circuit_reason) = self
+            .db
+            .adapter_circuit_gate(adapter, provider, account, now, false)?;
         let quota: Vec<_> = self
             .db
             .list_quota()?
@@ -313,12 +524,35 @@ impl Garnish {
                 PolicyDecision::Deny(reason) => (false, format!("policy.denied: {reason}")),
             }
         };
-        let allowed = schedule.eligible && policy_allowed && quota_allowed;
+        if claim_circuit_probe
+            && circuit_allowed
+            && circuit_reason == "circuit.probe_available"
+            && schedule.eligible
+            && retry_allowed
+            && policy_allowed
+            && quota_allowed
+        {
+            (circuit_allowed, circuit_wake, circuit_reason) = self
+                .db
+                .adapter_circuit_gate(adapter, provider, account, now, true)?;
+        }
+        let allowed = schedule.eligible
+            && retry_allowed
+            && circuit_allowed
+            && policy_allowed
+            && quota_allowed;
         let reason = if !schedule.eligible {
             format!(
                 "{}: task affinity {} does not match {} day {}",
                 schedule.reason_code, schedule.affinity, schedule.day_kind, schedule.local_date
             )
+        } else if !retry_allowed {
+            format!(
+                "retry.backoff: retry is deferred until {}",
+                retry.retry_not_before.expect("checked as present")
+            )
+        } else if !circuit_allowed {
+            format!("{circuit_reason}: adapter is temporarily unavailable")
         } else if !policy_allowed {
             policy_reason
         } else {
@@ -331,12 +565,11 @@ impl Garnish {
         let schedule_wake = (!schedule.eligible)
             .then_some(schedule.next_eligible_at)
             .flatten();
-        let next_wake_at = match (schedule_wake, quota_wake) {
-            (Some(schedule), Some(quota)) => Some(schedule.max(quota)),
-            (Some(schedule), None) => Some(schedule),
-            (None, Some(quota)) => Some(quota),
-            (None, None) => None,
-        };
+        let retry_wake = (!retry_allowed).then_some(retry.retry_not_before).flatten();
+        let next_wake_at = [schedule_wake, quota_wake, retry_wake, circuit_wake]
+            .into_iter()
+            .flatten()
+            .max();
         let minimum_effective_remaining_percent = quota
             .iter()
             .filter_map(|surface| surface.effective_remaining_percent)
@@ -382,7 +615,8 @@ impl Garnish {
             .collect::<Vec<_>>();
         let mut decisions = Vec::with_capacity(ready.len());
         for task in ready {
-            decisions.push(self.route_task_at(&task.id, adapter, provider, account, now)?);
+            decisions
+                .push(self.route_task_at_mode(&task.id, adapter, provider, account, now, false)?);
         }
         Ok(SchedulerPreview {
             evaluated_at: now,
@@ -1153,6 +1387,59 @@ mod tests {
         }
     }
 
+    fn prepare_active_run(garnish: &mut Garnish, task: &Task, run_id: &str, now: DateTime<Utc>) {
+        let decision = RouteDecision {
+            id: Ulid::new().to_string(),
+            task_id: task.id.clone(),
+            selected_adapter: Some("fake".into()),
+            allowed: true,
+            reason: "fixture".into(),
+            required_headroom_percent: 0.0,
+            candidates: vec![],
+            next_wake_at: None,
+            schedule: None,
+            quota: vec![],
+            policy_hash: garnish.policy.hash(),
+            created_at: now,
+        };
+        garnish.db.record_route(&decision).unwrap();
+        garnish
+            .db
+            .transition_task(&task.id, TaskStatus::Ready, TaskStatus::Leased, "fixture")
+            .unwrap();
+        garnish
+            .db
+            .transition_task(
+                &task.id,
+                TaskStatus::Leased,
+                TaskStatus::Planning,
+                "fixture",
+            )
+            .unwrap();
+        garnish
+            .db
+            .transition_task(
+                &task.id,
+                TaskStatus::Planning,
+                TaskStatus::Running,
+                "fixture",
+            )
+            .unwrap();
+        garnish
+            .db
+            .create_run(
+                run_id,
+                &task.id,
+                "fake",
+                &decision.id,
+                "/fixture/worktree",
+                "fixture",
+                "0123456789abcdef",
+                now + Duration::minutes(10),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn vertical_slice_declines_then_runs_after_override() {
         let dir = tempdir().unwrap();
@@ -1391,6 +1678,227 @@ mod tests {
         assert_eq!(wakes.len(), 1);
         assert_eq!(wakes[0].task_id, off_task.id);
         assert_eq!(wakes[0].reason_code, "schedule.ineligible_workday");
+    }
+
+    #[test]
+    fn runtime_checkpoint_pauses_when_task_day_changes() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        garnish
+            .configure_calendar("uk-week", "Europe/London", "WWWWWOO")
+            .unwrap();
+        garnish
+            .assign_project_calendar(&project.id, "uk-week")
+            .unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let mut work = task(project.id);
+        work.day_affinity = crate::domain::DayAffinity::Work;
+        let work = garnish.add_task(&work).unwrap();
+        let friday = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 24, 22, 59, 0).unwrap();
+        prepare_active_run(&mut garnish, &work, "run-day-boundary", friday);
+        let saturday = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 24, 23, 1, 0).unwrap();
+        let checkpoint = garnish
+            .checkpoint_run_at("run-day-boundary", "fake", "test", saturday)
+            .unwrap();
+        assert_eq!(checkpoint.action, CheckpointAction::Pause);
+        assert_eq!(checkpoint.reason_code, "schedule.ineligible_off_day");
+        assert_eq!(garnish.task(&work.id).unwrap().status, TaskStatus::Running);
+        garnish
+            .db
+            .record_process_outcome(
+                "run-day-boundary",
+                Some(FailureCategory::Cancelled),
+                None,
+                &serde_json::json!({"classification": "cancelled"}),
+                Some(&serde_json::json!({"term_sent": true})),
+                saturday + Duration::seconds(1),
+            )
+            .unwrap();
+        assert_eq!(garnish.task(&work.id).unwrap().status, TaskStatus::Paused);
+    }
+
+    #[test]
+    fn runtime_checkpoint_adapts_to_mid_run_quota_changes() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        let now = Utc::now();
+        prepare_active_run(&mut garnish, &task, "run-quota", now);
+        let healthy = garnish
+            .checkpoint_run_at("run-quota", "fake", "test", now + Duration::seconds(1))
+            .unwrap();
+        assert_eq!(healthy.action, CheckpointAction::Continue);
+
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(21.5),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let shortened = garnish
+            .checkpoint_run_at("run-quota", "fake", "test", now + Duration::seconds(2))
+            .unwrap();
+        assert_eq!(shortened.action, CheckpointAction::ShortenCheckpoint);
+
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(20.5),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let paused = garnish
+            .checkpoint_run_at("run-quota", "fake", "test", now + Duration::seconds(3))
+            .unwrap();
+        assert_eq!(paused.action, CheckpointAction::Pause);
+        assert_eq!(paused.reason_code, "quota.insufficient");
+    }
+
+    #[test]
+    fn scheduler_respects_persisted_retry_not_before() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        garnish
+            .db
+            .transition_task(&task.id, TaskStatus::Ready, TaskStatus::Leased, "fixture")
+            .unwrap();
+        garnish
+            .db
+            .transition_task(&task.id, TaskStatus::Leased, TaskStatus::Failed, "fixture")
+            .unwrap();
+        let now = Utc::now();
+        let plan = garnish
+            .db
+            .plan_retry(
+                &task.id,
+                "run-retry",
+                FailureCategory::Infrastructure,
+                now,
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(300),
+            )
+            .unwrap();
+        let decision = garnish
+            .route_task_at(&task.id, "fake", "fake", "test", now)
+            .unwrap();
+        assert!(!decision.allowed);
+        assert!(decision.reason.starts_with("retry.backoff"));
+        assert_eq!(decision.next_wake_at, plan.retry_at);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supervised_invocation_acknowledges_durable_cancellation_after_process_exit() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let mut work = task(project.id);
+        work.checkpoint_seconds = 1;
+        let work = garnish.add_task(&work).unwrap();
+        let now = Utc::now();
+        prepare_active_run(&mut garnish, &work, "run-cancel-process", now);
+        assert!(
+            garnish
+                .request_run_cancellation("run-cancel-process", "fixture cancellation")
+                .unwrap()
+        );
+        let invocation = Invocation {
+            executable: PathBuf::from("/bin/sh"),
+            argv: vec!["-c".into(), "sleep 5".into()],
+            cwd: source,
+            environment: std::collections::BTreeMap::new(),
+            stdin: vec![],
+            structured_protocol: None,
+            timeout: std::time::Duration::from_secs(10),
+            output_limit: 1_024,
+        };
+        let result = garnish
+            .supervise_invocation_for_run(
+                "run-cancel-process",
+                "fake",
+                "fake",
+                "test",
+                &invocation,
+                std::sync::Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        assert_eq!(result.outcome.classification, ExitClassification::Cancelled);
+        assert!(result.outcome.termination.is_some());
+        assert!(result.retry.is_none());
+        assert_eq!(
+            garnish.task(&work.id).unwrap().status,
+            TaskStatus::Cancelled
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use crate::{
     domain::{
-        CalendarException, CalendarProfile, ClaimedRunStart, DayKind, NewTask, Project,
-        ProjectLink, QuotaSurface, RouteDecision, SchedulerClaim, SchedulerLeader, SchedulerWake,
+        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ClaimedRunStart,
+        DayKind, FailureCategory, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan,
+        RetryState, RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerLeader, SchedulerWake,
         Task, TaskStatus,
     },
     schedule,
@@ -18,7 +19,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 pub struct Database {
     path: PathBuf,
@@ -72,6 +73,9 @@ impl Database {
         }
         if current < 4 {
             tx.execute_batch(MIGRATION_4)?;
+        }
+        if current < 5 {
+            tx.execute_batch(MIGRATION_5)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -855,6 +859,12 @@ impl Database {
                 leader_generation,
             ],
         )?;
+        tx.execute(
+            "INSERT INTO run_supervision(run_id, attempt, updated_at)
+             SELECT ?1, retries_used + 1, ?2
+             FROM task_retry_state WHERE task_id = ?3",
+            params![run_id, now.to_rfc3339(), task_id],
+        )?;
         let consumed = tx.execute(
             "UPDATE scheduler_claims
              SET status = 'consumed', consumed_at = ?2, run_id = ?3, action_key = ?4
@@ -1002,6 +1012,11 @@ impl Database {
                 new.fake_write_content,
                 now.to_rfc3339(),
             ],
+        )?;
+        tx.execute(
+            "INSERT INTO task_retry_state(task_id, retry_limit, retries_used, updated_at)
+             VALUES (?1, 3, 0, ?2)",
+            params![id, now.to_rfc3339()],
         )?;
         for dependency in &new.dependencies {
             let exists: bool = tx.query_row(
@@ -1425,6 +1440,12 @@ impl Database {
                 lease_expires_at.to_rfc3339(),
             ],
         )?;
+        tx.execute(
+            "INSERT INTO run_supervision(run_id, attempt, updated_at)
+             SELECT ?1, retries_used + 1, ?2
+             FROM task_retry_state WHERE task_id = ?3",
+            params![run_id, now.to_rfc3339(), task_id],
+        )?;
         append_event_tx(
             &tx,
             None,
@@ -1478,6 +1499,552 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn retry_state(&self, task_id: &str) -> Result<RetryState> {
+        self.conn
+            .query_row(
+                "SELECT task_id, retry_limit, retries_used, retry_not_before,
+                        last_failure_category, updated_at
+                 FROM task_retry_state WHERE task_id = ?1",
+                [task_id],
+                map_retry_state,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("retry state not found for task: {task_id}"))
+    }
+
+    pub fn set_retry_limit(&mut self, task_id: &str, retry_limit: u32) -> Result<RetryState> {
+        if retry_limit > 20 {
+            bail!("retry limit must be in 0..=20");
+        }
+        let changed = self.conn.execute(
+            "UPDATE task_retry_state SET retry_limit = ?2, updated_at = ?3 WHERE task_id = ?1",
+            params![task_id, retry_limit, Utc::now().to_rfc3339()],
+        )?;
+        if changed != 1 {
+            bail!("retry state not found for task: {task_id}");
+        }
+        self.retry_state(task_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_retry(
+        &mut self,
+        task_id: &str,
+        run_id: &str,
+        failure: FailureCategory,
+        now: DateTime<Utc>,
+        base_delay: std::time::Duration,
+        max_delay: std::time::Duration,
+    ) -> Result<RetryPlan> {
+        if max_delay < base_delay {
+            bail!("maximum retry delay must be at least the base delay");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (status, retry_limit, retries_used): (String, u32, u32) = tx.query_row(
+            "SELECT t.status, r.retry_limit, r.retries_used
+             FROM tasks t JOIN task_retry_state r ON r.task_id = t.id
+             WHERE t.id = ?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if status != TaskStatus::Failed.to_string() {
+            bail!("retry can only be planned for a failed task; current status is {status}");
+        }
+        let retry_number = retries_used.saturating_add(1);
+        let scheduled = failure.retryable() && retries_used < retry_limit;
+        let (reason_code, retry_at, delay_seconds) = if scheduled {
+            let delay = deterministic_retry_delay(task_id, retry_number, base_delay, max_delay)?;
+            let retry_at =
+                now + chrono::Duration::from_std(delay).context("retry delay is too large")?;
+            tx.execute(
+                "UPDATE task_retry_state
+                 SET retries_used = retries_used + 1, retry_not_before = ?2,
+                     last_failure_category = ?3, updated_at = ?4
+                 WHERE task_id = ?1 AND retries_used = ?5",
+                params![
+                    task_id,
+                    retry_at.to_rfc3339(),
+                    failure.to_string(),
+                    now.to_rfc3339(),
+                    retries_used,
+                ],
+            )?;
+            transition_task_tx(
+                &tx,
+                task_id,
+                TaskStatus::Failed,
+                TaskStatus::Ready,
+                "retry_scheduled",
+            )?;
+            (
+                "retry.scheduled".to_owned(),
+                Some(retry_at),
+                Some(delay.as_secs()),
+            )
+        } else {
+            tx.execute(
+                "UPDATE task_retry_state
+                 SET retry_not_before = NULL, last_failure_category = ?2, updated_at = ?3
+                 WHERE task_id = ?1",
+                params![task_id, failure.to_string(), now.to_rfc3339()],
+            )?;
+            (
+                if failure.retryable() {
+                    "retry.exhausted"
+                } else {
+                    "retry.permanent_failure"
+                }
+                .to_owned(),
+                None,
+                None,
+            )
+        };
+        let plan = RetryPlan {
+            task_id: task_id.into(),
+            run_id: run_id.into(),
+            scheduled,
+            reason_code,
+            retry_number,
+            retry_at,
+            delay_seconds,
+            failure_category: failure,
+        };
+        append_event_tx(
+            &tx,
+            None,
+            Some(task_id),
+            Some(run_id),
+            "run.retry_planned",
+            "supervisor",
+            &plan,
+        )?;
+        tx.commit()?;
+        Ok(plan)
+    }
+
+    pub fn run_lease_context(&self, run_id: &str) -> Result<(String, String, i64)> {
+        self.conn
+            .query_row(
+                "SELECT task_id, owner, generation FROM leases
+                 WHERE run_id = ?1 AND released_at IS NULL",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("active run lease not found: {run_id}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_run_checkpoint(
+        &mut self,
+        run_id: &str,
+        owner: &str,
+        generation: i64,
+        now: DateTime<Utc>,
+        lease_ttl: std::time::Duration,
+        action: CheckpointAction,
+        reason_code: &str,
+        next_checkpoint_at: Option<DateTime<Utc>>,
+        detail: &serde_json::Value,
+    ) -> Result<RunCheckpoint> {
+        let lease_expires_at =
+            now + chrono::Duration::from_std(lease_ttl).context("run lease TTL is too large")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let context: Option<(String, String, String, i64, String)> = tx
+            .query_row(
+                "SELECT r.task_id, r.status, t.status, l.generation, l.expires_at
+                 FROM runs r JOIN tasks t ON t.id = r.task_id
+                 JOIN leases l ON l.run_id = r.id
+                 WHERE r.id = ?1 AND l.owner = ?2 AND l.released_at IS NULL",
+                params![run_id, owner],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_id, run_status, task_status, lease_generation, lease_expiry)) = context
+        else {
+            bail!("active run lease is missing or owned by another supervisor");
+        };
+        if lease_generation != generation || parse_time(lease_expiry)? <= now {
+            bail!("run lease is expired or fenced by another generation");
+        }
+        if run_status != "running" || task_status != TaskStatus::Running.to_string() {
+            bail!("checkpoint requires a running run and task");
+        }
+        let sequence: i64 = tx.query_row(
+            "UPDATE run_supervision
+             SET checkpoint_sequence = checkpoint_sequence + 1, updated_at = ?2,
+                 version = version + 1
+             WHERE run_id = ?1
+             RETURNING checkpoint_sequence",
+            params![run_id, now.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        let checkpoint = RunCheckpoint {
+            id: Ulid::new().to_string(),
+            run_id: run_id.into(),
+            sequence,
+            evaluated_at: now,
+            action,
+            reason_code: reason_code.into(),
+            next_checkpoint_at,
+            detail: detail.clone(),
+        };
+        tx.execute(
+            "INSERT INTO run_checkpoints(
+                id, run_id, sequence, evaluated_at, action, reason_code,
+                next_checkpoint_at, detail_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                checkpoint.id,
+                run_id,
+                sequence,
+                now.to_rfc3339(),
+                action.to_string(),
+                reason_code,
+                next_checkpoint_at.map(|value| value.to_rfc3339()),
+                to_json(detail)?,
+            ],
+        )?;
+        match action {
+            CheckpointAction::Continue | CheckpointAction::ShortenCheckpoint => {
+                tx.execute(
+                    "UPDATE leases SET heartbeat_at = ?4, expires_at = ?5
+                     WHERE run_id = ?1 AND owner = ?2 AND generation = ?3
+                       AND released_at IS NULL",
+                    params![
+                        run_id,
+                        owner,
+                        generation,
+                        now.to_rfc3339(),
+                        lease_expires_at.to_rfc3339(),
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE runs SET heartbeat_at = ?2, checkpoint_due_at = ?3 WHERE id = ?1",
+                    params![
+                        run_id,
+                        now.to_rfc3339(),
+                        next_checkpoint_at.unwrap_or(lease_expires_at).to_rfc3339(),
+                    ],
+                )?;
+            }
+            CheckpointAction::Pause | CheckpointAction::Cancel => {
+                let requested_action = if action == CheckpointAction::Pause {
+                    "pause"
+                } else {
+                    "cancel"
+                };
+                tx.execute(
+                    "UPDATE runs SET heartbeat_at = ?2, checkpoint_due_at = ?3 WHERE id = ?1",
+                    params![run_id, now.to_rfc3339(), lease_expires_at.to_rfc3339()],
+                )?;
+                tx.execute(
+                    "UPDATE leases SET heartbeat_at = ?2, expires_at = ?3
+                     WHERE run_id = ?1 AND released_at IS NULL",
+                    params![run_id, now.to_rfc3339(), lease_expires_at.to_rfc3339()],
+                )?;
+                tx.execute(
+                    "UPDATE run_supervision
+                     SET cancellation_status = 'requested', cancellation_reason = ?2,
+                         cancellation_requested_at = COALESCE(cancellation_requested_at, ?3),
+                         requested_action = ?4, updated_at = ?3, version = version + 1
+                     WHERE run_id = ?1",
+                    params![run_id, reason_code, now.to_rfc3339(), requested_action],
+                )?;
+            }
+        }
+        append_event_tx(
+            &tx,
+            None,
+            Some(&task_id),
+            Some(run_id),
+            "run.checkpointed",
+            "supervisor",
+            &checkpoint,
+        )?;
+        tx.commit()?;
+        Ok(checkpoint)
+    }
+
+    pub fn request_run_cancellation(
+        &mut self,
+        run_id: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task_id: String = tx.query_row(
+            "SELECT task_id FROM runs WHERE id = ?1 AND status = 'running'",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let changed = tx.execute(
+            "UPDATE run_supervision
+             SET cancellation_status = 'requested', cancellation_reason = ?2,
+                 cancellation_requested_at = ?3, requested_action = 'cancel',
+                 updated_at = ?3, version = version + 1
+             WHERE run_id = ?1 AND cancellation_status = 'none'",
+            params![run_id, reason, now.to_rfc3339()],
+        )?;
+        if changed == 1 {
+            append_event_tx(
+                &tx,
+                None,
+                Some(&task_id),
+                Some(run_id),
+                "run.cancellation_requested",
+                "user",
+                &serde_json::json!({"reason": reason}),
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn run_cancellation_requested(&self, run_id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT cancellation_status = 'requested' FROM run_supervision WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("run supervision not found: {run_id}"))
+    }
+
+    pub fn record_process_outcome(
+        &mut self,
+        run_id: &str,
+        failure: Option<FailureCategory>,
+        exit_code: Option<i32>,
+        outcome: &serde_json::Value,
+        termination: Option<&serde_json::Value>,
+        now: DateTime<Utc>,
+    ) -> Result<String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (task_id, run_status, task_status, requested_action): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = tx.query_row(
+            "SELECT r.task_id, r.status, t.status, s.requested_action
+             FROM runs r JOIN tasks t ON t.id = r.task_id
+             JOIN run_supervision s ON s.run_id = r.id WHERE r.id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if run_status != "running" || task_status != TaskStatus::Running.to_string() {
+            bail!("process outcome requires a running run and task");
+        }
+        let (run_next, task_next) = match failure {
+            None => ("verifying", TaskStatus::Verifying),
+            Some(FailureCategory::Cancelled) if requested_action.as_deref() == Some("pause") => {
+                ("paused", TaskStatus::Paused)
+            }
+            Some(FailureCategory::Cancelled) => ("cancelled", TaskStatus::Cancelled),
+            Some(_) => ("failed", TaskStatus::Failed),
+        };
+        transition_task_tx(
+            &tx,
+            &task_id,
+            TaskStatus::Running,
+            task_next,
+            "process_outcome",
+        )?;
+        tx.execute(
+            "UPDATE runs SET status = ?2, exit_code = ?3, heartbeat_at = ?4,
+                 ended_at = CASE WHEN ?2 = 'verifying' THEN ended_at ELSE ?4 END
+             WHERE id = ?1",
+            params![run_id, run_next, exit_code, now.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE run_supervision
+             SET failure_category = ?2, termination_json = ?3, outcome_json = ?4,
+                 cancellation_status = CASE WHEN ?2 = 'cancelled' THEN 'completed'
+                                            ELSE cancellation_status END,
+                 updated_at = ?5, version = version + 1 WHERE run_id = ?1",
+            params![
+                run_id,
+                failure.map(|value| value.to_string()),
+                termination.map(to_json).transpose()?,
+                to_json(outcome)?,
+                now.to_rfc3339(),
+            ],
+        )?;
+        if failure.is_some() {
+            tx.execute(
+                "UPDATE leases SET released_at = ?2 WHERE run_id = ?1 AND released_at IS NULL",
+                params![run_id, now.to_rfc3339()],
+            )?;
+            tx.execute(
+                "UPDATE resource_locks SET released_at = ?2
+                 WHERE claim_id IN (SELECT id FROM scheduler_claims WHERE run_id = ?1)
+                   AND released_at IS NULL",
+                params![run_id, now.to_rfc3339()],
+            )?;
+        }
+        append_event_tx(
+            &tx,
+            None,
+            Some(&task_id),
+            Some(run_id),
+            "run.process_outcome",
+            "supervisor",
+            outcome,
+        )?;
+        tx.commit()?;
+        Ok(task_id)
+    }
+
+    pub fn adapter_circuit_gate(
+        &mut self,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+        claim_probe: bool,
+    ) -> Result<(bool, Option<DateTime<Utc>>, String)> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = query_circuit_tx(&tx, adapter, provider, account)?;
+        let result = match existing {
+            None => (true, None, "circuit.closed".to_owned()),
+            Some(circuit) if circuit.state == "closed" => (true, None, "circuit.closed".to_owned()),
+            Some(circuit) if circuit.state == "open" => {
+                let probe_due = circuit.next_probe_at.is_none_or(|probe| probe <= now);
+                if probe_due && claim_probe {
+                    let changed = tx.execute(
+                        "UPDATE adapter_circuits
+                         SET state = 'half_open', probe_claimed_at = ?4, updated_at = ?4
+                         WHERE adapter = ?1 AND provider = ?2 AND account = ?3
+                           AND state = 'open' AND (next_probe_at IS NULL OR next_probe_at <= ?4)",
+                        params![adapter, provider, account, now.to_rfc3339()],
+                    )?;
+                    if changed == 1 {
+                        (true, None, "circuit.half_open_probe".to_owned())
+                    } else {
+                        (
+                            false,
+                            circuit.next_probe_at,
+                            "circuit.probe_claimed".to_owned(),
+                        )
+                    }
+                } else if probe_due {
+                    (true, None, "circuit.probe_available".to_owned())
+                } else {
+                    (false, circuit.next_probe_at, "circuit.open".to_owned())
+                }
+            }
+            Some(circuit) => (
+                false,
+                circuit.next_probe_at,
+                "circuit.probe_claimed".to_owned(),
+            ),
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_adapter_outcome(
+        &mut self,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        failure: Option<FailureCategory>,
+        now: DateTime<Utc>,
+        failure_threshold: u32,
+        cooldown: std::time::Duration,
+    ) -> Result<CircuitBreaker> {
+        if failure_threshold == 0 {
+            bail!("circuit failure threshold must be greater than zero");
+        }
+        let next_probe =
+            now + chrono::Duration::from_std(cooldown).context("cooldown is too large")?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = query_circuit_tx(&tx, adapter, provider, account)?;
+        let (state, consecutive_failures, opened_at, next_probe_at, probe_claimed_at) =
+            match failure {
+                None => ("closed", 0_u32, None, None, None),
+                Some(category) if category.retryable() => {
+                    let count = existing
+                        .as_ref()
+                        .map_or(1, |circuit| circuit.consecutive_failures.saturating_add(1));
+                    let open = existing
+                        .as_ref()
+                        .is_some_and(|circuit| circuit.state == "half_open")
+                        || count >= failure_threshold;
+                    if open {
+                        ("open", count, Some(now), Some(next_probe), None)
+                    } else {
+                        ("closed", count, None, None, None)
+                    }
+                }
+                Some(_) => ("closed", 0_u32, None, None, None),
+            };
+        tx.execute(
+            "INSERT INTO adapter_circuits(
+                adapter, provider, account, state, consecutive_failures,
+                last_failure_category, opened_at, next_probe_at, probe_claimed_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(adapter, provider, account) DO UPDATE SET
+                state = excluded.state,
+                consecutive_failures = excluded.consecutive_failures,
+                last_failure_category = excluded.last_failure_category,
+                opened_at = excluded.opened_at,
+                next_probe_at = excluded.next_probe_at,
+                probe_claimed_at = excluded.probe_claimed_at,
+                updated_at = excluded.updated_at",
+            params![
+                adapter,
+                provider,
+                account,
+                state,
+                consecutive_failures,
+                failure.map(|value| value.to_string()),
+                opened_at.map(|value| value.to_rfc3339()),
+                next_probe_at.map(|value| value.to_rfc3339()),
+                probe_claimed_at.map(|value: DateTime<Utc>| value.to_rfc3339()),
+                now.to_rfc3339(),
+            ],
+        )?;
+        let circuit = query_circuit_tx(&tx, adapter, provider, account)?
+            .ok_or_else(|| anyhow!("adapter circuit write was not visible"))?;
+        tx.commit()?;
+        Ok(circuit)
+    }
+
+    pub fn adapter_circuits(&self) -> Result<Vec<CircuitBreaker>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT adapter, provider, account, state, consecutive_failures,
+                    last_failure_category, opened_at, next_probe_at, probe_claimed_at, updated_at
+             FROM adapter_circuits ORDER BY adapter, provider, account",
+        )?;
+        let rows = stmt.query_map([], map_circuit)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn append_run_event<T: Serialize>(
@@ -1934,6 +2501,95 @@ fn map_quota(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaSurface> {
     })
 }
 
+fn map_retry_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetryState> {
+    let retry_not_before: Option<String> = row.get(3)?;
+    let last_failure: Option<String> = row.get(4)?;
+    Ok(RetryState {
+        task_id: row.get(0)?,
+        retry_limit: row.get(1)?,
+        retries_used: row.get(2)?,
+        retry_not_before: retry_not_before.map(parse_time).transpose()?,
+        last_failure_category: last_failure
+            .map(|value| {
+                FailureCategory::from_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+        updated_at: parse_time(row.get(5)?)?,
+    })
+}
+
+fn map_circuit(row: &rusqlite::Row<'_>) -> rusqlite::Result<CircuitBreaker> {
+    let last_failure: Option<String> = row.get(5)?;
+    let opened_at: Option<String> = row.get(6)?;
+    let next_probe_at: Option<String> = row.get(7)?;
+    let probe_claimed_at: Option<String> = row.get(8)?;
+    Ok(CircuitBreaker {
+        adapter: row.get(0)?,
+        provider: row.get(1)?,
+        account: row.get(2)?,
+        state: row.get(3)?,
+        consecutive_failures: row.get(4)?,
+        last_failure_category: last_failure
+            .map(|value| {
+                FailureCategory::from_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        value.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+        opened_at: opened_at.map(parse_time).transpose()?,
+        next_probe_at: next_probe_at.map(parse_time).transpose()?,
+        probe_claimed_at: probe_claimed_at.map(parse_time).transpose()?,
+        updated_at: parse_time(row.get(9)?)?,
+    })
+}
+
+fn query_circuit_tx(
+    tx: &Transaction<'_>,
+    adapter: &str,
+    provider: &str,
+    account: &str,
+) -> Result<Option<CircuitBreaker>> {
+    tx.query_row(
+        "SELECT adapter, provider, account, state, consecutive_failures,
+                last_failure_category, opened_at, next_probe_at, probe_claimed_at, updated_at
+         FROM adapter_circuits WHERE adapter = ?1 AND provider = ?2 AND account = ?3",
+        params![adapter, provider, account],
+        map_circuit,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn deterministic_retry_delay(
+    task_id: &str,
+    retry_number: u32,
+    base_delay: std::time::Duration,
+    max_delay: std::time::Duration,
+) -> Result<std::time::Duration> {
+    let exponent = retry_number.saturating_sub(1).min(31);
+    let multiplier = 1_u128 << exponent;
+    let uncapped_ms = base_delay.as_millis().saturating_mul(multiplier);
+    let capped_ms = uncapped_ms.min(max_delay.as_millis());
+    let digest = Sha256::digest(format!("{task_id}:{retry_number}").as_bytes());
+    let sample = u16::from_be_bytes([digest[0], digest[1]]) as u128;
+    // Stable jitter in the inclusive 80%..120% range prevents synchronized retries.
+    let basis_points = 8_000_u128 + (sample * 4_000_u128 / u16::MAX as u128);
+    let jittered_ms = capped_ms.saturating_mul(basis_points) / 10_000_u128;
+    let bounded_ms = jittered_ms.min(max_delay.as_millis());
+    let milliseconds = u64::try_from(bounded_ms).context("retry delay exceeds u64")?;
+    Ok(std::time::Duration::from_millis(milliseconds))
+}
+
 fn ensure_acyclic_tx(tx: &Transaction<'_>) -> Result<()> {
     let cycle: bool = tx.query_row(
         "WITH RECURSIVE walk(origin, node) AS (
@@ -2317,6 +2973,72 @@ CREATE UNIQUE INDEX idx_scheduler_claim_action
     ON scheduler_claims(action_key) WHERE action_key IS NOT NULL;
 "#;
 
+const MIGRATION_5: &str = r#"
+CREATE TABLE task_retry_state (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    retry_limit INTEGER NOT NULL DEFAULT 3 CHECK(retry_limit BETWEEN 0 AND 20),
+    retries_used INTEGER NOT NULL DEFAULT 0 CHECK(retries_used >= 0),
+    retry_not_before TEXT,
+    last_failure_category TEXT,
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO task_retry_state(task_id, retry_limit, retries_used, updated_at)
+    SELECT id, 3, 0, updated_at FROM tasks;
+
+CREATE TABLE run_supervision (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL DEFAULT 1 CHECK(attempt > 0),
+    checkpoint_sequence INTEGER NOT NULL DEFAULT 0 CHECK(checkpoint_sequence >= 0),
+    failure_category TEXT,
+    cancellation_status TEXT NOT NULL DEFAULT 'none'
+        CHECK(cancellation_status IN ('none', 'requested', 'completed')),
+    cancellation_reason TEXT,
+    cancellation_requested_at TEXT,
+    requested_action TEXT CHECK(requested_action IN ('pause', 'cancel')),
+    termination_json TEXT,
+    outcome_json TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO run_supervision(run_id, attempt, updated_at)
+    SELECT id, 1, heartbeat_at FROM runs;
+
+CREATE TABLE run_checkpoints (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK(sequence > 0),
+    evaluated_at TEXT NOT NULL,
+    action TEXT NOT NULL
+        CHECK(action IN ('continue', 'shorten_checkpoint', 'pause', 'cancel')),
+    reason_code TEXT NOT NULL,
+    next_checkpoint_at TEXT,
+    detail_json TEXT NOT NULL,
+    UNIQUE(run_id, sequence)
+);
+
+CREATE INDEX idx_run_checkpoints_run
+    ON run_checkpoints(run_id, sequence);
+
+CREATE TABLE adapter_circuits (
+    adapter TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    account TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('closed', 'open', 'half_open')),
+    consecutive_failures INTEGER NOT NULL CHECK(consecutive_failures >= 0),
+    last_failure_category TEXT,
+    opened_at TEXT,
+    next_probe_at TEXT,
+    probe_claimed_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(adapter, provider, account)
+);
+
+CREATE INDEX idx_adapter_circuit_probe
+    ON adapter_circuits(state, next_probe_at);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2564,7 +3286,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -2968,5 +3690,229 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 1, 0));
+    }
+
+    #[test]
+    fn retry_backoff_is_deterministic_persisted_and_budgeted() {
+        let (dir, mut db) = database();
+        let database_path = db.path().to_path_buf();
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let project = db.add_project("one", "One", &root).unwrap();
+        let task = db
+            .add_task(&new_task(&project.id, "retry", vec![]))
+            .unwrap();
+        db.set_retry_limit(&task.id, 2).unwrap();
+        db.transition_task(&task.id, TaskStatus::Ready, TaskStatus::Leased, "fixture")
+            .unwrap();
+        db.transition_task(&task.id, TaskStatus::Leased, TaskStatus::Failed, "fixture")
+            .unwrap();
+        let now = Utc::now();
+        let expected = deterministic_retry_delay(
+            &task.id,
+            1,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(100),
+        )
+        .unwrap();
+        let first = db
+            .plan_retry(
+                &task.id,
+                "run-1",
+                FailureCategory::Infrastructure,
+                now,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(100),
+            )
+            .unwrap();
+        assert!(first.scheduled);
+        assert_eq!(first.delay_seconds, Some(expected.as_secs()));
+        let retry_at = first.retry_at.unwrap();
+        drop(db);
+
+        let mut db = Database::open(&database_path).unwrap();
+        assert_eq!(
+            db.retry_state(&task.id).unwrap().retry_not_before,
+            Some(retry_at)
+        );
+        for run_number in 2..=3 {
+            db.transition_task(&task.id, TaskStatus::Ready, TaskStatus::Leased, "fixture")
+                .unwrap();
+            db.transition_task(&task.id, TaskStatus::Leased, TaskStatus::Failed, "fixture")
+                .unwrap();
+            let plan = db
+                .plan_retry(
+                    &task.id,
+                    &format!("run-{run_number}"),
+                    FailureCategory::Infrastructure,
+                    now + chrono::Duration::minutes(run_number),
+                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_secs(100),
+                )
+                .unwrap();
+            assert_eq!(plan.scheduled, run_number == 2);
+        }
+        let state = db.retry_state(&task.id).unwrap();
+        assert_eq!(state.retries_used, 2);
+        assert!(state.retry_not_before.is_none());
+        assert_eq!(db.task(&task.id).unwrap().status, TaskStatus::Failed);
+    }
+
+    #[test]
+    fn adapter_circuit_opens_and_allows_only_one_half_open_probe() {
+        let (_dir, mut db) = database();
+        let now = Utc::now();
+        for offset in 0..3 {
+            db.record_adapter_outcome(
+                "codex",
+                "openai",
+                "primary",
+                Some(FailureCategory::AdapterTransient),
+                now + chrono::Duration::seconds(offset),
+                3,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        }
+        let circuit = db.adapter_circuits().unwrap().remove(0);
+        assert_eq!(circuit.state, "open");
+        let probe_at = circuit.next_probe_at.unwrap();
+        assert!(
+            !db.adapter_circuit_gate(
+                "codex",
+                "openai",
+                "primary",
+                probe_at - chrono::Duration::seconds(1),
+                true,
+            )
+            .unwrap()
+            .0
+        );
+        assert!(
+            db.adapter_circuit_gate("codex", "openai", "primary", probe_at, true)
+                .unwrap()
+                .0
+        );
+        assert!(
+            !db.adapter_circuit_gate("codex", "openai", "primary", probe_at, true)
+                .unwrap()
+                .0
+        );
+        let closed = db
+            .record_adapter_outcome(
+                "codex",
+                "openai",
+                "primary",
+                None,
+                probe_at,
+                3,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(closed.state, "closed");
+        assert_eq!(closed.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn checkpoints_renew_fenced_lease_and_complete_requested_cancellation() {
+        let (dir, mut db) = database();
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let project = db.add_project("one", "One", &root).unwrap();
+        let task = db
+            .add_task(&new_task(&project.id, "checkpoint", vec![]))
+            .unwrap();
+        let now = Utc::now();
+        let decision = RouteDecision {
+            id: Ulid::new().to_string(),
+            task_id: task.id.clone(),
+            selected_adapter: Some("fake".into()),
+            allowed: true,
+            reason: "fixture".into(),
+            required_headroom_percent: 0.0,
+            candidates: vec![],
+            next_wake_at: None,
+            schedule: None,
+            quota: vec![],
+            policy_hash: "fixture".into(),
+            created_at: now,
+        };
+        db.record_route(&decision).unwrap();
+        db.transition_task(&task.id, TaskStatus::Ready, TaskStatus::Leased, "fixture")
+            .unwrap();
+        db.transition_task(
+            &task.id,
+            TaskStatus::Leased,
+            TaskStatus::Planning,
+            "fixture",
+        )
+        .unwrap();
+        db.transition_task(
+            &task.id,
+            TaskStatus::Planning,
+            TaskStatus::Running,
+            "fixture",
+        )
+        .unwrap();
+        db.create_run(
+            "run-checkpoint",
+            &task.id,
+            "fake",
+            &decision.id,
+            "/fixture/worktree",
+            "fixture",
+            "0123456789abcdef",
+            now + chrono::Duration::seconds(60),
+        )
+        .unwrap();
+        let first = db
+            .apply_run_checkpoint(
+                "run-checkpoint",
+                "local",
+                1,
+                now + chrono::Duration::seconds(1),
+                std::time::Duration::from_secs(60),
+                CheckpointAction::Continue,
+                "supervision.healthy",
+                Some(now + chrono::Duration::seconds(61)),
+                &serde_json::json!({"fixture": true}),
+            )
+            .unwrap();
+        assert_eq!(first.sequence, 1);
+        assert!(
+            db.request_run_cancellation(
+                "run-checkpoint",
+                "user requested",
+                now + chrono::Duration::seconds(2),
+            )
+            .unwrap()
+        );
+        let cancelled = db
+            .apply_run_checkpoint(
+                "run-checkpoint",
+                "local",
+                1,
+                now + chrono::Duration::seconds(3),
+                std::time::Duration::from_secs(60),
+                CheckpointAction::Cancel,
+                "cancel.requested",
+                None,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(cancelled.sequence, 2);
+        assert_eq!(db.task(&task.id).unwrap().status, TaskStatus::Running);
+        assert!(db.run_lease_context("run-checkpoint").is_ok());
+        db.record_process_outcome(
+            "run-checkpoint",
+            Some(FailureCategory::Cancelled),
+            None,
+            &serde_json::json!({"classification": "cancelled"}),
+            Some(&serde_json::json!({"term_sent": true, "kill_sent": false})),
+            now + chrono::Duration::seconds(4),
+        )
+        .unwrap();
+        assert_eq!(db.task(&task.id).unwrap().status, TaskStatus::Cancelled);
+        assert!(db.run_lease_context("run-checkpoint").is_err());
     }
 }

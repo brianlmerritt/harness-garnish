@@ -65,7 +65,7 @@ garnish --data-dir .garnish-state schedule evaluate --task TASK_ID
 garnish --data-dir .garnish-state schedule preview --provider fake --account test
 ```
 
-Calendar gating is external to the agents. An ineligible task remains ready with an explained next wake time; a running task that crosses a day boundary will checkpoint and pause at the next safe boundary once the Phase 2 daemon is connected.
+Calendar gating is external to the agents. An ineligible task remains ready with an explained next wake time; a running task that crosses a day boundary requests a checkpoint and graceful pause at the next safe boundary.
 
 The scheduler arbitration commands are deliberately explicit while the daemon is being built:
 
@@ -84,10 +84,20 @@ The continuous daemon owns and renews both the leader lease and its task claims.
 garnish --data-dir .garnish-state scheduler daemon --instance local-1 --hostname my-mac
 ```
 
-By default the daemon only arbitrates and holds eligible work. `--execute-fake` additionally exercises the quota-free fake claim-to-run path: the route, claim, single-use action key, run, run lease, and project lock are bound durably before fake execution begins. Real agents remain disabled here until runtime checkpoint/cancellation supervision is connected. `--max-ticks` provides a bounded diagnostic run.
+By default the daemon only arbitrates and holds eligible work. `--execute-fake` additionally exercises the quota-free fake claim-to-run path: the route, claim, single-use action key, run, run lease, and project lock are bound durably before fake execution begins. Real agents remain opt-in while their secure-container execution path is connected. `--max-ticks` provides a bounded diagnostic run.
 
 ```console
 garnish --data-dir .garnish-state scheduler daemon --instance local-1 --hostname my-mac --execute-fake --max-ticks 1
+```
+
+Runtime supervision persists lease-fenced checkpoint decisions, cancellation intent, process termination evidence, retry budgets/backoff, and adapter circuit state. Pause/cancel decisions retain the run lease until the worker records TERM/KILL completion.
+
+```console
+garnish --data-dir .garnish-state runtime checkpoint --run RUN_ID --provider fake --account test
+garnish --data-dir .garnish-state runtime cancel --run RUN_ID --reason "user requested"
+garnish --data-dir .garnish-state runtime retry-state --task TASK_ID
+garnish --data-dir .garnish-state runtime retry-limit --task TASK_ID --limit 3
+garnish --data-dir .garnish-state runtime circuits
 ```
 
 ### Linux midpoint checkpoint
