@@ -167,6 +167,8 @@ cargo run --locked -- --data-dir .garnish-state api spend
 
 These three commands contain no placeholders. A project budget can be configured through `api budget-set`, but configuration alone never enables spending: effective policy is independently default-deny, and no subscription-quota condition can select paid API use. Secret fields accept only a locator shaped as `env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`; they never accept a key value. The authenticated read-only dashboard shows API budgets, outstanding reservations, and settled usage under **Agents & quotas**.
 
+Protected secret resolution is host-side and bounded. On Unix, `file:` targets must be regular files owned by the Garnish user with no group/other permissions (normally mode `0600`); symlinks are rejected. `keychain:` currently requires macOS. WSL2 and native Linux use `env:` or a protected Linux-side file. No API transport is enabled yet, so users should not configure or test a live credential at this stage.
+
 Successful fake execution now creates separate implementer and verifier run records. The quota-free `garnish-command-verifier:local:default` is independently selected, receives a clean detached verification worktree and its own evidence directory, and runs only the task's predeclared verification argv. It is a deterministic command verifier, not a claim of semantic agent review. Default policy requires a different verifier adapter; project policy can also require a different provider.
 
 ### Local operator interface
@@ -246,7 +248,7 @@ After updating the checkout on either the Linux VPS or WSL2, run this exact comm
 ./scripts/test-phase4-portability
 ```
 
-There are no placeholders and no additional packages or container images are required. The script removes OpenAI and Anthropic credential variables from the test environment, then runs formatting, strict lint, and the complete fixture-only suite. It automatically distinguishes native Linux from WSL2 and rejects a WSL checkout under `/mnt/<drive>`.
+There are no placeholders and no additional packages or container images are required. The script removes OpenAI and Anthropic credential variables from the test environment, then runs formatting, strict lint, and the complete fixture-only suite. It automatically distinguishes native Linux from WSL2 and rejects a WSL checkout under `/mnt/<drive>`. Both platforms passed on 2026-07-20; the combined three-platform evidence is in [`docs/phase-4-portability-checkpoint.md`](docs/phase-4-portability-checkpoint.md).
 
 ## Repository authority
 

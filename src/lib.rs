@@ -11,6 +11,7 @@ pub mod projections;
 pub mod quota;
 pub mod routing;
 pub mod schedule;
+pub mod secrets;
 pub mod service;
 pub mod web_ui;
 

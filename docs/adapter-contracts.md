@@ -227,6 +227,8 @@ trait SecretProvider {
 
 The core never requests list-all/read-all access. Secret metadata is non-sensitive. Projection favours a protected file/descriptor over environment and never argv. Redaction fingerprints are derived without storing the value.
 
+The current protected-reference foundation accepts only `env:NAME`, `file:/absolute/path`, and macOS `keychain:SERVICE/ACCOUNT`. Unix file resolution uses no-follow opening, verifies a regular file owned by the Garnish user, rejects group/other permissions, and bounds the value to 16 KiB. macOS Keychain lookup executes `/usr/bin/security` with a cleared environment, locator-only argv, bounded output, timeout, and process-tree supervision. Secret values cannot be cloned or serialized, redact `Debug`, reject whitespace/control bytes, and are cleared on drop. Windows Credential Manager remains unimplemented; WSL2 uses its Linux-side environment or protected file until an explicit Windows adapter exists.
+
 ## Notification and remote approval
 
 Local notification adapters receive a bounded summary and opaque task/run ID, not secrets or full logs. Remote approval is absent from the MVP. A future adapter requires mutually authenticated SSH/Tailscale transport, actor identity, action-digest binding, expiry, replay prevention, and an authenticated loopback control API behind the tunnel.

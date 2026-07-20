@@ -44,7 +44,9 @@ Schema 15 now implements network-free project API budgets and atomic reservation
 
 The next network-free slice adds strict OpenAI Responses and Anthropic Messages response/stream fixture parsers. They accept additive non-authoritative fields, require bounded typed output, terminal state, provider request identity, and exact usage, and reject malformed, partial, reordered, ambiguous, or authoritative schema-drift cases. Error fixtures keep authentication, permission, rate limits, paid-usage exhaustion, invalid requests, and transient provider failures distinct. There is still no HTTP transport or secret access, so this slice cannot spend money.
 
-This is intermediate evidence, not Phase 4 exit. Linux and WSL2 evidence is collected with `./scripts/test-phase4-portability` at this declared checkpoint rather than inferred from macOS.
+The protected-reference slice centralizes exact `env:NAME`, `file:/absolute/path`, and macOS `keychain:SERVICE/ACCOUNT` locators. Secret values are non-cloneable and non-serializable, have redacted debug output, receive bounded reads, and are cleared on drop. Unix files require the current user, a regular non-symlink file, and no group/other permissions; macOS Keychain lookup uses bounded supervised host execution with locator-only argv. Canary tests cover errors, debug output, SQLite/WAL state, verified backups, diagnostics, and the authenticated UI snapshot. Its macOS suite passed 119 tests with the two real-container tests explicitly ignored. No normal test reads a real credential.
+
+This is intermediate evidence, not Phase 4 exit. Linux and WSL2 both passed `./scripts/test-phase4-portability`; combined macOS/Linux/WSL2 evidence is recorded in [`phase-4-portability-checkpoint.md`](phase-4-portability-checkpoint.md).
 
 ## Explicit non-goals
 

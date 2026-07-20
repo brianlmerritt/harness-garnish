@@ -4619,7 +4619,7 @@ fn validate_api_budget_config(config: &NewApiBudget) -> Result<()> {
     {
         bail!("API account must be 1..=200 non-whitespace characters");
     }
-    validate_api_secret_reference(&config.secret_reference)?;
+    crate::secrets::SecretReference::parse(&config.secret_reference)?;
     if config.currency_limit_micros.is_some() != config.currency.is_some() {
         bail!("API monetary limits require exactly one three-letter currency");
     }
@@ -4674,41 +4674,6 @@ fn validate_api_budget_config(config: &NewApiBudget) -> Result<()> {
     }
     if config.reason.trim().is_empty() || config.reason.chars().count() > 1000 {
         bail!("API budget reason must contain 1..=1000 characters");
-    }
-    Ok(())
-}
-
-fn validate_api_secret_reference(reference: &str) -> Result<()> {
-    if reference.chars().count() > 200 || reference.chars().any(char::is_whitespace) {
-        bail!(
-            "API secret reference must be env:NAME, keychain:SERVICE/ACCOUNT, or file:/absolute/path"
-        );
-    }
-    let valid = if let Some(name) = reference.strip_prefix("env:") {
-        let mut bytes = name.bytes();
-        bytes
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    } else if let Some(value) = reference.strip_prefix("keychain:") {
-        value.split_once('/').is_some_and(|(service, account)| {
-            !service.is_empty()
-                && !account.is_empty()
-                && [service, account].iter().all(|part| {
-                    part.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b'-')
-                    })
-                })
-        })
-    } else if let Some(path) = reference.strip_prefix("file:") {
-        !path.is_empty() && std::path::Path::new(path).is_absolute()
-    } else {
-        false
-    };
-    if !valid {
-        bail!(
-            "API secret reference must be env:NAME, keychain:SERVICE/ACCOUNT, or file:/absolute/path"
-        );
     }
     Ok(())
 }

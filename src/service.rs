@@ -3031,6 +3031,91 @@ mod tests {
         assert!(garnish.api_budgets(Some("fixture")).unwrap().is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn api_secret_canary_never_enters_state_backup_diagnostics_or_ui() {
+        use crate::{secrets::SecretReference, web_ui::operator_snapshot};
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        const CANARY: &str = "secret-canary-never-persist-1d37a4b2";
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let secret_path = dir.path().join("provider-api-key");
+        let mut secret_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secret_path)
+            .unwrap();
+        writeln!(secret_file, "{CANARY}").unwrap();
+        drop(secret_file);
+
+        let data_dir = dir.path().join("state");
+        let now = Utc::now();
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let locator = format!("file:{}", secret_path.display());
+        garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id,
+                provider: "openai".into(),
+                account: "default".into(),
+                enabled: true,
+                secret_reference: locator.clone(),
+                currency: Some("USD".into()),
+                currency_limit_micros: Some(1_000),
+                token_limit: Some(1_000),
+                request_limit: Some(1),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::days(1),
+                allowed_models: vec!["gpt-fixture".into()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["planner".into()],
+                max_output_tokens: 100,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "secret canary fixture".into(),
+            })
+            .unwrap();
+        let secret = SecretReference::parse(&locator).unwrap().resolve().unwrap();
+        assert!(secret.expose(|bytes| bytes == CANARY.as_bytes()));
+        assert!(!format!("{secret:?}").contains(CANARY));
+        drop(secret);
+
+        let diagnostics = serde_json::to_vec(&garnish.diagnostics().unwrap()).unwrap();
+        let snapshot = serde_json::to_vec(&operator_snapshot(&garnish).unwrap()).unwrap();
+        assert!(
+            !diagnostics
+                .windows(CANARY.len())
+                .any(|part| part == CANARY.as_bytes())
+        );
+        assert!(
+            !snapshot
+                .windows(CANARY.len())
+                .any(|part| part == CANARY.as_bytes())
+        );
+        garnish.create_backup(None).unwrap();
+        drop(garnish);
+
+        fn assert_tree_has_no_canary(path: &Path) {
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    assert_tree_has_no_canary(&path);
+                } else {
+                    let bytes = fs::read(path).unwrap();
+                    assert!(
+                        !bytes
+                            .windows(CANARY.len())
+                            .any(|part| part == CANARY.as_bytes())
+                    );
+                }
+            }
+        }
+        assert_tree_has_no_canary(&data_dir);
+    }
+
     #[test]
     fn route_records_and_gates_on_the_exact_historical_forecast() {
         let dir = tempdir().unwrap();
