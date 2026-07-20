@@ -1,13 +1,13 @@
 # Phase 4 portability checkpoint
 
 - Date: 2026-07-20
-- Evidence boundary: Git commit `387d9db` (`phase 4 pt10`)
-- Scope: Schema 19 durable bounded fake-transport retry execution and dispatch-attempt accounting, plus the earlier exact request-plan, scheduler binding, API budget, pricing, fake-execution, and protected-reference boundaries
+- Evidence boundary: Git commit `5fdbb78` (`phase 4 pt12`)
+- Scope: direct Rustls provider transport with no redirects, proxy inheritance, or implicit replay; separately ignored paid smoke-test gate; and the earlier Schema 19 request-plan, dispatch-attempt, API-budget, pricing, and protected-reference boundaries
 - Result: passed on macOS, native Linux, and WSL2
 
 ## Safety conditions
 
-The portability script removed `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_AUTH_TOKEN` from the test process environment. The suite used fixture responses and fake executables only. It made no provider request and consumed no subscription quota or paid API credit. The two real-container tests remained explicitly ignored because this checkpoint did not opt in with digest-pinned image variables.
+The portability script removed `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and every real-API smoke selector and acknowledgement from the test process environment. The suite used fixture responses and fake executables only. It made no provider request and consumed no subscription quota or paid API credit. The two real-container tests and the one paid-API smoke test remained explicitly ignored.
 
 ## macOS
 
@@ -15,7 +15,7 @@ The portability script removed `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `ANTHR
 - Rust: 1.97.1
 - Cargo: 1.97.1
 - Strict Clippy: passed
-- Tests: 138 passed, 0 failed, 2 explicitly ignored
+- Tests: 140 passed, 0 failed, 3 explicitly ignored
 
 The macOS suite was run directly because `scripts/test-phase4-portability` deliberately accepts only Linux and WSL2. This avoids presenting a Linux portability check as a macOS test while preserving the same format, lint, and fixture-only test gates.
 
@@ -26,7 +26,7 @@ The macOS suite was run directly because `scripts/test-phase4-portability` delib
 - Cargo: 1.97.1
 - Script: `./scripts/test-phase4-portability`
 - Strict Clippy: passed
-- Tests: 138 passed, 0 failed, 2 explicitly ignored
+- Tests: 140 passed, 0 failed, 3 explicitly ignored
 - Terminal evidence: `Phase 4 quota-free portability checkpoint passed on linux`
 
 ## WSL2
@@ -37,11 +37,11 @@ The macOS suite was run directly because `scripts/test-phase4-portability` delib
 - Cargo: 1.97.1
 - Script: `./scripts/test-phase4-portability`
 - Strict Clippy: passed
-- Tests: 138 passed, 0 failed, 2 explicitly ignored
+- Tests: 140 passed, 0 failed, 3 explicitly ignored
 - Terminal evidence: `Phase 4 quota-free portability checkpoint passed on wsl2`
 
 The script's terminal success is emitted only after format, strict Clippy, and the complete locked workspace test suite succeed with provider credential variables removed.
 
 ## Conclusion
 
-P4-14 is established for the Schema 19 intermediate scope: the normal macOS/Linux/WSL2 suites are fixture-only and quota-free. Durable exact request plans, paid-API scheduler binding, bounded retryable-response handling, terminal and uncertain failure handling, restart replay denial, and exact started-attempt accounting are portable across all three platforms. This is not Phase 4 exit evidence. A real provider transport, controlled extensions, and any explicitly opted-in paid smoke test remain incomplete.
+P4-14 is established for the direct-transport intermediate scope: the normal macOS/Linux/WSL2 suites are fixture-only and quota-free. The fixed-endpoint Rustls client, explicit network opt-in, disabled redirects/proxies/client retries, bounded response validation, sensitive authorization headers, and paid-smoke denial gate are portable across all three platforms. This is not Phase 4 exit evidence. General scheduler activation, a separately opted-in paid provider smoke test, and controlled extensions remain incomplete.
