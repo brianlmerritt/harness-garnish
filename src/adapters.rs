@@ -361,6 +361,8 @@ pub struct SandboxAttestation {
     #[serde(default)]
     pub effective_capabilities: Option<Vec<String>>,
     #[serde(default)]
+    pub capability_evidence_source: Option<String>,
+    #[serde(default)]
     pub inherited_proxy_environment: Vec<String>,
     pub reasons: Vec<String>,
 }
@@ -384,6 +386,7 @@ impl FakeSandbox {
             rootless: Some(true),
             user_namespace: Some("fake-isolated".into()),
             effective_capabilities: Some(vec![]),
+            capability_evidence_source: Some("fake".into()),
             inherited_proxy_environment: vec![],
             reasons: vec![],
         }
@@ -597,30 +600,12 @@ impl PodmanBackend {
         let value = values
             .first()
             .context("podman inspect returned no container")?;
-        let caps = Command::new(&self.executable)
-            .args([
-                "container",
-                "inspect",
-                "--format",
-                "{{json .EffectiveCaps}}",
-                &spec.name,
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .context("inspecting effective Podman capabilities")?;
-        if !caps.status.success() {
-            bail!(
-                "podman effective-capability inspection failed: {}",
-                String::from_utf8_lossy(&caps.stderr).trim()
-            );
-        }
-        let effective_capabilities: Vec<String> = serde_json::from_slice(&caps.stdout)
-            .context("parsing effective Podman capabilities")?;
+        let capabilities = inspect_podman_capabilities(value)?;
         attest_podman_inspect(
             spec,
             value,
             &self.runtime,
-            effective_capabilities,
+            capabilities,
             &current_user_pair()?,
         )
     }
@@ -726,6 +711,92 @@ fn current_user_pair() -> Result<String> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PodmanCapabilityInspection {
+    effective: Vec<String>,
+    all_sets_empty: bool,
+    source: String,
+}
+
+fn inspect_podman_capabilities(
+    container: &serde_json::Value,
+) -> Result<PodmanCapabilityInspection> {
+    match container.get("EffectiveCaps") {
+        Some(serde_json::Value::Array(values)) => {
+            let effective: Vec<String> = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .context("Podman EffectiveCaps contains a non-string value")
+                })
+                .collect::<Result<_>>()?;
+            return Ok(PodmanCapabilityInspection {
+                all_sets_empty: effective.is_empty(),
+                effective,
+                source: "podman-inspect-effective-caps".into(),
+            });
+        }
+        Some(serde_json::Value::Null) | None => {}
+        Some(_) => bail!("Podman EffectiveCaps has an unsupported shape"),
+    }
+
+    // Podman 4.9 reports EffectiveCaps as null while a container is in the created state.
+    // The generated OCI runtime configuration is the pre-start source of truth in that case.
+    let oci_path = container["OCIConfigPath"]
+        .as_str()
+        .context("Podman did not provide EffectiveCaps or an OCIConfigPath")?;
+    let oci: serde_json::Value = serde_json::from_slice(
+        &fs::read(oci_path).with_context(|| format!("reading Podman OCI config {oci_path}"))?,
+    )
+    .with_context(|| format!("parsing Podman OCI config {oci_path}"))?;
+    let sets = oci["process"]["capabilities"]
+        .as_object()
+        .context("Podman OCI config is missing process.capabilities")?;
+    let required_sets = ["bounding", "effective", "inheritable", "permitted"];
+    let mut nonempty = Vec::new();
+    for set_name in required_sets {
+        let values = sets
+            .get(set_name)
+            .and_then(serde_json::Value::as_array)
+            .with_context(|| format!("Podman OCI capability set {set_name} is missing"))?;
+        for value in values {
+            let capability = value
+                .as_str()
+                .with_context(|| format!("Podman OCI capability set {set_name} is malformed"))?;
+            nonempty.push(format!("{set_name}:{capability}"));
+        }
+    }
+    if let Some(ambient) = sets.get("ambient") {
+        let values = ambient
+            .as_array()
+            .context("Podman OCI capability set ambient is malformed")?;
+        for value in values {
+            let capability = value
+                .as_str()
+                .context("Podman OCI capability set ambient is malformed")?;
+            nonempty.push(format!("ambient:{capability}"));
+        }
+    }
+    let effective = sets["effective"]
+        .as_array()
+        .expect("effective capability set was validated")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("effective capability value was validated")
+                .to_owned()
+        })
+        .collect();
+    Ok(PodmanCapabilityInspection {
+        effective,
+        all_sets_empty: nonempty.is_empty(),
+        source: "oci-runtime-config".into(),
+    })
+}
+
 fn attest_docker_inspect(
     spec: &DockerSpec,
     value: &serde_json::Value,
@@ -818,6 +889,7 @@ fn attest_docker_inspect(
         rootless: None,
         user_namespace: host["UsernsMode"].as_str().map(str::to_owned),
         effective_capabilities: None,
+        capability_evidence_source: None,
         inherited_proxy_environment: vec![],
         reasons,
     })
@@ -827,7 +899,7 @@ fn attest_podman_inspect(
     spec: &DockerSpec,
     value: &serde_json::Value,
     runtime: &PodmanRuntimeInfo,
-    effective_capabilities: Vec<String>,
+    capabilities: PodmanCapabilityInspection,
     expected_user: &str,
 ) -> Result<SandboxAttestation> {
     let host = &value["HostConfig"];
@@ -900,8 +972,8 @@ fn attest_podman_inspect(
             "root filesystem is writable",
         ),
         (
-            effective_capabilities.is_empty(),
-            "effective capabilities are not empty",
+            capabilities.all_sets_empty,
+            "Podman capability sets are not empty",
         ),
         (no_new_privileges, "no-new-privileges is missing"),
         (host["Privileged"] == false, "container is privileged"),
@@ -985,7 +1057,8 @@ fn attest_podman_inspect(
         pids_limit,
         rootless: Some(runtime.rootless),
         user_namespace: Some(user_namespace.into()),
-        effective_capabilities: Some(effective_capabilities),
+        effective_capabilities: Some(capabilities.effective),
+        capability_evidence_source: Some(capabilities.source),
         inherited_proxy_environment,
         reasons,
     })
@@ -1420,16 +1493,36 @@ mod tests {
                 "Propagation": "rprivate"
             }]
         });
-        let attestation = attest_podman_inspect(&spec, &inspect, &runtime, vec![], &user).unwrap();
+        let attestation = attest_podman_inspect(
+            &spec,
+            &inspect,
+            &runtime,
+            PodmanCapabilityInspection {
+                effective: vec![],
+                all_sets_empty: true,
+                source: "fixture".into(),
+            },
+            &user,
+        )
+        .unwrap();
         assert!(attestation.secure_container, "{:?}", attestation.reasons);
         assert_eq!(attestation.rootless, Some(true));
         assert_eq!(attestation.effective_capabilities, Some(vec![]));
 
         inspect["HostConfig"]["NetworkMode"] = serde_json::json!("host");
         inspect["Config"]["Env"] = serde_json::json!(["HTTPS_PROXY=secret.invalid"]);
-        let rejected =
-            attest_podman_inspect(&spec, &inspect, &runtime, vec!["CAP_NET_RAW".into()], &user)
-                .unwrap();
+        let rejected = attest_podman_inspect(
+            &spec,
+            &inspect,
+            &runtime,
+            PodmanCapabilityInspection {
+                effective: vec!["CAP_NET_RAW".into()],
+                all_sets_empty: false,
+                source: "fixture".into(),
+            },
+            &user,
+        )
+        .unwrap();
         assert!(!rejected.secure_container);
         assert!(
             rejected
@@ -1441,7 +1534,7 @@ mod tests {
             rejected
                 .reasons
                 .iter()
-                .any(|reason| reason.contains("capabilities"))
+                .any(|reason| reason.contains("capability"))
         );
         assert!(
             rejected
@@ -1449,6 +1542,54 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("proxy"))
         );
+    }
+
+    #[test]
+    fn podman_created_state_uses_oci_capabilities_when_effective_caps_are_null() {
+        let dir = tempdir().unwrap();
+        let oci_path = dir.path().join("config.json");
+        fs::write(
+            &oci_path,
+            serde_json::to_vec(&serde_json::json!({
+                "process": {
+                    "capabilities": {
+                        "bounding": [],
+                        "effective": [],
+                        "inheritable": [],
+                        "permitted": [],
+                        "ambient": []
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let inspect = serde_json::json!({
+            "EffectiveCaps": null,
+            "OCIConfigPath": oci_path
+        });
+        let capabilities = inspect_podman_capabilities(&inspect).unwrap();
+        assert!(capabilities.all_sets_empty);
+        assert!(capabilities.effective.is_empty());
+        assert_eq!(capabilities.source, "oci-runtime-config");
+
+        fs::write(
+            &oci_path,
+            serde_json::to_vec(&serde_json::json!({
+                "process": {
+                    "capabilities": {
+                        "bounding": ["CAP_NET_RAW"],
+                        "effective": [],
+                        "inheritable": [],
+                        "permitted": []
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let capabilities = inspect_podman_capabilities(&inspect).unwrap();
+        assert!(!capabilities.all_sets_empty);
     }
 
     #[test]
