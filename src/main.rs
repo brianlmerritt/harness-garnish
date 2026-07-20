@@ -5,10 +5,12 @@ use harness_garnish::{
     Garnish,
     adapters::AgentKind,
     domain::{DayAffinity, DayKind, NewTask, RouteTarget, SchedulerDaemonConfig},
+    web_ui::{UiServerConfig, serve_ui},
 };
 use serde::Serialize;
 use serde_json::json;
 use std::{
+    io::Write,
     path::PathBuf,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
@@ -74,7 +76,27 @@ enum Command {
         #[command(subcommand)]
         command: ApprovalCommand,
     },
+    Ui {
+        #[command(subcommand)]
+        command: UiCommand,
+    },
     Recover,
+}
+
+#[derive(Subcommand)]
+enum UiCommand {
+    Serve(UiServeArgs),
+}
+
+#[derive(Args)]
+struct UiServeArgs {
+    #[arg(long, default_value_t = 7467)]
+    port: u16,
+    #[arg(
+        long,
+        help = "Stop after this many HTTP requests; intended for bounded diagnostics"
+    )]
+    max_requests: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -217,6 +239,7 @@ enum QuotaCommand {
         about = "Fetch CodexBar JSON; may access provider authentication and the network"
     )]
     RefreshCodexbar(QuotaRefreshCodexbar),
+    Attempts,
     Reservations,
     Status,
 }
@@ -698,6 +721,7 @@ fn run() -> Result<()> {
                 args.reserve_percent,
                 StdDuration::from_secs(args.valid_seconds),
             )?),
+            QuotaCommand::Attempts => print_json(&garnish.quota_collection_attempts()?),
             QuotaCommand::Reservations => print_json(&garnish.quota_reservations()?),
             QuotaCommand::Status => print_json(&garnish.quota()?),
         },
@@ -918,6 +942,28 @@ fn run() -> Result<()> {
                 let action: serde_json::Value = serde_json::from_str(&action)?;
                 garnish.consume_approval(&id, &action)?;
                 print_json(&json!({"id": id, "status": "consumed"}))
+            }
+        },
+        Command::Ui { command } => match command {
+            UiCommand::Serve(args) => {
+                serve_ui(
+                    &garnish,
+                    &UiServerConfig {
+                        port: args.port,
+                        max_requests: args.max_requests,
+                    },
+                    |ready| {
+                        print_json(&json!({
+                            "ok": true,
+                            "mode": "read_only",
+                            "listen": ready.listen,
+                            "url": ready.url,
+                        }))?;
+                        std::io::stdout().flush()?;
+                        Ok(())
+                    },
+                )?;
+                Ok(())
             }
         },
         Command::Recover => print_json(&json!({"recovered_task_ids": garnish.recover()?})),

@@ -8,6 +8,6 @@
 | [0004](0004-quota-surfaces-and-checkpoints.md) | Multi-surface quota policy and five-minute checkpoints | Accepted |
 | [0005](0005-layered-project-policy.md) | Layered, project-specific policy with secure-container autonomy | Accepted |
 | [0006](0006-api-providers-and-updates.md) | Opt-in budgeted APIs and rollback-safe self-update | Accepted |
+| [0007](0007-local-operator-interface.md) | Authenticated loopback operator interface with CLI parity | Accepted |
 
 ADRs describe decisions, not implementation completion. A changed decision is recorded by a new ADR that supersedes the old one.
-

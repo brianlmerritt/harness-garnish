@@ -393,6 +393,31 @@ pub struct QuotaReservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaCollectionAttempt {
+    pub id: String,
+    pub provider: String,
+    pub account: String,
+    pub collector_contract: String,
+    pub status: String,
+    pub detail: String,
+    pub attempted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub id: String,
+    pub task_id: String,
+    pub effect_class: u8,
+    pub action: serde_json::Value,
+    pub decision: String,
+    pub requested_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub decided_by: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub consumed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteDecision {
     pub id: String,
     pub task_id: String,

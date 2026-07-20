@@ -5,20 +5,20 @@ use crate::{
     },
     db::Database,
     domain::{
-        AgentCapabilityProbe, AgentCapabilityStatus, BackupRecord, CalendarException,
-        CalendarProfile, CheckpointAction, CircuitBreaker, ControlState, DayKind,
-        EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project, ProjectLink,
-        QuotaReservation, QuotaSurface, RetryPlan, RetryState, RouteCandidate, RouteDecision,
-        RouteTarget, RunCheckpoint, RunSummary, ScheduleEvaluation, SchedulerClaim,
-        SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
-        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
+        AgentCapabilityProbe, AgentCapabilityStatus, ApprovalRequest, BackupRecord,
+        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ControlState,
+        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project,
+        ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface, RetryPlan, RetryState,
+        RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint, RunSummary, ScheduleEvaluation,
+        SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary,
+        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
     policy::{EffectivePolicy, PolicyDecision},
     process::{ExitClassification, ProcessOutcome},
     projections::Projector,
-    quota::collect_codexbar,
+    quota::{CODEXBAR_CONTRACT, collect_codexbar},
     routing::{
         AdapterHealth, CandidateIdentity, ProbeFreshness, RoutingCandidateInput, RoutingRequest,
         select_candidate,
@@ -82,7 +82,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 11,
+            schema_version: 12,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -369,6 +369,10 @@ impl Garnish {
         self.db.list_quota_reservations()
     }
 
+    pub fn quota_collection_attempts(&self) -> Result<Vec<QuotaCollectionAttempt>> {
+        self.db.list_quota_collection_attempts()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn refresh_quota_codexbar(
         &mut self,
@@ -380,7 +384,8 @@ impl Garnish {
         reserve_percent: f64,
         valid_for: std::time::Duration,
     ) -> Result<Vec<QuotaSurface>> {
-        let observations = collect_codexbar(
+        let attempted_at = Utc::now();
+        let observations = match collect_codexbar(
             executable,
             &self.data_dir,
             provider,
@@ -389,8 +394,35 @@ impl Garnish {
             source,
             reserve_percent,
             valid_for,
+        ) {
+            Ok(observations) => observations,
+            Err(error) => {
+                let detail: String = format!("{error:#}").chars().take(1_000).collect();
+                if let Err(evidence_error) = self.db.record_quota_collection_attempt(
+                    provider,
+                    account,
+                    CODEXBAR_CONTRACT,
+                    "failed",
+                    &detail,
+                    attempted_at,
+                ) {
+                    return Err(anyhow::anyhow!(
+                        "{error:#}; recording quota collection failure also failed: {evidence_error:#}"
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        let surfaces = self.db.record_quota_observations(&observations)?;
+        self.db.record_quota_collection_attempt(
+            provider,
+            account,
+            CODEXBAR_CONTRACT,
+            "succeeded",
+            &format!("normalized {} quota surfaces", surfaces.len()),
+            attempted_at,
         )?;
-        self.db.record_quota_observations(&observations)
+        Ok(surfaces)
     }
 
     pub fn retry_state(&self, task_id: &str) -> Result<RetryState> {
@@ -2001,6 +2033,10 @@ impl Garnish {
         )
     }
 
+    pub fn approvals(&self, limit: usize) -> Result<Vec<ApprovalRequest>> {
+        self.db.list_approvals(limit)
+    }
+
     pub fn decide_approval(&mut self, approval_id: &str, approve: bool) -> Result<()> {
         self.db.decide_approval(approval_id, approve)
     }
@@ -2457,11 +2493,12 @@ mod tests {
                 provider: "fake".into(),
                 account: "test".into(),
                 surface: "five_hour".into(),
-                remaining_percent: 90.0,
+                remaining_percent: Some(90.0),
                 reserve_percent: 20.0,
                 reset_at: None,
                 source: "codexbar:oauth".into(),
                 confidence: "provider_reported".into(),
+                unknown_reason: None,
                 observed_at,
                 valid_until: observed_at + Duration::minutes(5),
                 collector_contract: "codexbar-usage-json-v1".into(),

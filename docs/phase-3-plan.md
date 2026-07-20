@@ -13,7 +13,8 @@ Normal tests use fake executables and quota fixtures. Real CLI and quota-provide
 3. Quota providers: a versioned provider contract, CodexBar machine-readable parser, historical-usage observations, freshness/confidence, and fail-closed parser drift.
 4. Reservations: atomically reserve forecast headroom across every relevant subscription surface and release/reconcile it on completion, cancellation, failure, or recovery.
 5. Scheduler integration: select and claim the winning adapter/account together, preserve route-specific ceilings, and re-route safely after live quota or health changes.
-6. Independent verification: select a verifier separately from the implementer when policy requires it and retain distinct run/evidence records.
+6. Operator interface: an authenticated loopback-only dashboard over canonical projects, queue reasons, agent/quota state, approvals, and activity; mutations remain disabled until they have CLI-equivalent policy and evidence.
+7. Independent verification: select a verifier separately from the implementer when policy requires it and retain distinct run/evidence records.
 
 ## Machine acceptance
 
@@ -29,6 +30,7 @@ Normal tests use fake executables and quota fixtures. Real CLI and quota-provide
 | P3-08 | A mid-project quota override or manual pin change causes deterministic re-evaluation without rewriting the original decision evidence. |
 | P3-09 | Independent verification uses a separately selected run and clean verification worktree; policy can require a different adapter/provider. |
 | P3-10 | Normal macOS/Linux/WSL2 suites use fake providers only and make no provider subscription or paid API calls. |
+| P3-11 | The local operator interface binds only to loopback, requires an ephemeral token/cookie, rejects invalid hosts and unauthenticated state reads, and renders durable reason codes without enabling mutations. |
 
 ## First slice
 
@@ -40,7 +42,11 @@ The pure multi-candidate routing kernel is also implemented. It distinguishes un
 
 Schema 9 persists exact task pins as an adapter/provider/account triple and records pin/unpin events with an operator reason. Scheduler tick and daemon configuration accept repeatable `ADAPTER:PROVIDER:ACCOUNT` candidates, preflight every candidate, apply the pure score, persist the complete candidate matrix, and atomically claim capacity for the selected identity. A missing configured pin records `manual_pin.unavailable`; a pinned candidate that fails health, capability, policy, or quota remains denied.
 
-Schema 11 implements the current CodexBar machine JSON contract with bounded argv-only execution, object/array parsing, known-window normalization, additive-field tolerance, structural and numeric drift rejection, append-only observations, source confidence, five-minute default validity, and raw-payload digests. Stale evidence fails routing and mid-run checkpoints unless a live explicit override applies. Scheduler claims atomically sum and reserve forecast percentage across every selected account surface; a two-connection race admits only the claim that fits, and expiry recovery releases the orphaned reservation exactly once. P3-05 and P3-07 now have deterministic quota-free coverage. Real CodexBar refresh proof and historical-usage forecasting remain outstanding, followed by independent verifier selection.
+Schema 11 implements the current CodexBar machine JSON contract with bounded argv-only execution, object/array parsing, recognized JSONL diagnostic preludes, known-window normalization, additive-field tolerance, structural and numeric drift rejection, append-only observations, source confidence, five-minute default validity, and raw-payload digests. Expected five-hour or weekly lanes that CodexBar omits are persisted as unknown evidence rather than silently disappearing. Provider failures extract their bounded structured message whether CodexBar writes it to stdout or stderr. Stale evidence fails routing and mid-run checkpoints unless a live explicit override applies. Scheduler claims atomically sum and reserve forecast percentage across every selected account surface; a two-connection race admits only the claim that fits, and expiry recovery releases the orphaned reservation exactly once. P3-05 and P3-07 now have deterministic quota-free coverage. A real Codex OAuth refresh through CodexBar `0.45.2` passed on macOS on 2026-07-20 and exposed an unavailable expected lane, strengthening the missing-window fixture. A real Claude CLI refresh through Claude Code `2.1.215` also passed after Garnish preserved the narrowly allowlisted terminal, identity, locale, temporary-directory, configuration, and tool-manager context needed by CodexBar's nested CLI probe. API keys, OAuth tokens, and the user's private quota values remain excluded from the collector environment and project documentation. Historical-usage forecasting remains outstanding, followed by independent verifier selection.
+
+Schema 12 makes every explicit collector success or failure durable in `quota_collection_attempts`; `quota attempts` exposes the bounded evidence. A failed refresh does not overwrite the last successful observation, which naturally becomes stale when its validity ends.
+
+The first operator-interface slice adds Overview, Projects, Queue, Agents & quotas, Approvals, Activity, and Settings pages plus an authenticated `/api/v1/snapshot` endpoint. It is responsive, dependency-light, and intentionally read-only. The server binds to `127.0.0.1`, generates a new random token on every start, exchanges the startup query token for a strict `HttpOnly` cookie, validates the exact loopback `Host`, and sends no-store/CSP/frame-denial headers. Queue explanations consume durable scheduler wake reason codes. Deterministic HTML escaping, authentication, cookie, API, and projection tests use only local fixtures and no provider quota.
 
 ## Explicit non-goals
 

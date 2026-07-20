@@ -1,10 +1,11 @@
 use crate::{
     domain::{
-        AgentCapabilityProbe, BackupRecord, CalendarException, CalendarProfile, CheckpointAction,
-        CircuitBreaker, ClaimedRunStart, ControlState, DayKind, EmergencyStopResult,
-        FailureCategory, LocalNotification, NewTask, Project, ProjectLink, QuotaReservation,
-        QuotaSurface, RetryPlan, RetryState, RouteDecision, RunCheckpoint, SchedulerClaim,
-        SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
+        AgentCapabilityProbe, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
+        CheckpointAction, CircuitBreaker, ClaimedRunStart, ControlState, DayKind,
+        EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project, ProjectLink,
+        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, RetryPlan, RetryState,
+        RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader,
+        SchedulerWake, Task, TaskStatus,
     },
     quota::QuotaObservation,
     schedule,
@@ -22,7 +23,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 pub struct Database {
     path: PathBuf,
@@ -459,6 +460,9 @@ impl Database {
         }
         if current < 11 {
             tx.execute_batch(MIGRATION_11)?;
+        }
+        if current < 12 {
+            tx.execute_batch(MIGRATION_12)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1998,13 +2002,22 @@ impl Database {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut identities = Vec::with_capacity(observations.len());
         for observation in observations {
-            validate_percentage(Some(observation.remaining_percent), "remaining")?;
+            validate_percentage(observation.remaining_percent, "remaining")?;
             validate_percentage(Some(observation.reserve_percent), "reserve")?;
             if observation.valid_until <= observation.observed_at {
                 bail!("quota observation validity must end after its observation time");
             }
-            if observation.confidence != "provider_reported" {
+            if !matches!(
+                observation.confidence.as_str(),
+                "provider_reported" | "unknown"
+            ) {
                 bail!("unsupported quota observation confidence");
+            }
+            if observation.remaining_percent.is_none() && observation.unknown_reason.is_none() {
+                bail!("unknown quota observation requires an unknown reason");
+            }
+            if observation.remaining_percent.is_some() && observation.unknown_reason.is_some() {
+                bail!("known quota observation cannot include an unknown reason");
             }
             if observation.payload_sha256.len() != 64
                 || !observation
@@ -2023,13 +2036,13 @@ impl Database {
                     id, provider, account, surface_key, observed_remaining_percent,
                     reserve_percent, reset_at, source, unknown_reason, observed_at,
                     valid_until, confidence, collector_contract, provider_version, payload_sha256
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(provider, account, surface_key) DO UPDATE SET
                     observed_remaining_percent = excluded.observed_remaining_percent,
                     reserve_percent = excluded.reserve_percent,
                     reset_at = excluded.reset_at,
                     source = excluded.source,
-                    unknown_reason = NULL,
+                    unknown_reason = excluded.unknown_reason,
                     observed_at = excluded.observed_at,
                     valid_until = excluded.valid_until,
                     confidence = excluded.confidence,
@@ -2045,6 +2058,7 @@ impl Database {
                     observation.reserve_percent,
                     observation.reset_at.map(|value| value.to_rfc3339()),
                     observation.source,
+                    observation.unknown_reason,
                     observation.observed_at.to_rfc3339(),
                     observation.valid_until.to_rfc3339(),
                     observation.confidence,
@@ -2058,7 +2072,7 @@ impl Database {
                     id, surface_id, observed_remaining_percent, reserve_percent, reset_at,
                     source, unknown_reason, observed_at, valid_until, confidence,
                     collector_contract, provider_version, payload_sha256
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     Ulid::new().to_string(),
                     surface_id,
@@ -2066,6 +2080,7 @@ impl Database {
                     observation.reserve_percent,
                     observation.reset_at.map(|value| value.to_rfc3339()),
                     observation.source,
+                    observation.unknown_reason,
                     observation.observed_at.to_rfc3339(),
                     observation.valid_until.to_rfc3339(),
                     observation.confidence,
@@ -2195,6 +2210,79 @@ impl Database {
                 expires_at: parse_time(row.get(8)?)?,
                 released_at: released_at.map(parse_time).transpose()?,
                 release_reason: row.get(10)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn record_quota_collection_attempt(
+        &mut self,
+        provider: &str,
+        account: &str,
+        collector_contract: &str,
+        status: &str,
+        detail: &str,
+        attempted_at: DateTime<Utc>,
+    ) -> Result<QuotaCollectionAttempt> {
+        if !matches!(status, "succeeded" | "failed") {
+            bail!("quota collection attempt status must be succeeded or failed");
+        }
+        let detail = detail.trim();
+        if detail.is_empty() || detail.chars().count() > 1_000 {
+            bail!("quota collection attempt detail must contain 1..=1000 characters");
+        }
+        let attempt = QuotaCollectionAttempt {
+            id: Ulid::new().to_string(),
+            provider: provider.into(),
+            account: account.into(),
+            collector_contract: collector_contract.into(),
+            status: status.into(),
+            detail: detail.into(),
+            attempted_at,
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO quota_collection_attempts(
+                id, provider, account, collector_contract, status, detail, attempted_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                attempt.id,
+                attempt.provider,
+                attempt.account,
+                attempt.collector_contract,
+                attempt.status,
+                attempt.detail,
+                attempt.attempted_at.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "quota.collection_attempted",
+            "quota_provider",
+            &attempt,
+        )?;
+        tx.commit()?;
+        Ok(attempt)
+    }
+
+    pub fn list_quota_collection_attempts(&self) -> Result<Vec<QuotaCollectionAttempt>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, provider, account, collector_contract, status, detail, attempted_at
+             FROM quota_collection_attempts ORDER BY attempted_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(QuotaCollectionAttempt {
+                id: row.get(0)?,
+                provider: row.get(1)?,
+                account: row.get(2)?,
+                collector_contract: row.get(3)?,
+                status: row.get(4)?,
+                detail: row.get(5)?,
+                attempted_at: parse_time(row.get(6)?)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -3053,6 +3141,62 @@ impl Database {
             ],
         )?;
         Ok(id)
+    }
+
+    pub fn list_approvals(&self, limit: usize) -> Result<Vec<ApprovalRequest>> {
+        if limit == 0 || limit > 200 {
+            bail!("approval limit must be in 1..=200");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT id, task_id, effect_class, action_json, decision, requested_at, expires_at,
+                    decided_by, decided_at, consumed_at
+             FROM approvals
+             ORDER BY CASE WHEN decision = 'pending' THEN 0 ELSE 1 END,
+                      requested_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                id,
+                task_id,
+                effect_class,
+                action_json,
+                decision,
+                requested_at,
+                expires_at,
+                decided_by,
+                decided_at,
+                consumed_at,
+            ) = row?;
+            Ok(ApprovalRequest {
+                id,
+                task_id,
+                effect_class: u8::try_from(effect_class)
+                    .context("invalid approval effect class")?,
+                action: serde_json::from_str(&action_json).context("parsing approval action")?,
+                decision,
+                requested_at: parse_time(requested_at)?,
+                expires_at: parse_time(expires_at)?,
+                decided_by,
+                decided_at: decided_at.map(parse_time).transpose()?,
+                consumed_at: consumed_at.map(parse_time).transpose()?,
+            })
+        })
+        .collect()
     }
 
     pub fn decide_approval(&mut self, approval_id: &str, approve: bool) -> Result<()> {
@@ -4358,6 +4502,21 @@ CREATE INDEX idx_quota_reservations_claim ON quota_reservations(claim_id);
 CREATE INDEX idx_quota_reservations_run ON quota_reservations(run_id) WHERE run_id IS NOT NULL;
 "#;
 
+const MIGRATION_12: &str = r#"
+CREATE TABLE quota_collection_attempts (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    account TEXT NOT NULL,
+    collector_contract TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('succeeded', 'failed')),
+    detail TEXT NOT NULL CHECK(length(detail) BETWEEN 1 AND 1000),
+    attempted_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_quota_collection_attempts_latest
+    ON quota_collection_attempts(provider, account, attempted_at DESC, id DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4496,11 +4655,12 @@ mod tests {
             provider: "codex".into(),
             account: "personal".into(),
             surface: "five_hour".into(),
-            remaining_percent: 72.0,
+            remaining_percent: Some(72.0),
             reserve_percent: 20.0,
             reset_at: Some(observed_at + chrono::Duration::hours(3)),
             source: "codexbar:oauth".into(),
             confidence: "provider_reported".into(),
+            unknown_reason: None,
             observed_at,
             valid_until: observed_at + chrono::Duration::minutes(5),
             collector_contract: "codexbar-usage-json-v1".into(),
@@ -4510,7 +4670,7 @@ mod tests {
         db.record_quota_observations(std::slice::from_ref(&first))
             .unwrap();
         let second = QuotaObservation {
-            remaining_percent: 61.0,
+            remaining_percent: Some(61.0),
             observed_at: observed_at + chrono::Duration::minutes(1),
             valid_until: observed_at + chrono::Duration::minutes(6),
             payload_sha256: "b".repeat(64),
@@ -4576,6 +4736,13 @@ mod tests {
                 Utc::now() + chrono::Duration::minutes(5),
             )
             .unwrap();
+        let pending = db.list_approvals(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, approval);
+        assert_eq!(pending[0].effect_class, 2);
+        assert_eq!(pending[0].action, action);
+        assert_eq!(pending[0].decision, "pending");
+        assert!(db.list_approvals(0).is_err());
         db.decide_approval(&approval, true).unwrap();
         assert!(
             db.consume_approval(&approval, &serde_json::json!({"kind":"other"}))
@@ -4583,6 +4750,10 @@ mod tests {
         );
         db.consume_approval(&approval, &action).unwrap();
         assert!(db.consume_approval(&approval, &action).is_err());
+        let consumed = db.list_approvals(10).unwrap();
+        assert_eq!(consumed[0].decision, "approved");
+        assert!(consumed[0].decided_at.is_some());
+        assert!(consumed[0].consumed_at.is_some());
     }
 
     #[test]
@@ -4711,7 +4882,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -5993,7 +6164,7 @@ mod tests {
         let destination = dir.path().join("backups/state.db");
         let backup = db.backup_to(&destination, Utc::now()).unwrap();
         assert_eq!(backup.integrity, "ok");
-        assert_eq!(backup.schema_version, 11);
+        assert_eq!(backup.schema_version, 12);
         assert_eq!(backup.sha256.len(), 64);
         assert_eq!(backup.size_bytes, fs::metadata(&destination).unwrap().len());
         assert!(db.backup_to(&destination, Utc::now()).is_err());

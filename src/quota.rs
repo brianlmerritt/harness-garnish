@@ -17,16 +17,47 @@ use std::{
 
 pub const CODEXBAR_CONTRACT: &str = "codexbar-usage-json-v1";
 
+// CodexBar can delegate collection to provider CLIs. Those nested processes need
+// ordinary login-shell identity, terminal, locale, temporary-directory, and tool
+// manager paths in addition to HOME/PATH. Keep credentials and unrelated process
+// state out of the collector environment.
+const CODEXBAR_ENVIRONMENT_KEYS: &[&str] = &[
+    "HOME",
+    "PATH",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "COLORTERM",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "CLAUDE_CONFIG_DIR",
+    "BUN_INSTALL",
+    "NVM_DIR",
+    "FNM_DIR",
+    "VOLTA_HOME",
+    "MISE_DATA_DIR",
+    "ASDF_DATA_DIR",
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaObservation {
     pub provider: String,
     pub account: String,
     pub surface: String,
-    pub remaining_percent: f64,
+    pub remaining_percent: Option<f64>,
     pub reserve_percent: f64,
     pub reset_at: Option<DateTime<Utc>>,
     pub source: String,
     pub confidence: String,
+    pub unknown_reason: Option<String>,
     pub observed_at: DateTime<Utc>,
     pub valid_until: DateTime<Utc>,
     pub collector_contract: String,
@@ -102,10 +133,7 @@ pub fn codexbar_invocation(
     if let Some(account) = collector_account {
         argv.extend([OsString::from("--account"), OsString::from(account)]);
     }
-    let environment = ["HOME", "PATH", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"]
-        .into_iter()
-        .filter_map(|key| env::var(key).ok().map(|value| (key.to_owned(), value)))
-        .collect::<BTreeMap<_, _>>();
+    let environment = codexbar_environment(cwd, |key| env::var(key).ok());
     Ok(Invocation {
         executable,
         argv,
@@ -116,6 +144,18 @@ pub fn codexbar_invocation(
         timeout: StdDuration::from_secs(90),
         output_limit: 2 * 1024 * 1024,
     })
+}
+
+fn codexbar_environment(
+    cwd: &Path,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    let mut environment = CODEXBAR_ENVIRONMENT_KEYS
+        .iter()
+        .filter_map(|key| lookup(key).map(|value| ((*key).to_owned(), value)))
+        .collect::<BTreeMap<_, _>>();
+    environment.insert("PWD".into(), cwd.to_string_lossy().into_owned());
+    environment
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -135,7 +175,7 @@ pub fn collect_codexbar(
     let invocation = codexbar_invocation(executable, cwd, provider, collector_account, source)?;
     let outcome = run_invocation(&invocation, Arc::new(AtomicBool::new(false)))?;
     if outcome.classification != ExitClassification::Success {
-        let detail = bounded_text(&outcome.stderr);
+        let detail = codexbar_failure_detail(&outcome.stdout, &outcome.stderr);
         bail!(
             "CodexBar refresh failed ({:?}, exit {:?}): {detail}",
             outcome.classification,
@@ -169,14 +209,27 @@ pub fn parse_codexbar_usage(
     if valid_for.is_zero() {
         bail!("quota observation validity must be greater than zero");
     }
-    let value: serde_json::Value =
-        serde_json::from_slice(input).context("parsing CodexBar usage JSON")?;
-    let values = match value {
-        serde_json::Value::Object(_) => vec![value],
-        serde_json::Value::Array(values) if !values.is_empty() => values,
-        serde_json::Value::Array(_) => bail!("CodexBar returned an empty usage array"),
-        _ => bail!("CodexBar usage JSON must be an object or non-empty array"),
-    };
+    let records = serde_json::Deserializer::from_slice(input)
+        .into_iter::<serde_json::Value>()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parsing CodexBar usage JSON")?;
+    let mut values = Vec::new();
+    for record in records {
+        match record {
+            serde_json::Value::Object(ref object) if object.contains_key("provider") => {
+                values.push(record);
+            }
+            serde_json::Value::Object(ref object)
+                if object.contains_key("level")
+                    && object.contains_key("message")
+                    && object.contains_key("label") => {}
+            serde_json::Value::Array(payloads) => values.extend(payloads),
+            _ => bail!("CodexBar usage output contains an unexpected JSON record"),
+        }
+    }
+    if values.is_empty() {
+        bail!("CodexBar returned no usage payloads");
+    }
     let mut matching = values
         .into_iter()
         .map(serde_json::from_value::<CodexBarPayload>)
@@ -207,11 +260,16 @@ pub fn parse_codexbar_usage(
     let payload_sha256 = hex::encode(Sha256::digest(input));
     let mut surfaces = BTreeSet::new();
     let mut observations = Vec::new();
-    for (lane, window) in [
+    let windows = [
         ("primary", payload.usage.primary),
         ("secondary", payload.usage.secondary),
         ("tertiary", payload.usage.tertiary),
-    ] {
+    ];
+    let missing_lanes = windows
+        .iter()
+        .filter_map(|(lane, window)| window.is_none().then_some(*lane))
+        .collect::<BTreeSet<_>>();
+    for (lane, window) in windows {
         let Some(window) = window else { continue };
         validate_percentage(window.used_percent, "used")?;
         if window.window_minutes == Some(0) {
@@ -225,11 +283,12 @@ pub fn parse_codexbar_usage(
             provider: payload.provider.clone(),
             account: account.into(),
             surface,
-            remaining_percent: 100.0 - window.used_percent,
+            remaining_percent: Some(100.0 - window.used_percent),
             reserve_percent,
             reset_at: window.resets_at,
             source: format!("codexbar:{}", payload.source),
             confidence: "provider_reported".into(),
+            unknown_reason: None,
             observed_at: payload.usage.updated_at,
             valid_until: payload.usage.updated_at + valid_for,
             collector_contract: CODEXBAR_CONTRACT.into(),
@@ -237,10 +296,38 @@ pub fn parse_codexbar_usage(
             payload_sha256: payload_sha256.clone(),
         });
     }
+    for &(lane, surface) in expected_surfaces(&payload.provider) {
+        if missing_lanes.contains(lane) && surfaces.insert(surface.into()) {
+            observations.push(QuotaObservation {
+                provider: payload.provider.clone(),
+                account: account.into(),
+                surface: surface.into(),
+                remaining_percent: None,
+                reserve_percent,
+                reset_at: None,
+                source: format!("codexbar:{}", payload.source),
+                confidence: "unknown".into(),
+                unknown_reason: Some(format!("codexbar_missing_{lane}")),
+                observed_at: payload.usage.updated_at,
+                valid_until: payload.usage.updated_at + valid_for,
+                collector_contract: CODEXBAR_CONTRACT.into(),
+                provider_version: payload.version.clone(),
+                payload_sha256: payload_sha256.clone(),
+            });
+        }
+    }
+    observations.sort_by(|left, right| left.surface.cmp(&right.surface));
     if observations.is_empty() {
         bail!("CodexBar payload contains no quota windows");
     }
     Ok(observations)
+}
+
+fn expected_surfaces(provider: &str) -> &'static [(&'static str, &'static str)] {
+    match provider {
+        "codex" | "claude" => &[("primary", "five_hour"), ("secondary", "weekly")],
+        _ => &[],
+    }
 }
 
 fn surface_key(lane: &str, minutes: Option<u64>) -> String {
@@ -270,6 +357,48 @@ fn validate_identity(value: &str, label: &str) -> Result<()> {
 fn bounded_text(bytes: &[u8]) -> String {
     let value = String::from_utf8_lossy(bytes);
     value.chars().take(1_000).collect()
+}
+
+fn codexbar_failure_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut provider_messages = Vec::new();
+    let mut log_messages = Vec::new();
+    for value in serde_json::Deserializer::from_slice(stdout)
+        .into_iter::<serde_json::Value>()
+        .filter_map(std::result::Result::ok)
+    {
+        collect_error_messages(&value, &mut provider_messages);
+        if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
+            log_messages.push(message.to_owned());
+        }
+    }
+    provider_messages
+        .pop()
+        .or_else(|| log_messages.pop())
+        .map(|message| message.chars().take(1_000).collect())
+        .or_else(|| {
+            let detail = bounded_text(stderr);
+            (!detail.trim().is_empty()).then_some(detail)
+        })
+        .unwrap_or_else(|| "no structured diagnostic returned".into())
+}
+
+fn collect_error_messages(value: &serde_json::Value, messages: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_error_messages(value, messages);
+            }
+        }
+        serde_json::Value::Object(_) => {
+            if let Some(message) = value
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+            {
+                messages.push(message.to_owned());
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -307,9 +436,9 @@ mod tests {
         .unwrap();
         assert_eq!(observations.len(), 2);
         assert_eq!(observations[0].surface, "five_hour");
-        assert_eq!(observations[0].remaining_percent, 72.0);
+        assert_eq!(observations[0].remaining_percent, Some(72.0));
         assert_eq!(observations[1].surface, "weekly");
-        assert_eq!(observations[1].remaining_percent, 41.0);
+        assert_eq!(observations[1].remaining_percent, Some(41.0));
         assert_eq!(observations[0].confidence, "provider_reported");
         assert_eq!(
             observations[0].valid_until,
@@ -320,10 +449,17 @@ mod tests {
 
     #[test]
     fn parser_fails_closed_on_drift_ambiguity_and_invalid_percentages() {
-        assert!(parse_codexbar_usage(
-            br#"{"provider":"codex","source":"oauth","usage":{"updatedAt":"2026-07-20T18:10:22Z"}}"#,
-            "codex", "personal", None, 20.0, StdDuration::from_secs(300)
-        ).is_err());
+        assert!(
+            parse_codexbar_usage(
+                br#"{"provider":"codex","source":"oauth"}"#,
+                "codex",
+                "personal",
+                None,
+                20.0,
+                StdDuration::from_secs(300)
+            )
+            .is_err()
+        );
         let invalid = FIXTURE.replace("\"usedPercent\": 28", "\"usedPercent\": 128");
         assert!(
             parse_codexbar_usage(
@@ -362,6 +498,78 @@ mod tests {
     }
 
     #[test]
+    fn missing_expected_window_is_preserved_as_unknown_evidence() {
+        let fixture = FIXTURE.replace(
+            r#""primary": { "usedPercent": 28, "windowMinutes": 300, "resetsAt": "2026-07-20T19:15:00Z" },"#,
+            r#""primary": null,"#,
+        );
+        let observations = parse_codexbar_usage(
+            fixture.as_bytes(),
+            "codex",
+            "personal",
+            None,
+            20.0,
+            StdDuration::from_secs(300),
+        )
+        .unwrap();
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].surface, "five_hour");
+        assert_eq!(observations[0].remaining_percent, None);
+        assert_eq!(
+            observations[0].unknown_reason.as_deref(),
+            Some("codexbar_missing_primary")
+        );
+        assert_eq!(observations[0].confidence, "unknown");
+        assert_eq!(observations[1].surface, "weekly");
+    }
+
+    #[test]
+    fn machine_log_prelude_is_accepted_but_unrecognized_records_fail_closed() {
+        let logged = format!(
+            "{{\"label\":\"codexbar.fixture\",\"level\":\"warning\",\"message\":\"bounded warning\"}}\n{FIXTURE}"
+        );
+        assert_eq!(
+            parse_codexbar_usage(
+                logged.as_bytes(),
+                "codex",
+                "personal",
+                None,
+                20.0,
+                StdDuration::from_secs(300),
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        let unexpected = format!("{{\"message\":\"not a recognized log\"}}\n{FIXTURE}");
+        assert!(
+            parse_codexbar_usage(
+                unexpected.as_bytes(),
+                "codex",
+                "personal",
+                None,
+                20.0,
+                StdDuration::from_secs(300),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_provider_message_is_extracted_from_json_stdout() {
+        let stdout = br#"{"message":"diagnostic prelude"}
+[{"provider":"claude","source":"auto","error":{"code":1,"message":"No Claude session key found in browser cookies.","kind":"provider"}}]"#;
+        assert_eq!(
+            codexbar_failure_detail(stdout, b""),
+            "No Claude session key found in browser cookies."
+        );
+        assert_eq!(
+            codexbar_failure_detail(b"", b"plain failure"),
+            "plain failure"
+        );
+    }
+
+    #[test]
     fn invocation_uses_argv_boundaries_and_whitelisted_environment() {
         let dir = tempdir().unwrap();
         let executable = dir.path().join("codexbar fixture");
@@ -391,9 +599,59 @@ mod tests {
             ]
             .map(OsString::from)
         );
-        assert!(invocation.environment.keys().all(|key| matches!(
-            key.as_str(),
-            "HOME" | "PATH" | "XDG_CONFIG_HOME" | "XDG_CACHE_HOME"
-        )));
+        assert!(
+            invocation
+                .environment
+                .keys()
+                .all(|key| { key == "PWD" || CODEXBAR_ENVIRONMENT_KEYS.contains(&key.as_str()) })
+        );
+        assert_eq!(
+            invocation.environment.get("PWD"),
+            Some(&dir.path().to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn nested_cli_environment_keeps_runtime_context_but_not_credentials() {
+        let dir = tempdir().unwrap();
+        let supplied = BTreeMap::from([
+            ("HOME", "/safe/home"),
+            ("PATH", "/safe/bin"),
+            ("USER", "fixture-user"),
+            ("SHELL", "/bin/zsh"),
+            ("TERM", "xterm-256color"),
+            ("TMPDIR", "/safe/tmp"),
+            ("LANG", "en_GB.UTF-8"),
+            ("CLAUDE_CONFIG_DIR", "/safe/claude"),
+            ("BUN_INSTALL", "/safe/bun"),
+            ("ANTHROPIC_API_KEY", "must-not-leak"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "must-not-leak"),
+            ("AWS_SECRET_ACCESS_KEY", "must-not-leak"),
+        ]);
+        let environment = codexbar_environment(dir.path(), |key| {
+            supplied.get(key).map(|value| (*value).to_owned())
+        });
+
+        for key in [
+            "HOME",
+            "PATH",
+            "USER",
+            "SHELL",
+            "TERM",
+            "TMPDIR",
+            "LANG",
+            "CLAUDE_CONFIG_DIR",
+            "BUN_INSTALL",
+            "PWD",
+        ] {
+            assert!(environment.contains_key(key), "missing {key}");
+        }
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!environment.contains_key(key), "leaked {key}");
+        }
     }
 }

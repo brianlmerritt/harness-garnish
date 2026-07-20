@@ -143,7 +143,7 @@ Examples include `five_hour_percent`, `weekly_percent`, `monthly_requests`, `mon
 
 Unknown is represented by `unknown_reason`, never by `remaining_percent=100` or zero. Provider-reported values and local forecasts use distinct `source` classifications.
 
-The current schema-11 implementation materializes the latest observation in `quota_surfaces` and appends every source result to `quota_observations`. It records `valid_until`, confidence, collector contract, provider version, and a raw-payload SHA-256 digest. Account-bearing raw CodexBar JSON is not stored. An expired observation is `quota.stale`, distinct from unknown or insufficient quota; a live append-only user override remains visibly separate.
+The current schema-12 implementation materializes the latest observation in `quota_surfaces`, appends every successful source result to `quota_observations`, and records bounded success/failure evidence in `quota_collection_attempts`. It records `valid_until`, confidence, collector contract, provider version, and a raw-payload SHA-256 digest. Account-bearing raw CodexBar JSON is not stored. An expected Codex/Claude five-hour or weekly lane that is absent from a successful payload becomes an explicit unknown observation. An expired observation is `quota.stale`, distinct from unknown or insufficient quota; a live append-only user override remains visibly separate.
 
 ### `quota_overrides`
 

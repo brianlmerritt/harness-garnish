@@ -50,6 +50,62 @@ printf '%s\n' '{"provider":"codex","version":"0.144.6","source":"oauth","usage":
     assert_eq!(surfaces[0]["confidence"], "provider_reported");
     assert_eq!(surfaces[0]["collector_contract"], "codexbar-usage-json-v1");
     assert_eq!(surfaces[0]["payload_sha256"].as_str().unwrap().len(), 64);
+
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+printf '%s\n' '[{"provider":"claude","source":"auto","error":{"code":1,"kind":"provider","message":"No Claude session key found in browser cookies."}}]'
+exit 1
+"#,
+    )
+    .unwrap();
+    let failure = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "quota",
+            "refresh-codexbar",
+            "--provider",
+            "claude",
+            "--account",
+            "personal",
+            "--executable",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(failure.status.code(), Some(1));
+    let error: Value = serde_json::from_slice(&failure.stderr).unwrap();
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("No Claude session key")
+    );
+
+    let attempts = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "quota",
+            "attempts",
+        ])
+        .output()
+        .unwrap();
+    assert!(attempts.status.success());
+    let attempts: Value = serde_json::from_slice(&attempts.stdout).unwrap();
+    let attempts = attempts.as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["provider"], "claude");
+    assert_eq!(attempts[0]["status"], "failed");
+    assert!(
+        attempts[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("No Claude session key")
+    );
+    assert_eq!(attempts[1]["provider"], "codex");
+    assert_eq!(attempts[1]["status"], "succeeded");
 }
 
 #[test]
@@ -239,7 +295,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 11);
+    assert_eq!(value["schema_version"], 12);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")
