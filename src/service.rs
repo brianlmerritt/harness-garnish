@@ -3,6 +3,7 @@ use crate::{
         AgentKind, FakeSandbox, Invocation, ProbeResult, probe_aoe, probe_docker, probe_podman,
         run_invocation_with_tick, safe_write,
     },
+    api_providers::{ApiRequestSpec, PreparedApiRequest, prepare_api_request},
     db::Database,
     domain::{
         AgentCapabilityProbe, AgentCapabilityStatus, ApiBudget, ApiBudgetReservation,
@@ -411,6 +412,36 @@ impl Garnish {
             bail!("api.policy_disabled: effective policy disables this API provider");
         }
         self.db.reserve_api_budget(request)
+    }
+
+    pub fn prepare_reserved_api_request(
+        &self,
+        reservation_id: &str,
+        spec: &ApiRequestSpec,
+        now: DateTime<Utc>,
+    ) -> Result<PreparedApiRequest> {
+        let reservation = self.db.api_reservation(reservation_id)?;
+        if !self.policy.api_allowed(&reservation.provider) {
+            bail!("api.policy_disabled: effective policy disables this API provider");
+        }
+        if reservation.status != "active" || reservation.expires_at <= now {
+            bail!("api.reservation_inactive: request requires a live undispatched reservation");
+        }
+        if spec.provider != reservation.provider || spec.model != reservation.model {
+            bail!("api.reservation_mismatch: provider or model differs from the reservation");
+        }
+        if spec.max_output_tokens != reservation.reserved_output_tokens {
+            bail!("api.reservation_mismatch: output maximum differs from the reservation");
+        }
+        let latest = self.db.latest_api_budget(
+            &reservation.project_id,
+            &reservation.provider,
+            &reservation.account,
+        )?;
+        if latest.id != reservation.budget_id {
+            bail!("api.budget_superseded: reservation budget is no longer the latest revision");
+        }
+        prepare_api_request(&latest, spec, now, &reservation.request_digest)
     }
 
     pub fn claim_api_dispatch(
@@ -3114,6 +3145,115 @@ mod tests {
             }
         }
         assert_tree_has_no_canary(&data_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_request_preparation_requires_policy_live_exact_reservation_and_latest_budget() {
+        use crate::api_providers::{ApiRequestSpec, ApiToolDefinition, api_request_digest};
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        const SECRET: &str = "reserved-request-secret-canary-a103";
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let secret_path = dir.path().join("provider-api-key");
+        let mut secret_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secret_path)
+            .unwrap();
+        writeln!(secret_file, "{SECRET}").unwrap();
+        drop(secret_file);
+
+        let now = Utc::now();
+        let mut garnish = Garnish::open(dir.path().join("state")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        let config = NewApiBudget {
+            project_id: project.id.clone(),
+            provider: "openai".into(),
+            account: "default".into(),
+            enabled: true,
+            secret_reference: format!("file:{}", secret_path.display()),
+            currency: Some("USD".into()),
+            currency_limit_micros: Some(1_000),
+            token_limit: Some(1_000),
+            request_limit: Some(10),
+            period_start: now - Duration::minutes(1),
+            period_end: now + Duration::days(1),
+            allowed_models: vec!["gpt-fixture".into()],
+            allowed_tools: vec!["read_fixture".into()],
+            allowed_roles: vec!["planner".into()],
+            max_output_tokens: 20,
+            max_retries: 0,
+            max_concurrent_requests: 1,
+            reason: "request preparation fixture".into(),
+        };
+        let budget = garnish.configure_api_budget(&config).unwrap();
+        let spec = ApiRequestSpec {
+            provider: "openai".into(),
+            model: "gpt-fixture".into(),
+            instructions: "bounded fixture instructions".into(),
+            input: "bounded fixture input".into(),
+            max_output_tokens: 20,
+            tools: vec![ApiToolDefinition {
+                name: "read_fixture".into(),
+                description: "Read one fixture".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
+            stream: false,
+        };
+        let digest = api_request_digest(&budget, &spec, now).unwrap();
+        garnish.policy.openai_api_enabled = true;
+        let reservation = garnish
+            .reserve_api_budget(&ApiReservationRequest {
+                project_id: project.id,
+                task_id: task.id,
+                provider: "openai".into(),
+                account: "default".into(),
+                model: "gpt-fixture".into(),
+                role: "planner".into(),
+                request_digest: digest,
+                reserved_currency_micros: 100,
+                reserved_input_tokens: 10,
+                reserved_output_tokens: 20,
+                now,
+                expires_at: now + Duration::minutes(5),
+            })
+            .unwrap();
+
+        garnish.policy.openai_api_enabled = false;
+        let error = garnish
+            .prepare_reserved_api_request(&reservation.id, &spec, now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("api.policy_disabled"));
+        assert!(!error.contains(SECRET));
+
+        garnish.policy.openai_api_enabled = true;
+        let prepared = garnish
+            .prepare_reserved_api_request(&reservation.id, &spec, now)
+            .unwrap();
+        assert_eq!(prepared.endpoint(), "https://api.openai.com/v1/responses");
+        assert!(!format!("{prepared:?}").contains(SECRET));
+
+        let mut changed = spec.clone();
+        changed.input.push_str(" changed");
+        let error = garnish
+            .prepare_reserved_api_request(&reservation.id, &changed, now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("api.request_digest_mismatch"));
+        assert!(!error.contains(SECRET));
+
+        garnish.configure_api_budget(&config).unwrap();
+        let error = garnish
+            .prepare_reserved_api_request(&reservation.id, &spec, now)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("api.budget_superseded"));
     }
 
     #[test]

@@ -207,6 +207,8 @@ The Schema 15 fixture parser accepts bounded OpenAI `response` objects and the s
 
 The Anthropic fixture parser accepts bounded assistant `message` objects and ordered Messages API streams from `message_start` through stopped content blocks, terminal `message_delta` usage, and `message_stop`. It accounts for base, cache-creation, and cache-read input tokens; preserves terminal truncation, pause, refusal, and tool-use states; and fails closed on unknown authoritative content, mismatched deltas, invalid tool input, event reordering, or partial streams. Both parsers require the provider HTTP request ID in memory. Persistence receives only its SHA-256 hash. HTTP authentication, permission, rate limit, paid-usage exhaustion, invalid request, and transient provider failures remain distinct classifications.
 
+Prepared requests have fixed provider endpoints, bounded JSON bodies, public headers, and a separately held secret header value. They are non-serializable and redact bodies, prompts, request IDs, responses, and authorization material from `Debug` and errors. OpenAI credentials are delivered only as an `Authorization: Bearer` header; Anthropic credentials are delivered only as `x-api-key`, with the explicit API-version header. The transport interface has no real implementation yet and cannot choose an endpoint or acquire a secret itself.
+
 ## Verification adapter
 
 Verification commands use argv arrays, a clean sandbox, and the produced commit/patch. The contract returns command, cwd, environment fingerprint, tool versions, start/end, exit status, bounded output artifact, and result. Independent review is a separate role/run and cannot mutate the implementation worktree.

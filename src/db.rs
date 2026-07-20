@@ -2523,7 +2523,7 @@ impl Database {
             }),
         )?;
         tx.commit()?;
-        self.api_budget_by_id(&id)
+        self.api_budget(&id)
     }
 
     pub fn latest_api_budget(
@@ -2928,7 +2928,7 @@ impl Database {
         Ok(rows)
     }
 
-    fn api_budget_by_id(&self, id: &str) -> Result<ApiBudget> {
+    pub fn api_budget(&self, id: &str) -> Result<ApiBudget> {
         self.conn
             .query_row(
                 &format!("{API_BUDGET_SELECT} WHERE id = ?1"),
@@ -2937,6 +2937,17 @@ impl Database {
             )
             .optional()?
             .ok_or_else(|| anyhow!("API budget not found: {id}"))
+    }
+
+    pub fn api_reservation(&self, id: &str) -> Result<ApiBudgetReservation> {
+        self.conn
+            .query_row(
+                &format!("{API_RESERVATION_SELECT} WHERE id = ?1"),
+                [id],
+                map_api_reservation,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("API budget reservation not found: {id}"))
     }
 
     pub fn record_route(&mut self, decision: &RouteDecision) -> Result<()> {

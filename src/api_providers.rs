@@ -1,12 +1,359 @@
+use crate::{
+    domain::ApiBudget,
+    secrets::{SecretReference, SecretValue},
+};
 use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, fmt};
 
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EVENTS: usize = 100_000;
 const MAX_ITEMS: usize = 4_096;
 const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INSTRUCTIONS_BYTES: usize = 256 * 1024;
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOOLS: usize = 64;
+
+#[derive(Clone, PartialEq)]
+pub struct ApiToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ApiRequestSpec {
+    pub provider: String,
+    pub model: String,
+    pub instructions: String,
+    pub input: String,
+    pub max_output_tokens: u64,
+    pub tools: Vec<ApiToolDefinition>,
+    pub stream: bool,
+}
+
+impl fmt::Debug for ApiRequestSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiRequestSpec")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("instructions", &"[REDACTED]")
+            .field("input", &"[REDACTED]")
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field(
+                "tools",
+                &self
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("stream", &self.stream)
+            .finish()
+    }
+}
+
+pub struct PreparedApiRequest {
+    provider: String,
+    endpoint: &'static str,
+    public_headers: BTreeMap<String, String>,
+    secret_header_name: &'static str,
+    secret_header_prefix: &'static [u8],
+    secret: SecretValue,
+    body: Vec<u8>,
+}
+
+impl PreparedApiRequest {
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    pub fn endpoint(&self) -> &str {
+        self.endpoint
+    }
+
+    pub fn body_sha256(&self) -> String {
+        hex::encode(Sha256::digest(&self.body))
+    }
+
+    pub fn with_sensitive_parts<T>(
+        &self,
+        operation: impl FnOnce(&str, &BTreeMap<String, String>, &str, &[u8], &[u8], &[u8]) -> T,
+    ) -> T {
+        self.secret.expose(|secret| {
+            operation(
+                self.endpoint,
+                &self.public_headers,
+                self.secret_header_name,
+                self.secret_header_prefix,
+                secret,
+                &self.body,
+            )
+        })
+    }
+}
+
+impl fmt::Debug for PreparedApiRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedApiRequest")
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("public_headers", &self.public_headers)
+            .field("secret_header_name", &self.secret_header_name)
+            .field("secret_header", &"[REDACTED]")
+            .field("body", &"[REDACTED]")
+            .field("body_bytes", &self.body.len())
+            .field("body_sha256", &self.body_sha256())
+            .finish()
+    }
+}
+
+pub trait ApiTransport {
+    fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse>;
+}
+
+pub struct ApiTransportResponse {
+    status_code: u16,
+    request_id: String,
+    body: Vec<u8>,
+    streamed: bool,
+}
+
+impl ApiTransportResponse {
+    pub fn new(
+        status_code: u16,
+        request_id: String,
+        body: Vec<u8>,
+        streamed: bool,
+    ) -> Result<Self> {
+        if !(100..=599).contains(&status_code) {
+            bail!("api.transport_status_invalid: HTTP status is out of range");
+        }
+        validate_opaque_id(&request_id, "provider request ID")?;
+        validate_payload(&body)?;
+        Ok(Self {
+            status_code,
+            request_id,
+            body,
+            streamed,
+        })
+    }
+
+    pub fn status_code(&self) -> u16 {
+        self.status_code
+    }
+}
+
+impl fmt::Debug for ApiTransportResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiTransportResponse")
+            .field("status_code", &self.status_code)
+            .field("request_id", &"[REDACTED]")
+            .field("body", &"[REDACTED]")
+            .field("body_bytes", &self.body.len())
+            .field("streamed", &self.streamed)
+            .finish()
+    }
+}
+
+pub fn parse_api_transport_response(
+    provider: &str,
+    response: &ApiTransportResponse,
+) -> Result<ApiProviderResponse> {
+    if !(200..=299).contains(&response.status_code) {
+        let classification = classify_api_failure(provider, response.status_code, &response.body);
+        bail!(
+            "api.provider_failure: kind={:?} retryable={}",
+            classification.kind,
+            classification.retryable
+        );
+    }
+    match (provider, response.streamed) {
+        ("openai", false) => parse_openai_response(&response.request_id, &response.body),
+        ("openai", true) => parse_openai_response_stream(&response.request_id, &response.body),
+        ("anthropic", false) => parse_anthropic_response(&response.request_id, &response.body),
+        ("anthropic", true) => {
+            parse_anthropic_response_stream(&response.request_id, &response.body)
+        }
+        _ => bail!("api.provider_denied: unsupported API provider"),
+    }
+}
+
+pub(crate) fn prepare_api_request(
+    budget: &ApiBudget,
+    spec: &ApiRequestSpec,
+    now: DateTime<Utc>,
+    expected_request_digest: &str,
+) -> Result<PreparedApiRequest> {
+    validate_request_against_budget(budget, spec, now)?;
+    validate_sha256_text(expected_request_digest, "expected API request digest")?;
+    let body = build_api_request_body(spec)?;
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        bail!("api.request_bounds: serialized request body exceeds byte limit");
+    }
+    let body_digest = hex::encode(Sha256::digest(&body));
+    if !body_digest.eq_ignore_ascii_case(expected_request_digest) {
+        bail!("api.request_digest_mismatch: prepared request differs from its reservation");
+    }
+    let (endpoint, headers, secret_header_name, secret_header_prefix) = match spec.provider.as_str()
+    {
+        "openai" => (
+            "https://api.openai.com/v1/responses",
+            BTreeMap::from([("content-type".into(), "application/json".into())]),
+            "authorization",
+            b"Bearer ".as_slice(),
+        ),
+        "anthropic" => (
+            "https://api.anthropic.com/v1/messages",
+            BTreeMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("anthropic-version".into(), "2023-06-01".into()),
+            ]),
+            "x-api-key",
+            b"".as_slice(),
+        ),
+        _ => bail!("api.provider_denied: unsupported API provider"),
+    };
+    // Resolution is deliberately last: every policy-shaped budget/model/tool/output/period
+    // check and all local serialization bounds fail before a secret provider is touched.
+    let secret = SecretReference::parse(&budget.secret_reference)?.resolve()?;
+    Ok(PreparedApiRequest {
+        provider: spec.provider.clone(),
+        endpoint,
+        public_headers: headers,
+        secret_header_name,
+        secret_header_prefix,
+        secret,
+        body,
+    })
+}
+
+pub fn api_request_digest(
+    budget: &ApiBudget,
+    spec: &ApiRequestSpec,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    validate_request_against_budget(budget, spec, now)?;
+    let body = build_api_request_body(spec)?;
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        bail!("api.request_bounds: serialized request body exceeds byte limit");
+    }
+    Ok(hex::encode(Sha256::digest(body)))
+}
+
+fn build_api_request_body(spec: &ApiRequestSpec) -> Result<Vec<u8>> {
+    match spec.provider.as_str() {
+        "openai" => build_openai_body(spec),
+        "anthropic" => build_anthropic_body(spec),
+        _ => bail!("api.provider_denied: unsupported API provider"),
+    }
+}
+
+fn validate_request_against_budget(
+    budget: &ApiBudget,
+    spec: &ApiRequestSpec,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if !budget.enabled {
+        bail!("api.disabled: the latest project API budget is disabled");
+    }
+    if now < budget.period_start || now >= budget.period_end {
+        bail!("api.period_inactive: the API budget period is not active");
+    }
+    if spec.provider != budget.provider {
+        bail!("api.provider_mismatch: request provider differs from its budget");
+    }
+    if !budget.allowed_models.contains(&spec.model) {
+        bail!("api.model_denied: model is not in the project allowlist");
+    }
+    if spec.max_output_tokens == 0 || spec.max_output_tokens > budget.max_output_tokens {
+        bail!("api.output_limit: request exceeds the project output-token ceiling");
+    }
+    if spec.instructions.is_empty() || spec.instructions.len() > MAX_INSTRUCTIONS_BYTES {
+        bail!("api.request_bounds: instructions must be nonempty and bounded");
+    }
+    if spec.input.is_empty() || spec.input.len() > MAX_INPUT_BYTES {
+        bail!("api.request_bounds: input must be nonempty and bounded");
+    }
+    if spec.tools.len() > MAX_TOOLS {
+        bail!("api.tool_limit: request contains too many tools");
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for tool in &spec.tools {
+        validate_name(&tool.name, "API tool name")?;
+        if !names.insert(tool.name.as_str()) {
+            bail!("api.tool_duplicate: request tool names must be unique");
+        }
+        if !budget.allowed_tools.contains(&tool.name) {
+            bail!("api.tool_denied: tool is not in the project allowlist");
+        }
+        if tool.description.is_empty() || tool.description.len() > 10_000 {
+            bail!("api.tool_invalid: tool description must be nonempty and bounded");
+        }
+        if !tool.input_schema.is_object() {
+            bail!("api.tool_invalid: tool input schema must be an object");
+        }
+    }
+    Ok(())
+}
+
+fn build_openai_body(spec: &ApiRequestSpec) -> Result<Vec<u8>> {
+    let tools = spec
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+                "strict": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "model": spec.model,
+        "instructions": spec.instructions,
+        "input": [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": spec.input}],
+        }],
+        "max_output_tokens": spec.max_output_tokens,
+        "tools": tools,
+        "stream": spec.stream,
+    }))
+    .map_err(Into::into)
+}
+
+fn build_anthropic_body(spec: &ApiRequestSpec) -> Result<Vec<u8>> {
+    let tools = spec
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_vec(&serde_json::json!({
+        "model": spec.model,
+        "max_tokens": spec.max_output_tokens,
+        "system": spec.instructions,
+        "messages": [{"role": "user", "content": spec.input}],
+        "tools": tools,
+        "stream": spec.stream,
+    }))
+    .map_err(Into::into)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -18,8 +365,7 @@ pub enum ApiTerminalStatus {
     Paused,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone, PartialEq)]
 pub enum ApiOutputItem {
     Text {
         text: String,
@@ -34,7 +380,22 @@ pub enum ApiOutputItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl fmt::Debug for ApiOutputItem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { .. } => formatter.write_str("Text([REDACTED])"),
+            Self::ToolCall { name, .. } => formatter
+                .debug_struct("ToolCall")
+                .field("id", &"[REDACTED]")
+                .field("name", name)
+                .field("arguments", &"[REDACTED]")
+                .finish(),
+            Self::Refusal { .. } => formatter.write_str("Refusal([REDACTED])"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ApiProviderResponse {
     pub provider: String,
     pub provider_response_id: String,
@@ -44,6 +405,22 @@ pub struct ApiProviderResponse {
     pub output: Vec<ApiOutputItem>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+impl fmt::Debug for ApiProviderResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiProviderResponse")
+            .field("provider", &self.provider)
+            .field("provider_response_id", &"[REDACTED]")
+            .field("request_id", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("terminal_status", &self.terminal_status)
+            .field("output_items", &self.output.len())
+            .field("input_tokens", &self.input_tokens)
+            .field("output_tokens", &self.output_tokens)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,6 +1049,13 @@ fn validate_opaque_id(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_sha256_text(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("api.digest_invalid: {label} must be a hexadecimal SHA-256");
+    }
+    Ok(())
+}
+
 fn validate_model(value: &str) -> Result<()> {
     if value.len() > 200 || value.chars().any(char::is_whitespace) {
         bail!("api.model_invalid: provider model identifier is invalid");
@@ -743,6 +1127,7 @@ fn ensure_anthropic_started(response_id: &Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     const OPENAI_RESPONSE: &str = r#"{
         "id":"resp_fixture_001",
@@ -784,6 +1169,215 @@ mod tests {
         "future":{"safe":"ignored"}
     }"#;
 
+    fn request_budget(provider: &str, secret_reference: String, now: DateTime<Utc>) -> ApiBudget {
+        ApiBudget {
+            id: "budget-fixture".into(),
+            project_id: "project-fixture".into(),
+            provider: provider.into(),
+            account: "default".into(),
+            enabled: true,
+            secret_reference,
+            currency: Some("USD".into()),
+            currency_limit_micros: Some(1_000_000),
+            token_limit: Some(100_000),
+            request_limit: Some(10),
+            period_start: now - Duration::minutes(1),
+            period_end: now + Duration::days(1),
+            allowed_models: vec![format!("{provider}-fixture-model")],
+            allowed_tools: vec!["read_fixture".into()],
+            allowed_roles: vec!["planner".into()],
+            max_output_tokens: 1_000,
+            max_retries: 0,
+            max_concurrent_requests: 1,
+            reason: "request fixture".into(),
+            created_at: now,
+            supersedes_id: None,
+        }
+    }
+
+    fn request_spec(provider: &str) -> ApiRequestSpec {
+        ApiRequestSpec {
+            provider: provider.into(),
+            model: format!("{provider}-fixture-model"),
+            instructions: "system-canary-never-debug-01".into(),
+            input: "prompt-canary-never-debug-02".into(),
+            max_output_tokens: 100,
+            tools: vec![ApiToolDefinition {
+                name: "read_fixture".into(),
+                description: "Read one fixture".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false,
+                }),
+            }],
+            stream: true,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_requests_use_fixed_endpoints_and_redact_secret_and_prompt_canaries() {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        use tempfile::tempdir;
+
+        const SECRET: &str = "provider-secret-canary-never-debug-03";
+        let directory = tempdir().unwrap();
+        let secret_path = directory.path().join("api-key");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secret_path)
+            .unwrap();
+        writeln!(file, "{SECRET}").unwrap();
+        drop(file);
+        let now = Utc::now();
+        for provider in ["openai", "anthropic"] {
+            let budget = request_budget(provider, format!("file:{}", secret_path.display()), now);
+            let spec = request_spec(provider);
+            let digest = api_request_digest(&budget, &spec, now).unwrap();
+            let request = prepare_api_request(&budget, &spec, now, &digest).unwrap();
+            let debug = format!("{request:?}");
+            for canary in [
+                SECRET,
+                "system-canary-never-debug-01",
+                "prompt-canary-never-debug-02",
+            ] {
+                assert!(!debug.contains(canary));
+            }
+            assert_eq!(request.provider(), provider);
+            assert_eq!(request.body_sha256().len(), 64);
+            request.with_sensitive_parts(|endpoint, headers, secret_name, prefix, secret, body| {
+                assert_eq!(secret, SECRET.as_bytes());
+                assert_eq!(headers.get("content-type").unwrap(), "application/json");
+                let body: Value = serde_json::from_slice(body).unwrap();
+                assert_eq!(body["model"], format!("{provider}-fixture-model"));
+                assert_eq!(body["stream"], true);
+                match provider {
+                    "openai" => {
+                        assert_eq!(endpoint, "https://api.openai.com/v1/responses");
+                        assert_eq!(secret_name, "authorization");
+                        assert_eq!(prefix, b"Bearer ");
+                        assert_eq!(body["max_output_tokens"], 100);
+                        assert_eq!(body["tools"][0]["strict"], true);
+                    }
+                    "anthropic" => {
+                        assert_eq!(endpoint, "https://api.anthropic.com/v1/messages");
+                        assert_eq!(secret_name, "x-api-key");
+                        assert!(prefix.is_empty());
+                        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+                        assert_eq!(body["max_tokens"], 100);
+                        assert_eq!(body["tools"][0]["name"], "read_fixture");
+                    }
+                    _ => unreachable!(),
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn request_gates_fail_before_an_unavailable_secret_is_resolved() {
+        let now = Utc::now();
+        let mut budget = request_budget(
+            "openai",
+            "file:/definitely/not/a/real/garnish-secret".into(),
+            now,
+        );
+        let mut spec = request_spec("openai");
+
+        budget.enabled = false;
+        let error = prepare_api_request(&budget, &spec, now, &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("api.disabled"));
+        budget.enabled = true;
+
+        spec.model = "denied-model".into();
+        let error = prepare_api_request(&budget, &spec, now, &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("api.model_denied"));
+        spec.model = "openai-fixture-model".into();
+
+        spec.tools[0].name = "denied_tool".into();
+        let error = prepare_api_request(&budget, &spec, now, &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("api.tool_denied"));
+        spec.tools[0].name = "read_fixture".into();
+
+        spec.max_output_tokens = 1_001;
+        let error = prepare_api_request(&budget, &spec, now, &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("api.output_limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_transport_receives_sensitive_parts_without_debug_or_error_disclosure() {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        use tempfile::tempdir;
+
+        const SECRET: &str = "fake-transport-secret-canary-04";
+        struct FakeTransport {
+            sent: bool,
+        }
+        impl ApiTransport for FakeTransport {
+            fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse> {
+                request.with_sensitive_parts(|endpoint, _, secret_name, prefix, secret, body| {
+                    assert_eq!(endpoint, "https://api.openai.com/v1/responses");
+                    assert_eq!(secret_name, "authorization");
+                    assert_eq!(prefix, b"Bearer ");
+                    assert_eq!(secret, SECRET.as_bytes());
+                    let body: Value = serde_json::from_slice(body).unwrap();
+                    assert_eq!(body["model"], "openai-fixture-model");
+                });
+                self.sent = true;
+                ApiTransportResponse::new(
+                    200,
+                    "req_fake_transport_001".into(),
+                    OPENAI_RESPONSE.as_bytes().to_vec(),
+                    false,
+                )
+            }
+        }
+
+        let directory = tempdir().unwrap();
+        let secret_path = directory.path().join("api-key");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secret_path)
+            .unwrap();
+        writeln!(file, "{SECRET}").unwrap();
+        drop(file);
+        let now = Utc::now();
+        let budget = request_budget("openai", format!("file:{}", secret_path.display()), now);
+        let mut spec = request_spec("openai");
+        spec.stream = false;
+        let digest = api_request_digest(&budget, &spec, now).unwrap();
+        let request = prepare_api_request(&budget, &spec, now, &digest).unwrap();
+        let mut transport = FakeTransport { sent: false };
+        let response = transport.send(&request).unwrap();
+        assert!(transport.sent);
+        let debug = format!("{response:?}");
+        assert!(!debug.contains(SECRET));
+        assert!(!debug.contains("req_fake_transport_001"));
+        assert!(!debug.contains("fixture result"));
+        let parsed = parse_api_transport_response("openai", &response).unwrap();
+        assert_eq!(parsed.provider_response_id, "resp_fixture_001");
+
+        let failure = ApiTransportResponse::new(
+            429,
+            "req_fake_transport_002".into(),
+            br#"{"error":{"code":"insufficient_quota","message":"canary body"}}"#.to_vec(),
+            false,
+        )
+        .unwrap();
+        let error = parse_api_transport_response("openai", &failure)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("UsageExhausted"));
+        assert!(!error.contains("canary body"));
+        assert!(!error.contains("req_fake_transport_002"));
+    }
+
     #[test]
     fn openai_response_accepts_additive_fields_and_requires_exact_usage() {
         let response =
@@ -792,6 +1386,10 @@ mod tests {
         assert_eq!(response.input_tokens, 12);
         assert_eq!(response.output_tokens, 5);
         assert_eq!(response.terminal_status, ApiTerminalStatus::Completed);
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("req_fixture_001"));
+        assert!(!debug.contains("resp_fixture_001"));
+        assert!(!debug.contains("fixture result"));
         assert_eq!(
             response.output,
             vec![ApiOutputItem::Text {
