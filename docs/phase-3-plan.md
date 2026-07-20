@@ -4,6 +4,8 @@
 
 Phase 3 replaces single-candidate routing with deterministic selection across Codex CLI, Claude Code, and Antigravity. Hard policy, capability, health, freshness, quota, reservation, and manual-pin gates remain outside every agent. Scoring may rank only candidates that pass all hard gates, and every component of the selected score is recorded.
 
+Phase 3 exited successfully on 2026-07-20. Final macOS, Linux VPS, and WSL2 evidence is recorded in [`phase-3-exit-report.md`](phase-3-exit-report.md).
+
 Normal tests use fake executables and quota fixtures. Real CLI and quota-provider checks are separate opt-ins and must state whether they can consume subscription quota before running.
 
 ## Implementation stages

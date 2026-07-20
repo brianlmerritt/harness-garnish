@@ -4,7 +4,9 @@ Harness Garnish is a local control plane for quota-aware, policy-controlled AI-a
 
 Phase 0 established the architecture under [`docs/`](docs/README.md). The Phase 1 Rust vertical slice is now implemented and locally verified; its exact evidence, limitations, and deferred smoke tests are recorded in [`docs/phase-1-exit-report.md`](docs/phase-1-exit-report.md).
 
-Phase 2 is complete. Its schema-7 durable scheduler, supervision/recovery matrices, day-aware scheduling, container evidence, and final macOS/Linux/WSL2 results are recorded in [`docs/phase-2-exit-report.md`](docs/phase-2-exit-report.md). Phase 3 begins multi-agent capability and quota routing.
+Phase 2 is complete. Its schema-7 durable scheduler, supervision/recovery matrices, day-aware scheduling, container evidence, and final macOS/Linux/WSL2 results are recorded in [`docs/phase-2-exit-report.md`](docs/phase-2-exit-report.md).
+
+Phase 3 is complete. Its schema-14 multi-agent capability routing, quota observations/reservations/forecasting, authenticated local operator interface, separate verifier runs, and final macOS/Linux/WSL2 results are recorded in [`docs/phase-3-exit-report.md`](docs/phase-3-exit-report.md).
 
 ## Confirmed direction
 
