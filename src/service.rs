@@ -5,10 +5,11 @@ use crate::{
     },
     db::Database,
     domain::{
-        BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
-        ControlState, DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewTask,
-        Project, ProjectLink, QuotaSurface, RetryPlan, RetryState, RouteCandidate, RouteDecision,
-        RunCheckpoint, RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerClaimRejection,
+        AgentCapabilityProbe, AgentCapabilityStatus, BackupRecord, CalendarException,
+        CalendarProfile, CheckpointAction, CircuitBreaker, ControlState, DayKind,
+        EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project, ProjectLink,
+        QuotaSurface, RetryPlan, RetryState, RouteCandidate, RouteDecision, RunCheckpoint,
+        RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerClaimRejection,
         SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
         SchedulerTick, SchedulerWake, Task, TaskStatus,
     },
@@ -23,6 +24,7 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -75,7 +77,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 7,
+            schema_version: 8,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -87,6 +89,84 @@ impl Garnish {
                 probe_podman(),
             ],
         }
+    }
+
+    pub fn refresh_agent_capabilities(
+        &mut self,
+        valid_for: std::time::Duration,
+    ) -> Result<Vec<AgentCapabilityStatus>> {
+        self.refresh_agent_capabilities_at(Utc::now(), valid_for)
+    }
+
+    pub fn refresh_agent_capabilities_at(
+        &mut self,
+        now: DateTime<Utc>,
+        valid_for: std::time::Duration,
+    ) -> Result<Vec<AgentCapabilityStatus>> {
+        self.refresh_agent_capabilities_with(now, valid_for, AgentKind::probe)
+    }
+
+    fn refresh_agent_capabilities_with(
+        &mut self,
+        now: DateTime<Utc>,
+        valid_for: std::time::Duration,
+        mut probe_agent: impl FnMut(AgentKind) -> ProbeResult,
+    ) -> Result<Vec<AgentCapabilityStatus>> {
+        if valid_for.is_zero() {
+            bail!("agent capability probe validity must be greater than zero");
+        }
+        let valid_until = now
+            + Duration::from_std(valid_for)
+                .map_err(|_| anyhow::anyhow!("agent capability validity is too large"))?;
+        for kind in [AgentKind::Codex, AgentKind::Claude, AgentKind::Antigravity] {
+            let observed = probe_agent(kind);
+            self.db
+                .record_agent_capability_probe(&AgentCapabilityProbe {
+                    id: Ulid::new().to_string(),
+                    adapter: observed.adapter,
+                    executable: observed.executable,
+                    version: observed.version,
+                    health: observed.health,
+                    capabilities: observed.capabilities,
+                    failure: observed.failure,
+                    probed_at: now,
+                    valid_until,
+                })?;
+        }
+        self.agent_capability_status_at(now)
+    }
+
+    pub fn agent_capability_status(&self) -> Result<Vec<AgentCapabilityStatus>> {
+        self.agent_capability_status_at(Utc::now())
+    }
+
+    pub fn agent_capability_status_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<AgentCapabilityStatus>> {
+        let mut latest = self
+            .db
+            .latest_agent_capability_probes()?
+            .into_iter()
+            .map(|probe| (probe.adapter.clone(), probe))
+            .collect::<BTreeMap<_, _>>();
+        Ok(["codex", "claude", "antigravity"]
+            .into_iter()
+            .map(|adapter| {
+                let probe = latest.remove(adapter);
+                let (freshness, health) = match probe.as_ref() {
+                    None => ("unknown", "unknown"),
+                    Some(probe) if probe.valid_until <= now => ("stale", probe.health.as_str()),
+                    Some(probe) => ("fresh", probe.health.as_str()),
+                };
+                AgentCapabilityStatus {
+                    adapter: adapter.into(),
+                    freshness: freshness.into(),
+                    health: health.into(),
+                    probe,
+                }
+            })
+            .collect())
     }
 
     pub fn add_project(&mut self, slug: &str, title: &str, root: &Path) -> Result<Project> {
@@ -1653,6 +1733,102 @@ mod tests {
         assert!(validate_project_root_for_platform(Path::new("/home/user/project"), true).is_ok());
         assert!(validate_project_root_for_platform(Path::new("/mnt/wsl/project"), true).is_ok());
         assert!(validate_project_root_for_platform(Path::new("/mnt/c/dev/project"), false).is_ok());
+    }
+
+    #[test]
+    fn capability_matrix_distinguishes_unknown_stale_and_fresh_health() {
+        let dir = tempdir().unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let unknown = garnish.agent_capability_status_at(now).unwrap();
+        assert!(unknown.iter().all(|entry| entry.freshness == "unknown"));
+
+        garnish
+            .db
+            .record_agent_capability_probe(&AgentCapabilityProbe {
+                id: "codex-stale".into(),
+                adapter: "codex".into(),
+                executable: Some("/fixture/codex".into()),
+                version: Some("codex-cli 0.144.2".into()),
+                health: "healthy".into(),
+                capabilities: vec!["agent.headless".into()],
+                failure: None,
+                probed_at: now - Duration::minutes(10),
+                valid_until: now - Duration::minutes(5),
+            })
+            .unwrap();
+        garnish
+            .db
+            .record_agent_capability_probe(&AgentCapabilityProbe {
+                id: "claude-fresh".into(),
+                adapter: "claude".into(),
+                executable: Some("/fixture/claude".into()),
+                version: Some("2.1.215 (Claude Code)".into()),
+                health: "unsupported".into(),
+                capabilities: vec!["agent.headless".into()],
+                failure: Some("fixture drift".into()),
+                probed_at: now - Duration::minutes(1),
+                valid_until: now + Duration::minutes(4),
+            })
+            .unwrap();
+
+        let status = garnish.agent_capability_status_at(now).unwrap();
+        let codex = status
+            .iter()
+            .find(|entry| entry.adapter == "codex")
+            .unwrap();
+        assert_eq!(codex.freshness, "stale");
+        assert_eq!(codex.health, "healthy");
+        let claude = status
+            .iter()
+            .find(|entry| entry.adapter == "claude")
+            .unwrap();
+        assert_eq!(claude.freshness, "fresh");
+        assert_eq!(claude.health, "unsupported");
+        let antigravity = status
+            .iter()
+            .find(|entry| entry.adapter == "antigravity")
+            .unwrap();
+        assert_eq!(antigravity.freshness, "unknown");
+        assert_eq!(antigravity.health, "unknown");
+    }
+
+    #[test]
+    fn capability_refresh_records_all_initial_agents_without_running_tasks() {
+        let dir = tempdir().unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let status = garnish
+            .refresh_agent_capabilities_with(now, std::time::Duration::from_secs(300), |kind| {
+                ProbeResult {
+                    adapter: kind.key().into(),
+                    executable: Some(format!("/fixture/{}", kind.key())),
+                    version: Some("fixture 1.0.0".into()),
+                    health: "healthy".into(),
+                    capabilities: vec!["agent.headless".into()],
+                    failure: None,
+                }
+            })
+            .unwrap();
+        assert_eq!(status.len(), 3);
+        assert!(
+            status
+                .iter()
+                .all(|entry| entry.freshness == "fresh" && entry.health == "healthy")
+        );
+        assert_eq!(
+            garnish.db.latest_agent_capability_probes().unwrap().len(),
+            3
+        );
+        assert!(
+            garnish
+                .refresh_agent_capabilities_with(
+                    now,
+                    std::time::Duration::ZERO,
+                    |_| unreachable!(),
+                )
+                .is_err()
+        );
     }
 
     fn task(project_id: String) -> NewTask {

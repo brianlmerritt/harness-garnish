@@ -102,7 +102,7 @@ trait AgentAdapter {
 
 | Adapter | Locally probed version | Preferred mode | Structured evidence | Resume | Policy notes |
 | --- | --- | --- | --- | --- | --- |
-| Codex | 0.144.5 | `codex exec` with prompt via stdin | `--json` JSONL; optional output schema and last-message file | `exec resume` | Select explicit sandbox; unsafe bypass only after external sandbox attestation and explicit policy |
+| Codex | 0.144.6 | `codex exec` with prompt via stdin | `--json` JSONL; optional output schema and last-message file | `exec resume` | Select explicit sandbox; unsafe bypass only after external sandbox attestation and explicit policy |
 | Claude Code | 2.1.215 | `claude -p` | `--output-format stream-json`, optional JSON schema and hook events | session ID / continue / fork | Explicit allowed/disallowed tools and permission mode; max API budget applies only to API-billed calls |
 | Antigravity | 1.1.4 | `agy --print` | text/raw log in current verified interface | conversation ID / continue | Five-minute default print timeout; `--sandbox` and mode are version-specific; unsafe bypass remains externally gated |
 | Fake | test fixture | deterministic script | versioned fixture JSONL | deterministic | consumes no provider quota |

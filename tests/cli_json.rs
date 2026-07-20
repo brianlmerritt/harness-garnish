@@ -120,6 +120,30 @@ fn scheduler_daemon_can_run_one_diagnostic_tick_and_stop_cleanly() {
 }
 
 #[test]
+fn agent_status_reports_unknown_without_implicit_probe() {
+    let dir = tempdir().unwrap();
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "agent",
+            "status",
+            "--at",
+            "2026-07-20T12:00:00Z",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entries = value.as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert!(entries.iter().all(|entry| entry["freshness"] == "unknown"));
+    assert_eq!(entries[0]["adapter"], "codex");
+    assert_eq!(entries[1]["adapter"], "claude");
+    assert_eq!(entries[2]["adapter"], "antigravity");
+}
+
+#[test]
 fn operational_controls_status_and_backup_are_stable_json() {
     let dir = tempdir().unwrap();
     let data = dir.path().join("state");
@@ -165,7 +189,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 7);
+    assert_eq!(value["schema_version"], 8);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

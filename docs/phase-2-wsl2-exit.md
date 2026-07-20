@@ -33,3 +33,15 @@ Podman warned that its configured systemd cgroup manager had no user session and
 ## Acceptance mapping
 
 This run supplies the platform evidence required by P2-13: Linux-native WSL paths, default Windows-mounted-path denial, signals and descendant cleanup, permissions, restart recovery, and runtime discovery/selection. The Podman conformance test is now implemented but was not part of this captured run; rerun the bundle with `GARNISH_REAL_PODMAN_IMAGE` set to a local digest-pinned image to add that evidence. Docker conformance remains separate and explicitly opt-in.
+
+## Schema 7 exit refresh
+
+The final `scripts/test-wsl2-exit` rerun passed on 2026-07-20 after schema 7 was pulled:
+
+- Rust library suite: 68 passed, 0 failed, 2 explicitly ignored opt-in real-container tests.
+- CLI suite: 3 passed, 0 failed.
+- MVP vertical slice: 1 passed, 0 failed.
+- The Linux midpoint, WSL-mounted-path denial, signal handling, process cleanup, restart recovery, rootless-Podman selection, and private permissions all passed.
+- Operational status reported schema-7 state with no active work or emergency stop.
+- The integrity-checked backup was 299,008 bytes, mode `0600`, with SHA-256 `d61c41ae6d0f884f388368b9ab8e0ff2c5b2848860287bcef31fe6f0b2bdcab5`.
+- Podman's systemd-user-session warning again fell back to `cgroupfs`; it did not invalidate runtime discovery or the quota-free exit bundle.

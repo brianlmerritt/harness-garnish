@@ -440,6 +440,14 @@ struct QuotaOverride {
 #[derive(Subcommand)]
 enum AgentCommand {
     Probe,
+    Refresh {
+        #[arg(long, default_value_t = 300)]
+        valid_seconds: u64,
+    },
+    Status {
+        #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
+        at: Option<String>,
+    },
     Invocation {
         #[arg(value_enum)]
         agent: AgentArg,
@@ -769,6 +777,14 @@ fn run() -> Result<()> {
         },
         Command::Agent { command } => match command {
             AgentCommand::Probe => print_json(&garnish.doctor().probes),
+            AgentCommand::Refresh { valid_seconds } => print_json(
+                &garnish
+                    .refresh_agent_capabilities(std::time::Duration::from_secs(valid_seconds))?,
+            ),
+            AgentCommand::Status { at } => {
+                let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
+                print_json(&garnish.agent_capability_status_at(at)?)
+            }
             AgentCommand::Invocation { agent, cwd, prompt } => {
                 let kind: AgentKind = agent.into();
                 let invocation = kind.invocation(&cwd, &prompt)?;

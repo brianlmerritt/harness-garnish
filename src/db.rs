@@ -1,10 +1,10 @@
 use crate::{
     domain::{
-        BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
-        ClaimedRunStart, ControlState, DayKind, EmergencyStopResult, FailureCategory,
-        LocalNotification, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan, RetryState,
-        RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader,
-        SchedulerWake, Task, TaskStatus,
+        AgentCapabilityProbe, BackupRecord, CalendarException, CalendarProfile, CheckpointAction,
+        CircuitBreaker, ClaimedRunStart, ControlState, DayKind, EmergencyStopResult,
+        FailureCategory, LocalNotification, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan,
+        RetryState, RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerClaimRejection,
+        SchedulerLeader, SchedulerWake, Task, TaskStatus,
     },
     schedule,
 };
@@ -21,7 +21,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 pub struct Database {
     path: PathBuf,
@@ -446,6 +446,9 @@ impl Database {
         if current < 7 {
             tx.execute_batch(MIGRATION_7)?;
         }
+        if current < 8 {
+            tx.execute_batch(MIGRATION_8)?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -509,6 +512,47 @@ impl Database {
                  FROM projects ORDER BY slug",
         )?;
         let rows = stmt.query_map([], map_project)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn record_agent_capability_probe(&mut self, probe: &AgentCapabilityProbe) -> Result<()> {
+        if probe.valid_until <= probe.probed_at {
+            bail!("agent capability probe expiry must be after its observation time");
+        }
+        self.conn.execute(
+            "INSERT INTO agent_capability_probes(
+                id, adapter, executable, version, health, capabilities_json,
+                failure, probed_at, valid_until
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                probe.id,
+                probe.adapter,
+                probe.executable,
+                probe.version,
+                probe.health,
+                to_json(&probe.capabilities)?,
+                probe.failure,
+                probe.probed_at.to_rfc3339(),
+                probe.valid_until.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_agent_capability_probes(&self) -> Result<Vec<AgentCapabilityProbe>> {
+        let mut statement = self.conn.prepare(
+            "SELECT p.id, p.adapter, p.executable, p.version, p.health,
+                    p.capabilities_json, p.failure, p.probed_at, p.valid_until
+             FROM agent_capability_probes p
+             WHERE p.id = (
+                 SELECT candidate.id FROM agent_capability_probes candidate
+                 WHERE candidate.adapter = p.adapter
+                 ORDER BY candidate.probed_at DESC, candidate.id DESC LIMIT 1
+             )
+             ORDER BY p.adapter",
+        )?;
+        let rows = statement.query_map([], map_agent_capability_probe)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -3002,6 +3046,20 @@ fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+fn map_agent_capability_probe(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentCapabilityProbe> {
+    Ok(AgentCapabilityProbe {
+        id: row.get(0)?,
+        adapter: row.get(1)?,
+        executable: row.get(2)?,
+        version: row.get(3)?,
+        health: row.get(4)?,
+        capabilities: parse_json(row.get(5)?)?,
+        failure: row.get(6)?,
+        probed_at: parse_time(row.get(7)?)?,
+        valid_until: parse_time(row.get(8)?)?,
+    })
+}
+
 const TASK_SELECT: &str = "SELECT
     id, project_id, title, goal, rationale, scope_json, non_scope_json,
     acceptance_json, verification_argv_json, priority, risk_class,
@@ -3774,6 +3832,24 @@ CREATE INDEX idx_tasks_scheduler_order
     ON tasks(status, priority DESC, deadline_at, created_at, id);
 "#;
 
+const MIGRATION_8: &str = r#"
+CREATE TABLE agent_capability_probes (
+    id TEXT PRIMARY KEY,
+    adapter TEXT NOT NULL,
+    executable TEXT,
+    version TEXT,
+    health TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    failure TEXT,
+    probed_at TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    CHECK(valid_until > probed_at)
+);
+
+CREATE INDEX idx_agent_capability_probes_latest
+    ON agent_capability_probes(adapter, probed_at DESC, id DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3821,6 +3897,52 @@ mod tests {
         let project = db.add_project("one", "One", &root).unwrap();
         assert_eq!(db.project("one").unwrap().id, project.id);
         assert_eq!(db.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn agent_capability_probes_are_append_only_and_latest_is_deterministic() {
+        let (_dir, mut db) = database();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let first = AgentCapabilityProbe {
+            id: "probe-1".into(),
+            adapter: "codex".into(),
+            executable: Some("/fixture/codex".into()),
+            version: Some("codex-cli 0.144.2".into()),
+            health: "healthy".into(),
+            capabilities: vec!["agent.headless".into()],
+            failure: None,
+            probed_at: now,
+            valid_until: now + chrono::Duration::minutes(5),
+        };
+        db.record_agent_capability_probe(&first).unwrap();
+        let second = AgentCapabilityProbe {
+            id: "probe-2".into(),
+            version: Some("codex-cli 0.145.0".into()),
+            probed_at: now + chrono::Duration::minutes(1),
+            valid_until: now + chrono::Duration::minutes(6),
+            ..first.clone()
+        };
+        db.record_agent_capability_probe(&second).unwrap();
+
+        let latest = db.latest_agent_capability_probes().unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].id, "probe-2");
+        assert_eq!(latest[0].version.as_deref(), Some("codex-cli 0.145.0"));
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_capability_probes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let invalid = AgentCapabilityProbe {
+            id: "invalid".into(),
+            probed_at: now,
+            valid_until: now,
+            ..first
+        };
+        assert!(db.record_agent_capability_probe(&invalid).is_err());
     }
 
     #[test]
@@ -4026,7 +4148,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -5158,7 +5280,7 @@ mod tests {
         let destination = dir.path().join("backups/state.db");
         let backup = db.backup_to(&destination, Utc::now()).unwrap();
         assert_eq!(backup.integrity, "ok");
-        assert_eq!(backup.schema_version, 7);
+        assert_eq!(backup.schema_version, 8);
         assert_eq!(backup.sha256.len(), 64);
         assert_eq!(backup.size_bytes, fs::metadata(&destination).unwrap().len());
         assert!(db.backup_to(&destination, Utc::now()).is_err());

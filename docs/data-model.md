@@ -178,6 +178,8 @@ Probe: `id`, `installation_id`, `executable_realpath`, `version`, `capabilities_
 
 No route uses a stale probe when a required capability could have changed.
 
+Schema 8 implements the probe history as append-only `agent_capability_probes` rows containing adapter key, executable path, version, health, capability JSON, bounded failure detail, observation time, and validity expiry. The latest matrix is selected deterministically per adapter; freshness is computed at read time so an expired healthy observation is reported as stale rather than silently reused.
+
 ### `sandbox_instances` and `sandbox_attestations`
 
 Instance: backend, external ID, image ref/digest, worktree mount, state, timestamps, cleanup state.

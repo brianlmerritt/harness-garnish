@@ -206,6 +206,27 @@ pub struct ProjectLink {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCapabilityProbe {
+    pub id: String,
+    pub adapter: String,
+    pub executable: Option<String>,
+    pub version: Option<String>,
+    pub health: String,
+    pub capabilities: Vec<String>,
+    pub failure: Option<String>,
+    pub probed_at: DateTime<Utc>,
+    pub valid_until: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCapabilityStatus {
+    pub adapter: String,
+    pub freshness: String,
+    pub health: String,
+    pub probe: Option<AgentCapabilityProbe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub project_id: String,

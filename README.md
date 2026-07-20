@@ -4,7 +4,7 @@ Harness Garnish is a local control plane for quota-aware, policy-controlled AI-a
 
 Phase 0 established the architecture under [`docs/`](docs/README.md). The Phase 1 Rust vertical slice is now implemented and locally verified; its exact evidence, limitations, and deferred smoke tests are recorded in [`docs/phase-1-exit-report.md`](docs/phase-1-exit-report.md).
 
-Phase 2 is in progress. Its durable-scheduler design now includes timezone-aware work/off calendars, `W`/`O`/`B` task affinity, dated calendar exceptions, and explicit Linux/WSL2 proof milestones in [`docs/phase-2-plan.md`](docs/phase-2-plan.md).
+Phase 2 is complete. Its schema-7 durable scheduler, supervision/recovery matrices, day-aware scheduling, container evidence, and final macOS/Linux/WSL2 results are recorded in [`docs/phase-2-exit-report.md`](docs/phase-2-exit-report.md). Phase 3 begins multi-agent capability and quota routing.
 
 ## Confirmed direction
 
@@ -107,6 +107,17 @@ garnish --data-dir .garnish-state runtime retry-state --task TASK_ID
 garnish --data-dir .garnish-state runtime retry-limit --task TASK_ID --limit 3
 garnish --data-dir .garnish-state runtime circuits
 ```
+
+### Phase 3 capability matrix
+
+Schema 8 stores append-only Codex, Claude, and Antigravity capability probes. Refreshing probes only runs each CLI's version check; it does not submit an agent task or consume provider quota. Status distinguishes current, stale, and never-observed evidence.
+
+```console
+garnish --data-dir .garnish-state agent refresh --valid-seconds 300
+garnish --data-dir .garnish-state agent status
+```
+
+A missing or unsupported CLI is recorded as evidence rather than treated as healthy. The pure multi-candidate kernel now hard-filters probe freshness, health, capabilities, quota headroom, and exact manual pins before applying a deterministic recorded score. Durable pin configuration and scheduler integration are the next Phase 3 slice.
 
 Operational controls are durable and emit bounded JSON. `pause` stops new claims; `emergency-stop` also releases unstarted claims and requests graceful cancellation of active runs. Neither command claims a process has stopped until its supervisor records termination evidence.
 

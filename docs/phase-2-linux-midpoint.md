@@ -38,3 +38,14 @@ The corrected quota-free bundle passed on 2026-07-20:
 - Docker was not installed, so Docker conformance remains separate and opt-in.
 
 This closed the Linux midpoint and rootless-Podman capability probe. Full Podman and Docker conformance subsequently passed on the same VPS; see `phase-2-linux-container-conformance.md`.
+
+## Schema 7 exit refresh
+
+The final `scripts/test-linux-midpoint` rerun passed on 2026-07-20 after schema 7 was pulled:
+
+- Rust library suite: 68 passed, 0 failed, 2 explicitly ignored opt-in real-container tests.
+- CLI suite: 3 passed, 0 failed.
+- MVP vertical slice: 1 passed, 0 failed.
+- Bounded and signal-driven daemon shutdown, process cleanup, migrations, scheduler exclusion/ceiling matrices, and crash/reopen recovery passed.
+- State directory and database modes remained `0700` and `0600`.
+- Rootless Podman and Docker probes were healthy. Real conformance was not repeated because no backend code had changed since both digest-pinned conformance runs passed.

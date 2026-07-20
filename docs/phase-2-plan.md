@@ -74,7 +74,7 @@ Calendar examples:
 - A durable crash/reopen matrix now covers before claim, unconsumed claim, consumed action/run, and completed cleanup boundaries. Each boundary recovers at most once and never duplicates the external-action key or run. This completes P2-07 locally.
 - WSL2 defaults to denying project roots under `/mnt/<drive>`. The quota-free exit bundle passed on Ubuntu 24.04 under WSL2 with Linux-native paths, lifecycle/restart checks, private state and backup permissions, and rootless Podman selection; see `phase-2-wsl2-exit.md`. This supplies P2-13 evidence.
 - Hardened rootless-Podman and Docker backends have fail-closed runtime/effective-state attestation. Both explicit opt-in create/inspect/run/cleanup tests passed on Ubuntu 24.04.4 using the same digest-pinned Alpine image; see `phase-2-linux-container-conformance.md`.
-- The Phase 2 implementation and machine-acceptance coverage are locally complete. Phase 2 exit still requires the refreshed Linux midpoint and WSL2 exit bundles to pass after schema 7 is pulled. Real-agent claim execution, native desktop notification delivery, encrypted portable export, and Apple Container conformance remain later integration work and are not silently treated as complete.
+- Phase 2 exited successfully on 2026-07-20 after the refreshed schema-7 Linux midpoint and WSL2 exit bundles passed. The final evidence and acceptance mapping are in `phase-2-exit-report.md`. Real-agent claim execution, native desktop notification delivery, encrypted portable export, and Apple Container conformance remain later integration work and are not silently treated as complete.
 
 ## Explicit non-goals
 

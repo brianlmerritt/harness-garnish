@@ -1,6 +1,6 @@
 # Design documentation
 
-These documents contain the Phase 0 design baseline and the Phase 1 implementation evidence. Design documents describe contracts; the exit report distinguishes implemented and tested behavior from deferred work.
+These documents contain the design baseline and phased implementation evidence. Design documents describe contracts; exit reports distinguish implemented and tested behavior from deferred work.
 
 | Document | Purpose |
 | --- | --- |
@@ -16,6 +16,8 @@ These documents contain the Phase 0 design baseline and the Phase 1 implementati
 | [Phase 2 Linux midpoint](phase-2-linux-midpoint.md) | Linux scheduler, process, permission, and rootless-Podman capability evidence |
 | [Phase 2 Linux container conformance](phase-2-linux-container-conformance.md) | Real rootless-Podman and Docker sandbox attestation/lifecycle evidence |
 | [Phase 2 WSL2 exit](phase-2-wsl2-exit.md) | WSL2 path-policy, lifecycle, backup, permissions, and runtime-selection evidence |
+| [Phase 2 exit report](phase-2-exit-report.md) | Final schema-7 macOS, Linux, and WSL2 acceptance evidence and residual scope |
+| [Phase 3 plan](phase-3-plan.md) | Multi-agent capability evidence, quota providers/reservations, deterministic routing, and independent verification |
 | [ADRs](decisions/README.md) | Decisions that constrain implementation |
 
 Every material change to these boundaries requires an ADR amendment or a superseding ADR. Documentation may describe a future capability only when it is clearly labelled as planned.
