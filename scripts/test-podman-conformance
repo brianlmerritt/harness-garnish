@@ -21,13 +21,10 @@ if [[ -z "${GARNISH_REAL_PODMAN_IMAGE:-}" ]]; then
   exit 1
 fi
 
-case "$GARNISH_REAL_PODMAN_IMAGE" in
-  *@sha256:*) ;;
-  *)
-    echo "error: GARNISH_REAL_PODMAN_IMAGE must contain @sha256:" >&2
-    exit 1
-    ;;
-esac
+if [[ ! "$GARNISH_REAL_PODMAN_IMAGE" =~ @sha256:[[:xdigit:]]{64}$ ]]; then
+  echo "error: GARNISH_REAL_PODMAN_IMAGE must end with @sha256: followed by a real 64-character hexadecimal digest; documentation placeholders are not valid" >&2
+  exit 1
+fi
 
 podman info >/dev/null
 rootless="$(podman info --format '{{.Host.Security.Rootless}}')"

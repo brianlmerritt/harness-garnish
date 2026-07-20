@@ -429,7 +429,7 @@ impl DockerSpec {
             "--cpus".into(),
             "2".into(),
             "--user".into(),
-            "1000:1000".into(),
+            current_user_pair()?.into(),
             "--workdir".into(),
             "/workspace".into(),
             "--mount".into(),
@@ -721,25 +721,20 @@ struct PodmanCapabilityInspection {
 fn inspect_podman_capabilities(
     container: &serde_json::Value,
 ) -> Result<PodmanCapabilityInspection> {
-    match container.get("EffectiveCaps") {
-        Some(serde_json::Value::Array(values)) => {
-            let effective: Vec<String> = values
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("Podman EffectiveCaps contains a non-string value")
-                })
-                .collect::<Result<_>>()?;
-            return Ok(PodmanCapabilityInspection {
-                all_sets_empty: effective.is_empty(),
-                effective,
-                source: "podman-inspect-effective-caps".into(),
-            });
-        }
-        Some(serde_json::Value::Null) | None => {}
-        Some(_) => bail!("Podman EffectiveCaps has an unsupported shape"),
+    if container.get("EffectiveCaps").is_some()
+        && container.get("BoundingCaps").is_some()
+        && container["HostConfig"].get("CapAdd").is_some()
+    {
+        let effective =
+            parse_nullable_capability_set(&container["EffectiveCaps"], "EffectiveCaps")?;
+        let bounding = parse_nullable_capability_set(&container["BoundingCaps"], "BoundingCaps")?;
+        let cap_add = parse_nullable_capability_set(&container["HostConfig"]["CapAdd"], "CapAdd")?;
+        let all_sets_empty = effective.is_empty() && bounding.is_empty() && cap_add.is_empty();
+        return Ok(PodmanCapabilityInspection {
+            effective,
+            all_sets_empty,
+            source: "podman-inspect-capability-sets".into(),
+        });
     }
 
     // Podman 4.9 reports EffectiveCaps as null while a container is in the created state.
@@ -797,6 +792,23 @@ fn inspect_podman_capabilities(
     })
 }
 
+fn parse_nullable_capability_set(value: &serde_json::Value, field: &str) -> Result<Vec<String>> {
+    if value.is_null() {
+        return Ok(vec![]);
+    }
+    value
+        .as_array()
+        .with_context(|| format!("Podman {field} has an unsupported shape"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("Podman {field} contains a non-string value"))
+        })
+        .collect()
+}
+
 fn attest_docker_inspect(
     spec: &DockerSpec,
     value: &serde_json::Value,
@@ -829,15 +841,42 @@ fn attest_docker_inspect(
     let cap_drop_all = host["CapDrop"]
         .as_array()
         .is_some_and(|values| values.iter().any(|value| value == "ALL"));
-    let no_new_privileges = host["SecurityOpt"]
-        .as_array()
-        .is_some_and(|values| values.iter().any(|value| value == "no-new-privileges"));
+    let cap_add_empty = host["CapAdd"].as_array().is_none_or(Vec::is_empty);
+    let no_new_privileges = host["SecurityOpt"].as_array().is_some_and(|values| {
+        values.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|option| option.starts_with("no-new-privileges"))
+        })
+    });
     let pids_limit = host["PidsLimit"].as_u64().unwrap_or_default() as u32;
     let memory = host["Memory"].as_u64().unwrap_or_default();
     let nano_cpus = host["NanoCpus"].as_u64().unwrap_or_default();
     let expected_mount = bind_mounts.len() == 1
         && writable_mounts == vec![expected_worktree.clone()]
-        && bind_mounts[0]["Destination"] == "/workspace";
+        && bind_mounts[0]["Destination"] == "/workspace"
+        && bind_mounts[0]["Propagation"]
+            .as_str()
+            .is_none_or(|propagation| matches!(propagation, "" | "private" | "rprivate"));
+    let inherited_proxy_environment: Vec<String> = config["Env"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+        .filter(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "http_proxy" | "https_proxy" | "ftp_proxy" | "all_proxy" | "no_proxy"
+            )
+        })
+        .map(str::to_owned)
+        .collect();
+    let tmpfs = host["Tmpfs"]
+        .get("/tmp")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let expected_user = current_user_pair()?;
     let checks = [
         (host["NetworkMode"] == "none", "network is not disabled"),
         (
@@ -845,7 +884,25 @@ fn attest_docker_inspect(
             "root filesystem is writable",
         ),
         (cap_drop_all, "capabilities were not fully dropped"),
+        (cap_add_empty, "capabilities were added"),
         (no_new_privileges, "no-new-privileges is missing"),
+        (host["Privileged"] == false, "container is privileged"),
+        (
+            host["Devices"].as_array().is_none_or(Vec::is_empty),
+            "host devices are exposed",
+        ),
+        (
+            host["PidMode"].as_str().unwrap_or("private") != "host",
+            "host PID namespace is shared",
+        ),
+        (
+            host["IpcMode"].as_str().unwrap_or("private") != "host",
+            "host IPC namespace is shared",
+        ),
+        (
+            host["UTSMode"].as_str().unwrap_or("private") != "host",
+            "host UTS namespace is shared",
+        ),
         (pids_limit == 256, "PID limit differs from requested policy"),
         (
             memory == 2 * 1024 * 1024 * 1024,
@@ -856,8 +913,12 @@ fn attest_docker_inspect(
             "CPU limit differs from requested policy",
         ),
         (
-            config["User"] == "1000:1000",
-            "container user is not 1000:1000",
+            config["User"] == expected_user,
+            "container user differs from the host user",
+        ),
+        (
+            config["Image"] == spec.image,
+            "effective image differs from the requested digest-pinned image",
         ),
         (
             expected_mount,
@@ -868,6 +929,16 @@ fn attest_docker_inspect(
             "a container runtime socket is mounted",
         ),
         (!host_home_mounted, "the host home directory is mounted"),
+        (
+            inherited_proxy_environment.is_empty(),
+            "proxy environment was inherited",
+        ),
+        (
+            ["rw", "noexec", "nosuid", "nodev"]
+                .iter()
+                .all(|option| tmpfs.split(',').any(|value| value == *option)),
+            "hardened /tmp tmpfs options are missing",
+        ),
     ];
     let reasons: Vec<String> = checks
         .into_iter()
@@ -890,7 +961,7 @@ fn attest_docker_inspect(
         user_namespace: host["UsernsMode"].as_str().map(str::to_owned),
         effective_capabilities: None,
         capability_evidence_source: None,
-        inherited_proxy_environment: vec![],
+        inherited_proxy_environment,
         reasons,
     })
 }
@@ -938,6 +1009,7 @@ fn attest_podman_inspect(
     let memory = host["Memory"].as_u64().unwrap_or_default();
     let nano_cpus = host["NanoCpus"].as_u64().unwrap_or_default();
     let user_namespace = host["UsernsMode"].as_str().unwrap_or_default();
+    let keep_id_user_namespace = podman_keep_id_mapping_is_effective(host, expected_user);
     let expected_mount = bind_mounts.len() == 1
         && writable_mounts == vec![expected_worktree]
         && bind_mounts[0]["Destination"] == "/workspace"
@@ -994,8 +1066,8 @@ fn attest_podman_inspect(
             "host UTS namespace is shared",
         ),
         (
-            user_namespace.starts_with("keep-id"),
-            "rootless keep-id user namespace is missing",
+            keep_id_user_namespace,
+            "effective user namespace does not preserve the rootless host identity",
         ),
         (pids_limit == 256, "PID limit differs from requested policy"),
         (
@@ -1061,6 +1133,36 @@ fn attest_podman_inspect(
         capability_evidence_source: Some(capabilities.source),
         inherited_proxy_environment,
         reasons,
+    })
+}
+
+fn podman_keep_id_mapping_is_effective(host: &serde_json::Value, expected_user: &str) -> bool {
+    let Some((uid, gid)) = expected_user.split_once(':') else {
+        return false;
+    };
+    let mode = host["UsernsMode"].as_str().unwrap_or_default();
+    if mode.starts_with("keep-id") {
+        return true;
+    }
+    if mode != "private" {
+        return false;
+    }
+    let mappings = &host["IDMappings"];
+    mapping_contains_rootless_identity(&mappings["UidMap"], uid)
+        && mapping_contains_rootless_identity(&mappings["GidMap"], gid)
+}
+
+fn mapping_contains_rootless_identity(mappings: &serde_json::Value, container_id: &str) -> bool {
+    mappings.as_array().is_some_and(|values| {
+        values.iter().any(|value| {
+            value.as_str().is_some_and(|mapping| {
+                let mut fields = mapping.split(':');
+                fields.next() == Some(container_id)
+                    && fields.next() == Some("0")
+                    && fields.next() == Some("1")
+                    && fields.next().is_none()
+            })
+        })
     })
 }
 
@@ -1593,6 +1695,42 @@ mod tests {
     }
 
     #[test]
+    fn podman_49_null_capability_slices_are_verified_with_bounding_and_cap_add() {
+        let inspect = serde_json::json!({
+            "EffectiveCaps": null,
+            "BoundingCaps": null,
+            "HostConfig": {"CapAdd": []}
+        });
+        let capabilities = inspect_podman_capabilities(&inspect).unwrap();
+        assert!(capabilities.all_sets_empty);
+        assert!(capabilities.effective.is_empty());
+        assert_eq!(capabilities.source, "podman-inspect-capability-sets");
+
+        let inspect = serde_json::json!({
+            "EffectiveCaps": [],
+            "BoundingCaps": ["CAP_NET_RAW"],
+            "HostConfig": {"CapAdd": ["CAP_NET_RAW"]}
+        });
+        let capabilities = inspect_podman_capabilities(&inspect).unwrap();
+        assert!(!capabilities.all_sets_empty);
+    }
+
+    #[test]
+    fn podman_49_private_userns_is_accepted_only_with_keep_id_mappings() {
+        let mut host = serde_json::json!({
+            "UsernsMode": "private",
+            "IDMappings": {
+                "UidMap": ["0:1:1000", "1000:0:1", "1001:1001:64536"],
+                "GidMap": ["0:1:1000", "1000:0:1", "1001:1001:64536"]
+            }
+        });
+        assert!(podman_keep_id_mapping_is_effective(&host, "1000:1000"));
+
+        host["IDMappings"]["UidMap"] = serde_json::json!(["0:1:65536"]);
+        assert!(!podman_keep_id_mapping_is_effective(&host, "1000:1000"));
+    }
+
+    #[test]
     fn safe_write_rejects_escape_and_symlink() {
         let dir = tempdir().unwrap();
         assert!(safe_write(dir.path(), Path::new("../escape"), b"x").is_err());
@@ -1801,15 +1939,30 @@ mod tests {
         };
         let backend = DockerBackend::discover().unwrap();
         backend.create(&spec).unwrap();
-        let attestation = backend.inspect(&spec).unwrap();
-        let output = backend.start_attached(&name).unwrap();
+        let attestation = match backend.inspect(&spec) {
+            Ok(attestation) => attestation,
+            Err(error) => {
+                let _ = backend.remove(&name);
+                panic!("Docker attestation failed before start: {error:#}");
+            }
+        };
+        if !attestation.secure_container {
+            let _ = backend.remove(&name);
+            panic!("Docker attestation failed: {:?}", attestation.reasons);
+        }
+        let output = match backend.start_attached(&name) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = backend.remove(&name);
+                panic!("Docker start failed: {error:#}");
+            }
+        };
         let cleanup = backend.remove(&name);
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(attestation.secure_container, "{:?}", attestation.reasons);
         assert_eq!(
             fs::read_to_string(dir.path().join("container-output.txt")).unwrap(),
             "container-ok"
@@ -1840,21 +1993,32 @@ mod tests {
         let backend = PodmanBackend::discover().unwrap();
         backend.create(&spec).unwrap();
 
-        // Capture all outcomes before asserting so the managed container is removed even when
-        // runtime inspection or execution exposes a conformance failure.
-        let attestation = backend.inspect(&spec);
-        let output = backend.start_attached(&name);
+        let attestation = match backend.inspect(&spec) {
+            Ok(attestation) => attestation,
+            Err(error) => {
+                let _ = backend.remove(&name);
+                panic!("Podman attestation failed before start: {error:#}");
+            }
+        };
+        if !attestation.secure_container {
+            let _ = backend.remove(&name);
+            panic!("Podman attestation failed: {:?}", attestation.reasons);
+        }
+        let output = match backend.start_attached(&name) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = backend.remove(&name);
+                panic!("Podman start failed: {error:#}");
+            }
+        };
         let cleanup = backend.remove(&name);
 
-        let attestation = attestation.unwrap();
-        let output = output.unwrap();
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(attestation.rootless == Some(true));
-        assert!(attestation.secure_container, "{:?}", attestation.reasons);
         assert_eq!(attestation.effective_capabilities, Some(vec![]));
         assert_eq!(
             fs::read_to_string(dir.path().join("container-output.txt")).unwrap(),

@@ -125,13 +125,25 @@ After cloning the repository on an Ubuntu or Debian host, run the quota-free Lin
 
 It runs formatting, lint, build and tests; exercises bounded and signal-driven daemon shutdown; verifies private state permissions; and reports rootless Podman and Docker health when installed. The 2026-07-20 VPS run passed this checkpoint and confirmed a healthy rootless Podman capability probe.
 
-The hardened Podman sandbox lifecycle is a separate, explicit opt-in because it needs a real local image. The image must already exist and be addressed by digest; the test disables pulls and container networking:
+The hardened Podman sandbox lifecycle is a separate, explicit opt-in because it needs a real local image. These commands pull Alpine once, derive its real digest automatically, and then run with further pulls and container networking disabled:
 
 ```console
-GARNISH_REAL_PODMAN_IMAGE='registry.example/image@sha256:...' ./scripts/test-podman-conformance
+podman pull docker.io/library/alpine:latest
+PODMAN_IMAGE="$(podman image inspect docker.io/library/alpine:latest --format '{{index .RepoDigests 0}}')"
+GARNISH_REAL_PODMAN_IMAGE="$PODMAN_IMAGE" ./scripts/test-podman-conformance
 ```
 
 The same environment variable adds this conformance test to `test-linux-midpoint` and therefore to the WSL2 bundle. Without it, those bundles report the real-container test as skipped. No agent subscription or API is used.
+
+Docker has an equivalent opt-in test. These commands pull Alpine into Docker's separate local image store, derive the real digest, and run it:
+
+```console
+docker pull docker.io/library/alpine:latest
+DOCKER_IMAGE="$(docker image inspect docker.io/library/alpine:latest --format '{{index .RepoDigests 0}}')"
+GARNISH_REAL_DOCKER_IMAGE="$DOCKER_IMAGE" ./scripts/test-docker-conformance
+```
+
+Setting both environment variables when running `scripts/test-linux-midpoint` runs both real backends. Docker and rootless Podman retain separate local image stores, container namespaces, and lifecycle tests.
 
 ### WSL2 exit bundle
 

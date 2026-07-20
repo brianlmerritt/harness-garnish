@@ -70,6 +70,11 @@ fi
 if command -v docker >/dev/null 2>&1; then
   if docker info >/dev/null 2>&1; then
     echo "docker: healthy runtime"
+    if [[ -n "${GARNISH_REAL_DOCKER_IMAGE:-}" ]]; then
+      ./scripts/test-docker-conformance
+    else
+      echo "docker conformance: skipped (set GARNISH_REAL_DOCKER_IMAGE to opt in)"
+    fi
   else
     echo "docker: client present but daemon unavailable"
   fi

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(id -u)" == "0" ]]; then
+  echo "error: run Docker conformance as the dedicated non-root user" >&2
+  exit 1
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "error: docker is not installed" >&2
+  exit 1
+fi
+
+if [[ -z "${GARNISH_REAL_DOCKER_IMAGE:-}" ]]; then
+  echo "error: set GARNISH_REAL_DOCKER_IMAGE to a real, locally available digest-pinned image; do not copy the documentation placeholder" >&2
+  exit 1
+fi
+
+if [[ ! "$GARNISH_REAL_DOCKER_IMAGE" =~ @sha256:[[:xdigit:]]{64}$ ]]; then
+  echo "error: GARNISH_REAL_DOCKER_IMAGE must end with @sha256: followed by a real 64-character hexadecimal digest; documentation placeholders are not valid" >&2
+  exit 1
+fi
+
+if ! docker info >/dev/null 2>&1; then
+  echo "error: the Docker daemon is not accessible to user $(id -un) without sudo" >&2
+  exit 1
+fi
+
+if ! docker image inspect "$GARNISH_REAL_DOCKER_IMAGE" >/dev/null 2>&1; then
+  echo "error: the digest-pinned image is not present in Docker's local image store; this test will not pull it" >&2
+  exit 1
+fi
+
+echo "docker: $(docker version --format '{{.Server.Version}}')"
+echo "image: $GARNISH_REAL_DOCKER_IMAGE (present locally; pulls disabled)"
+
+cargo test \
+  adapters::tests::real_docker_backend_create_inspect_run_cleanup \
+  --lib \
+  -- \
+  --ignored \
+  --exact \
+  --nocapture
+
+echo "Docker conformance passed"
