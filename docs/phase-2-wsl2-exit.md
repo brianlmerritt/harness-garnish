@@ -32,4 +32,4 @@ Podman warned that its configured systemd cgroup manager had no user session and
 
 ## Acceptance mapping
 
-This run supplies the platform evidence required by P2-13: Linux-native WSL paths, default Windows-mounted-path denial, signals and descendant cleanup, permissions, restart recovery, and runtime discovery/selection. Docker-specific and full backend sandbox-conformance tests remain separate, explicitly opt-in work.
+This run supplies the platform evidence required by P2-13: Linux-native WSL paths, default Windows-mounted-path denial, signals and descendant cleanup, permissions, restart recovery, and runtime discovery/selection. The Podman conformance test is now implemented but was not part of this captured run; rerun the bundle with `GARNISH_REAL_PODMAN_IMAGE` set to a local digest-pinned image to add that evidence. Docker conformance remains separate and explicitly opt-in.

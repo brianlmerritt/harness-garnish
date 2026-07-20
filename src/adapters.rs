@@ -354,6 +354,14 @@ pub struct SandboxAttestation {
     pub cpu_limit: String,
     pub memory_limit: String,
     pub pids_limit: u32,
+    #[serde(default)]
+    pub rootless: Option<bool>,
+    #[serde(default)]
+    pub user_namespace: Option<String>,
+    #[serde(default)]
+    pub effective_capabilities: Option<Vec<String>>,
+    #[serde(default)]
+    pub inherited_proxy_environment: Vec<String>,
     pub reasons: Vec<String>,
 }
 
@@ -373,6 +381,10 @@ impl FakeSandbox {
             cpu_limit: "1".into(),
             memory_limit: "256m".into(),
             pids_limit: 64,
+            rootless: Some(true),
+            user_namespace: Some("fake-isolated".into()),
+            effective_capabilities: Some(vec![]),
+            inherited_proxy_environment: vec![],
             reasons: vec![],
         }
     }
@@ -396,6 +408,8 @@ impl DockerSpec {
             "create".into(),
             "--name".into(),
             self.name.clone().into(),
+            "--pull".into(),
+            "never".into(),
             "--label".into(),
             "harness-garnish.managed=true".into(),
             "--network".into(),
@@ -497,6 +511,221 @@ impl DockerBackend {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PodmanRuntimeInfo {
+    version: String,
+    rootless: bool,
+    service_is_remote: bool,
+    cgroup_manager: String,
+    cgroup_version: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PodmanBackend {
+    executable: PathBuf,
+    runtime: PodmanRuntimeInfo,
+}
+
+impl PodmanBackend {
+    pub fn discover() -> Result<Self> {
+        let executable =
+            discover_executable("podman").ok_or_else(|| anyhow!("podman executable not found"))?;
+        let runtime = inspect_podman_runtime(&executable)?;
+        if !runtime.rootless {
+            bail!("Podman backend requires a rootless runtime");
+        }
+        if runtime.service_is_remote {
+            bail!("remote Podman is not supported by the local bind-mount attestation contract");
+        }
+        Ok(Self {
+            executable,
+            runtime,
+        })
+    }
+
+    pub fn create_argv(spec: &DockerSpec) -> Result<Vec<OsString>> {
+        let mut argv = spec.create_argv()?;
+        let expected_user = current_user_pair()?;
+        let user_index = argv
+            .iter()
+            .position(|value| value == "--user")
+            .context("hardened OCI argv is missing --user")?;
+        argv[user_index + 1] = expected_user.into();
+        let image_index = argv
+            .iter()
+            .position(|value| value == spec.image.as_str())
+            .context("hardened OCI argv is missing the pinned image")?;
+        argv.splice(
+            image_index..image_index,
+            [
+                OsString::from("--userns"),
+                OsString::from("keep-id"),
+                OsString::from("--http-proxy=false"),
+            ],
+        );
+        Ok(argv)
+    }
+
+    pub fn create(&self, spec: &DockerSpec) -> Result<String> {
+        let output = Command::new(&self.executable)
+            .args(Self::create_argv(spec)?)
+            .stdin(Stdio::null())
+            .output()
+            .context("creating Podman sandbox")?;
+        if !output.status.success() {
+            bail!(
+                "podman create failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().into())
+    }
+
+    pub fn inspect(&self, spec: &DockerSpec) -> Result<SandboxAttestation> {
+        let output = Command::new(&self.executable)
+            .args(["container", "inspect", &spec.name])
+            .stdin(Stdio::null())
+            .output()
+            .context("inspecting Podman sandbox")?;
+        if !output.status.success() {
+            bail!(
+                "podman inspect failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        let value = values
+            .first()
+            .context("podman inspect returned no container")?;
+        let caps = Command::new(&self.executable)
+            .args([
+                "container",
+                "inspect",
+                "--format",
+                "{{json .EffectiveCaps}}",
+                &spec.name,
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .context("inspecting effective Podman capabilities")?;
+        if !caps.status.success() {
+            bail!(
+                "podman effective-capability inspection failed: {}",
+                String::from_utf8_lossy(&caps.stderr).trim()
+            );
+        }
+        let effective_capabilities: Vec<String> = serde_json::from_slice(&caps.stdout)
+            .context("parsing effective Podman capabilities")?;
+        attest_podman_inspect(
+            spec,
+            value,
+            &self.runtime,
+            effective_capabilities,
+            &current_user_pair()?,
+        )
+    }
+
+    pub fn start_attached(&self, name: &str) -> Result<std::process::Output> {
+        Command::new(&self.executable)
+            .args(["start", "--attach", name])
+            .stdin(Stdio::null())
+            .output()
+            .context("starting Podman sandbox")
+    }
+
+    pub fn remove(&self, name: &str) -> Result<()> {
+        let output = Command::new(&self.executable)
+            .args(["rm", "--force", name])
+            .stdin(Stdio::null())
+            .output()
+            .context("removing Podman sandbox")?;
+        if !output.status.success() {
+            bail!(
+                "podman remove failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn inspect_podman_runtime(executable: &Path) -> Result<PodmanRuntimeInfo> {
+    let output = Command::new(executable)
+        .args(["info", "--format", "json"])
+        .stdin(Stdio::null())
+        .output()
+        .context("probing Podman runtime")?;
+    if !output.status.success() {
+        bail!(
+            "podman info failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_podman_info(&serde_json::from_slice(&output.stdout)?)
+}
+
+fn parse_podman_info(value: &serde_json::Value) -> Result<PodmanRuntimeInfo> {
+    let host = value
+        .get("host")
+        .or_else(|| value.get("Host"))
+        .context("podman info is missing host metadata")?;
+    let security = host
+        .get("security")
+        .or_else(|| host.get("Security"))
+        .context("podman info is missing security metadata")?;
+    let version_value = value
+        .get("version")
+        .or_else(|| value.get("Version"))
+        .context("podman info is missing version metadata")?;
+    let version = version_value
+        .get("version")
+        .or_else(|| version_value.get("Version"))
+        .and_then(serde_json::Value::as_str)
+        .context("podman info is missing its version string")?;
+    Ok(PodmanRuntimeInfo {
+        version: version.into(),
+        rootless: security
+            .get("rootless")
+            .or_else(|| security.get("Rootless"))
+            .and_then(serde_json::Value::as_bool)
+            .context("podman info is missing the rootless security property")?,
+        service_is_remote: host
+            .get("serviceIsRemote")
+            .or_else(|| host.get("ServiceIsRemote"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        cgroup_manager: host
+            .get("cgroupManager")
+            .or_else(|| host.get("CgroupManager"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .into(),
+        cgroup_version: host
+            .get("cgroupVersion")
+            .or_else(|| host.get("CgroupVersion"))
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| value.to_string())
+            })
+            .unwrap_or_else(|| "unknown".into()),
+    })
+}
+
+fn current_user_pair() -> Result<String> {
+    #[cfg(unix)]
+    {
+        Ok(format!("{}:{}", unsafe { libc::geteuid() }, unsafe {
+            libc::getegid()
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        bail!("local rootless Podman requires a Unix host")
+    }
+}
+
 fn attest_docker_inspect(
     spec: &DockerSpec,
     value: &serde_json::Value,
@@ -586,6 +815,178 @@ fn attest_docker_inspect(
         cpu_limit: format!("{}", nano_cpus as f64 / 1_000_000_000.0),
         memory_limit: memory.to_string(),
         pids_limit,
+        rootless: None,
+        user_namespace: host["UsernsMode"].as_str().map(str::to_owned),
+        effective_capabilities: None,
+        inherited_proxy_environment: vec![],
+        reasons,
+    })
+}
+
+fn attest_podman_inspect(
+    spec: &DockerSpec,
+    value: &serde_json::Value,
+    runtime: &PodmanRuntimeInfo,
+    effective_capabilities: Vec<String>,
+    expected_user: &str,
+) -> Result<SandboxAttestation> {
+    let host = &value["HostConfig"];
+    let config = &value["Config"];
+    let mounts = value["Mounts"].as_array().cloned().unwrap_or_default();
+    let expected_worktree = spec.worktree.canonicalize()?.to_string_lossy().into_owned();
+    let bind_mounts: Vec<_> = mounts
+        .iter()
+        .filter(|mount| mount["Type"] == "bind")
+        .collect();
+    let writable_mounts: Vec<String> = bind_mounts
+        .iter()
+        .filter(|mount| mount["RW"] == true)
+        .filter_map(|mount| mount["Source"].as_str().map(str::to_owned))
+        .collect();
+    let container_socket_mounted = bind_mounts.iter().any(|mount| {
+        mount["Source"]
+            .as_str()
+            .is_some_and(|source| source.contains("docker.sock") || source.contains("podman.sock"))
+    });
+    let home = directories::UserDirs::new()
+        .map(|dirs| dirs.home_dir().to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let host_home_mounted = !home.is_empty()
+        && bind_mounts
+            .iter()
+            .any(|mount| mount["Source"].as_str() == Some(home.as_str()));
+    let no_new_privileges = host["SecurityOpt"].as_array().is_some_and(|values| {
+        values.iter().any(|value| {
+            value
+                .as_str()
+                .is_some_and(|option| option.starts_with("no-new-privileges"))
+        })
+    });
+    let pids_limit = host["PidsLimit"].as_u64().unwrap_or_default() as u32;
+    let memory = host["Memory"].as_u64().unwrap_or_default();
+    let nano_cpus = host["NanoCpus"].as_u64().unwrap_or_default();
+    let user_namespace = host["UsernsMode"].as_str().unwrap_or_default();
+    let expected_mount = bind_mounts.len() == 1
+        && writable_mounts == vec![expected_worktree]
+        && bind_mounts[0]["Destination"] == "/workspace"
+        && bind_mounts[0]["Propagation"]
+            .as_str()
+            .is_none_or(|propagation| matches!(propagation, "" | "private" | "rprivate"));
+    let inherited_proxy_environment: Vec<String> = config["Env"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name))
+        .filter(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                "http_proxy" | "https_proxy" | "ftp_proxy" | "all_proxy" | "no_proxy"
+            )
+        })
+        .map(str::to_owned)
+        .collect();
+    let tmpfs = host["Tmpfs"]
+        .get("/tmp")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let pinned_image_matches = value["ImageName"] == spec.image || config["Image"] == spec.image;
+    let checks = [
+        (runtime.rootless, "Podman runtime is not rootless"),
+        (!runtime.service_is_remote, "Podman runtime is remote"),
+        (host["NetworkMode"] == "none", "network is not disabled"),
+        (
+            host["ReadonlyRootfs"] == true,
+            "root filesystem is writable",
+        ),
+        (
+            effective_capabilities.is_empty(),
+            "effective capabilities are not empty",
+        ),
+        (no_new_privileges, "no-new-privileges is missing"),
+        (host["Privileged"] == false, "container is privileged"),
+        (
+            host["Devices"].as_array().is_none_or(Vec::is_empty),
+            "host devices are exposed",
+        ),
+        (
+            host["PidMode"].as_str().unwrap_or("private") != "host",
+            "host PID namespace is shared",
+        ),
+        (
+            host["IpcMode"].as_str().unwrap_or("private") != "host",
+            "host IPC namespace is shared",
+        ),
+        (
+            host["UTSMode"].as_str().unwrap_or("private") != "host",
+            "host UTS namespace is shared",
+        ),
+        (
+            user_namespace.starts_with("keep-id"),
+            "rootless keep-id user namespace is missing",
+        ),
+        (pids_limit == 256, "PID limit differs from requested policy"),
+        (
+            memory == 2 * 1024 * 1024 * 1024,
+            "memory limit differs from requested policy",
+        ),
+        (
+            nano_cpus == 2_000_000_000,
+            "CPU limit differs from requested policy",
+        ),
+        (
+            config["User"] == expected_user,
+            "container user differs from the rootless host identity",
+        ),
+        (
+            pinned_image_matches,
+            "effective image differs from the requested digest-pinned image",
+        ),
+        (
+            expected_mount,
+            "effective bind mounts differ from the sole private worktree mount",
+        ),
+        (
+            !container_socket_mounted,
+            "a container runtime socket is mounted",
+        ),
+        (!host_home_mounted, "the host home directory is mounted"),
+        (
+            inherited_proxy_environment.is_empty(),
+            "proxy environment was inherited",
+        ),
+        (
+            ["rw", "noexec", "nosuid", "nodev"]
+                .iter()
+                .all(|option| tmpfs.split(',').any(|value| value == *option)),
+            "hardened /tmp tmpfs options are missing",
+        ),
+    ];
+    let reasons: Vec<String> = checks
+        .into_iter()
+        .filter(|(passed, _)| !passed)
+        .map(|(_, reason)| reason.to_owned())
+        .collect();
+    Ok(SandboxAttestation {
+        backend: "podman".into(),
+        secure_container: reasons.is_empty(),
+        image: value["ImageName"]
+            .as_str()
+            .or_else(|| config["Image"].as_str())
+            .unwrap_or(&spec.image)
+            .into(),
+        writable_mounts,
+        network: host["NetworkMode"].as_str().unwrap_or("unknown").into(),
+        user: config["User"].as_str().unwrap_or_default().into(),
+        container_socket_mounted,
+        host_home_mounted,
+        cpu_limit: format!("{}", nano_cpus as f64 / 1_000_000_000.0),
+        memory_limit: memory.to_string(),
+        pids_limit,
+        rootless: Some(runtime.rootless),
+        user_namespace: Some(user_namespace.into()),
+        effective_capabilities: Some(effective_capabilities),
+        inherited_proxy_environment,
         reasons,
     })
 }
@@ -633,6 +1034,61 @@ pub fn probe_docker() -> ProbeResult {
             version: None,
             health: "unhealthy".into(),
             capabilities,
+            failure: Some(error.to_string()),
+        },
+    }
+}
+
+pub fn probe_podman() -> ProbeResult {
+    let base_capabilities = vec![
+        "sandbox.backend=podman".into(),
+        "sandbox.network=none".into(),
+        "sandbox.resource_limits".into(),
+        "sandbox.userns=keep-id".into(),
+    ];
+    let Some(executable) = discover_executable("podman") else {
+        return ProbeResult {
+            adapter: "podman".into(),
+            executable: None,
+            version: None,
+            health: "missing".into(),
+            capabilities: base_capabilities,
+            failure: Some("podman executable not found".into()),
+        };
+    };
+    match inspect_podman_runtime(&executable) {
+        Ok(runtime) if runtime.rootless && !runtime.service_is_remote => {
+            let mut capabilities = base_capabilities;
+            capabilities.push("sandbox.rootless=true".into());
+            capabilities.push(format!("sandbox.cgroup_manager={}", runtime.cgroup_manager));
+            capabilities.push(format!("sandbox.cgroup_version={}", runtime.cgroup_version));
+            ProbeResult {
+                adapter: "podman".into(),
+                executable: Some(executable.to_string_lossy().into_owned()),
+                version: Some(runtime.version),
+                health: "healthy".into(),
+                capabilities,
+                failure: None,
+            }
+        }
+        Ok(runtime) => ProbeResult {
+            adapter: "podman".into(),
+            executable: Some(executable.to_string_lossy().into_owned()),
+            version: Some(runtime.version),
+            health: "unsupported".into(),
+            capabilities: base_capabilities,
+            failure: Some(if runtime.service_is_remote {
+                "remote Podman is outside the local bind-mount attestation contract".into()
+            } else {
+                "Podman is not running rootless".into()
+            }),
+        },
+        Err(error) => ProbeResult {
+            adapter: "podman".into(),
+            executable: Some(executable.to_string_lossy().into_owned()),
+            version: None,
+            health: "unhealthy".into(),
+            capabilities: base_capabilities,
             failure: Some(error.to_string()),
         },
     }
@@ -855,6 +1311,7 @@ mod tests {
         assert!(text.contains("--network none"));
         assert!(text.contains("--cap-drop ALL"));
         assert!(text.contains("no-new-privileges"));
+        assert!(text.contains("--pull never"));
         assert!(!text.contains("docker.sock"));
         assert!(!text.contains(".ssh"));
         assert!(!text.contains(".claude"));
@@ -870,6 +1327,128 @@ mod tests {
             command: vec![],
         };
         assert!(spec.create_argv().is_err());
+    }
+
+    #[test]
+    fn podman_args_are_rootless_hardened_and_disable_implicit_network_fetches() {
+        let dir = tempdir().unwrap();
+        let spec = DockerSpec {
+            name: "garnish-podman-test".into(),
+            image: "example.invalid/image@sha256:abc".into(),
+            worktree: dir.path().to_path_buf(),
+            command: vec!["true".into()],
+        };
+        let text = PodmanBackend::create_argv(&spec)
+            .unwrap()
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("--pull never"));
+        assert!(text.contains("--userns keep-id"));
+        assert!(text.contains("--http-proxy=false"));
+        assert!(text.contains(&format!("--user {}", current_user_pair().unwrap())));
+        assert!(text.contains("--network none"));
+        assert!(text.contains("--read-only"));
+        assert!(text.contains("--cap-drop ALL"));
+    }
+
+    #[test]
+    fn podman_info_requires_explicit_rootless_local_metadata() {
+        let info = parse_podman_info(&serde_json::json!({
+            "host": {
+                "security": {"rootless": true},
+                "serviceIsRemote": false,
+                "cgroupManager": "cgroupfs",
+                "cgroupVersion": "v2"
+            },
+            "version": {"version": "5.6.2"}
+        }))
+        .unwrap();
+        assert!(info.rootless);
+        assert!(!info.service_is_remote);
+        assert_eq!(info.version, "5.6.2");
+        assert_eq!(info.cgroup_manager, "cgroupfs");
+        assert!(parse_podman_info(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn podman_attestation_accepts_only_effective_hardened_state() {
+        let dir = tempdir().unwrap();
+        let worktree = dir.path().canonicalize().unwrap();
+        let user = current_user_pair().unwrap();
+        let spec = DockerSpec {
+            name: "garnish-podman-test".into(),
+            image: "example.invalid/image@sha256:abc".into(),
+            worktree: worktree.clone(),
+            command: vec!["true".into()],
+        };
+        let runtime = PodmanRuntimeInfo {
+            version: "5.6.2".into(),
+            rootless: true,
+            service_is_remote: false,
+            cgroup_manager: "cgroupfs".into(),
+            cgroup_version: "v2".into(),
+        };
+        let mut inspect = serde_json::json!({
+            "ImageName": spec.image,
+            "Config": {
+                "Image": spec.image,
+                "User": user,
+                "Env": ["PATH=/usr/bin:/bin"]
+            },
+            "HostConfig": {
+                "NetworkMode": "none",
+                "ReadonlyRootfs": true,
+                "SecurityOpt": ["no-new-privileges"],
+                "Privileged": false,
+                "Devices": [],
+                "PidMode": "private",
+                "IpcMode": "private",
+                "UTSMode": "private",
+                "UsernsMode": "keep-id",
+                "PidsLimit": 256,
+                "Memory": 2147483648_u64,
+                "NanoCpus": 2000000000_u64,
+                "Tmpfs": {"/tmp": "rw,noexec,nosuid,nodev,size=268435456"}
+            },
+            "Mounts": [{
+                "Type": "bind",
+                "Source": worktree,
+                "Destination": "/workspace",
+                "RW": true,
+                "Propagation": "rprivate"
+            }]
+        });
+        let attestation = attest_podman_inspect(&spec, &inspect, &runtime, vec![], &user).unwrap();
+        assert!(attestation.secure_container, "{:?}", attestation.reasons);
+        assert_eq!(attestation.rootless, Some(true));
+        assert_eq!(attestation.effective_capabilities, Some(vec![]));
+
+        inspect["HostConfig"]["NetworkMode"] = serde_json::json!("host");
+        inspect["Config"]["Env"] = serde_json::json!(["HTTPS_PROXY=secret.invalid"]);
+        let rejected =
+            attest_podman_inspect(&spec, &inspect, &runtime, vec!["CAP_NET_RAW".into()], &user)
+                .unwrap();
+        assert!(!rejected.secure_container);
+        assert!(
+            rejected
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("network"))
+        );
+        assert!(
+            rejected
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("capabilities"))
+        );
+        assert!(
+            rejected
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("proxy"))
+        );
     }
 
     #[test]
@@ -1090,6 +1669,52 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(attestation.secure_container, "{:?}", attestation.reasons);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("container-output.txt")).unwrap(),
+            "container-ok"
+        );
+        cleanup.unwrap();
+    }
+
+    #[test]
+    #[ignore = "real-podman: requires GARNISH_REAL_PODMAN_IMAGE and a healthy local rootless runtime"]
+    fn real_podman_backend_create_inspect_run_cleanup() {
+        let image = env::var("GARNISH_REAL_PODMAN_IMAGE")
+            .expect("set GARNISH_REAL_PODMAN_IMAGE to a locally available digest-pinned image");
+        let dir = tempdir().unwrap();
+        let name = format!(
+            "garnish-podman-conformance-{}",
+            ulid::Ulid::new().to_string().to_lowercase()
+        );
+        let spec = DockerSpec {
+            name: name.clone(),
+            image,
+            worktree: dir.path().to_path_buf(),
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf container-ok > /workspace/container-output.txt".into(),
+            ],
+        };
+        let backend = PodmanBackend::discover().unwrap();
+        backend.create(&spec).unwrap();
+
+        // Capture all outcomes before asserting so the managed container is removed even when
+        // runtime inspection or execution exposes a conformance failure.
+        let attestation = backend.inspect(&spec);
+        let output = backend.start_attached(&name);
+        let cleanup = backend.remove(&name);
+
+        let attestation = attestation.unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(attestation.rootless == Some(true));
+        assert!(attestation.secure_container, "{:?}", attestation.reasons);
+        assert_eq!(attestation.effective_capabilities, Some(vec![]));
         assert_eq!(
             fs::read_to_string(dir.path().join("container-output.txt")).unwrap(),
             "container-ok"

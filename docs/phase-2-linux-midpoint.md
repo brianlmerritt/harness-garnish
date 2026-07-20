@@ -37,4 +37,4 @@ The corrected quota-free bundle passed on 2026-07-20:
 - `podman info` succeeded and reported a healthy rootless runtime.
 - Docker was not installed, so Docker conformance remains separate and opt-in.
 
-This closes the Linux midpoint and rootless-Podman capability probe. It does not yet prove the full backend-specific Podman sandbox attestation matrix; that remains part of later runtime conformance work.
+This closes the Linux midpoint and rootless-Podman capability probe. The backend-specific Podman sandbox conformance test is now available through `scripts/test-podman-conformance`, but this evidence remains capability-only until the VPS is rerun with `GARNISH_REAL_PODMAN_IMAGE` set to a local digest-pinned image.

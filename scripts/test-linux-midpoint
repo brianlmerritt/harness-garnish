@@ -58,6 +58,11 @@ if command -v podman >/dev/null 2>&1; then
   rootless="$(podman info --format '{{.Host.Security.Rootless}}')"
   [[ "$rootless" == "true" ]]
   echo "podman: healthy rootless runtime"
+  if [[ -n "${GARNISH_REAL_PODMAN_IMAGE:-}" ]]; then
+    ./scripts/test-podman-conformance
+  else
+    echo "podman conformance: skipped (set GARNISH_REAL_PODMAN_IMAGE to opt in)"
+  fi
 else
   echo "podman: not installed (runtime probe skipped)"
 fi

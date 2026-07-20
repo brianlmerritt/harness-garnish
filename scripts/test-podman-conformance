@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "error: real Podman conformance currently requires Linux or WSL2" >&2
+  exit 1
+fi
+
+if [[ "$(id -u)" == "0" ]]; then
+  echo "error: run Podman conformance as the dedicated non-root user" >&2
+  exit 1
+fi
+
+if ! command -v podman >/dev/null 2>&1; then
+  echo "error: podman is not installed" >&2
+  exit 1
+fi
+
+if [[ -z "${GARNISH_REAL_PODMAN_IMAGE:-}" ]]; then
+  echo "error: set GARNISH_REAL_PODMAN_IMAGE to a locally available digest-pinned image" >&2
+  exit 1
+fi
+
+case "$GARNISH_REAL_PODMAN_IMAGE" in
+  *@sha256:*) ;;
+  *)
+    echo "error: GARNISH_REAL_PODMAN_IMAGE must contain @sha256:" >&2
+    exit 1
+    ;;
+esac
+
+podman info >/dev/null
+rootless="$(podman info --format '{{.Host.Security.Rootless}}')"
+if [[ "$rootless" != "true" ]]; then
+  echo "error: Harness Garnish requires rootless Podman" >&2
+  exit 1
+fi
+
+if ! podman image exists "$GARNISH_REAL_PODMAN_IMAGE"; then
+  echo "error: the digest-pinned image is not present locally; this test will not pull it" >&2
+  exit 1
+fi
+
+echo "podman: $(podman version --format '{{.Client.Version}}')"
+echo "image: $GARNISH_REAL_PODMAN_IMAGE (present locally; pulls disabled)"
+
+cargo test \
+  adapters::tests::real_podman_backend_create_inspect_run_cleanup \
+  --lib \
+  -- \
+  --ignored \
+  --exact \
+  --nocapture
+
+echo "Rootless Podman conformance passed"

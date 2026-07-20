@@ -125,6 +125,14 @@ After cloning the repository on an Ubuntu or Debian host, run the quota-free Lin
 
 It runs formatting, lint, build and tests; exercises bounded and signal-driven daemon shutdown; verifies private state permissions; and reports rootless Podman and Docker health when installed. The 2026-07-20 VPS run passed this checkpoint and confirmed a healthy rootless Podman capability probe.
 
+The hardened Podman sandbox lifecycle is a separate, explicit opt-in because it needs a real local image. The image must already exist and be addressed by digest; the test disables pulls and container networking:
+
+```console
+GARNISH_REAL_PODMAN_IMAGE='registry.example/image@sha256:...' ./scripts/test-podman-conformance
+```
+
+The same environment variable adds this conformance test to `test-linux-midpoint` and therefore to the WSL2 bundle. Without it, those bundles report the real-container test as skipped. No agent subscription or API is used.
+
 ### WSL2 exit bundle
 
 Use a current rustup-managed Rust toolchain and keep the checkout in the WSL2 Linux filesystem, not under `/mnt/c` or another Windows drive mount. The project requires Rust 1.97 or newer; Rust edition 2024 is supported normally on WSL2 when the compiler is current.

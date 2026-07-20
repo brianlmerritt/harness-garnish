@@ -1,6 +1,6 @@
 use crate::{
     adapters::{
-        AgentKind, FakeSandbox, Invocation, ProbeResult, probe_aoe, probe_docker,
+        AgentKind, FakeSandbox, Invocation, ProbeResult, probe_aoe, probe_docker, probe_podman,
         run_invocation_with_tick, safe_write,
     },
     db::Database,
@@ -84,6 +84,7 @@ impl Garnish {
                 AgentKind::Antigravity.probe(),
                 probe_aoe(),
                 probe_docker(),
+                probe_podman(),
             ],
         }
     }

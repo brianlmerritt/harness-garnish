@@ -132,6 +132,8 @@ trait SandboxBackend {
 
 `prepare` labels every external resource with run ID and spec hash. `inspect` compares effective runtime state with the spec and issues a structured attestation. Docker, Podman, and Apple Container conformance suites share behaviour tests but keep backend-specific assertions.
 
+The Phase 2 rootless-Podman implementation creates without pulling, disables networking and inherited proxy variables, uses `keep-id`, drops all capabilities, enables `no-new-privileges`, applies a read-only root and hardened `/tmp`, bounds CPU/memory/PIDs, and mounts only the project worktree. It accepts the sandbox only after inspecting the effective runtime state, including the rootless/local runtime properties and the effective capability set. `scripts/test-podman-conformance` exercises create, inspect, attached execution, worktree output, and cleanup against an explicitly supplied local digest-pinned image.
+
 ## Quota provider
 
 ```rust
@@ -251,4 +253,3 @@ Every adapter ships:
 - capability degradation tests;
 - no-real-credential CI tests;
 - opt-in, labelled real smoke tests that disclose quota/cost impact.
-
