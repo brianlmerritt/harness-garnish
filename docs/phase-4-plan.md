@@ -54,7 +54,9 @@ The transport-agnostic execution boundary is now complete for fake transports: e
 
 The 2026-07-20 macOS quota-free suite passed 129 tests with 2 opt-in real-container tests ignored. Strict Clippy with warnings denied also passed. No provider transport, credential, subscription quota, or paid API credit was used.
 
-This is intermediate evidence, not Phase 4 exit. The recorded Linux/WSL2 checkpoint covers Schema 15 and remains in [`phase-4-portability-checkpoint.md`](phase-4-portability-checkpoint.md). Schema 16 requires a fresh Linux/WSL2 portability run after the macOS verification and user-managed Git update.
+This is intermediate evidence, not Phase 4 exit. Schema 16 passed the quota-free macOS, native-Linux, and WSL2 suites: 129 tests passed on each platform, with the same 2 explicitly opt-in real-container tests ignored. Exact kernels, toolchains, and safety conditions are recorded in [`phase-4-portability-checkpoint.md`](phase-4-portability-checkpoint.md).
+
+The first routing-integration slice gives the literal `api` adapter its own project-budget capacity gate instead of treating paid capacity as subscription percentage. It requires effective provider policy, the latest enabled and active project budget, implementer-role permission, concurrency and integer currency/token/request headroom, and effective price evidence for at least one allowed model. A mixed subscription/API candidate set marks the API lane `api.explicit_selection_required`; low subscription quota can never select it as fallback. An exact API pin reaches these gates, but automated scheduler claim is intentionally denied as `api.scheduler_execution_unavailable` until the scheduler can atomically bind an exact request digest and API budget reservation. The macOS quota-free suite now passes 132 tests with 2 opt-in real-container tests ignored; strict Clippy also passes.
 
 ## Explicit non-goals
 

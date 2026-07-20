@@ -32,6 +32,15 @@ pub struct Database {
     conn: Connection,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ApiRouteCapacity {
+    pub allowed: bool,
+    pub reason_code: String,
+    pub reason: String,
+    pub remaining_percent: Option<f64>,
+    pub next_wake_at: Option<DateTime<Utc>>,
+}
+
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
@@ -2576,6 +2585,175 @@ impl Database {
             ))
         });
         Ok(budgets)
+    }
+
+    pub(crate) fn api_route_capacity(
+        &self,
+        project_id: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ApiRouteCapacity> {
+        let budget = self
+            .conn
+            .query_row(
+                &format!(
+                    "{API_BUDGET_SELECT} WHERE project_id = ?1 AND provider = ?2 AND account = ?3
+                     ORDER BY created_at DESC, id DESC LIMIT 1"
+                ),
+                params![project_id, provider, account],
+                map_api_budget,
+            )
+            .optional()?;
+        let denied = |reason_code: &str, reason: String, next_wake_at: Option<DateTime<Utc>>| {
+            ApiRouteCapacity {
+                allowed: false,
+                reason_code: reason_code.into(),
+                reason,
+                remaining_percent: None,
+                next_wake_at,
+            }
+        };
+        let Some(budget) = budget else {
+            return Ok(denied(
+                "api.disabled",
+                "api.disabled: no project API budget is configured".into(),
+                None,
+            ));
+        };
+        if !budget.enabled {
+            return Ok(denied(
+                "api.disabled",
+                "api.disabled: the latest project API budget is disabled".into(),
+                None,
+            ));
+        }
+        if now < budget.period_start {
+            return Ok(denied(
+                "api.period_inactive",
+                format!(
+                    "api.period_inactive: the API budget starts at {}",
+                    budget.period_start
+                ),
+                Some(budget.period_start),
+            ));
+        }
+        if now >= budget.period_end {
+            return Ok(denied(
+                "api.period_inactive",
+                format!(
+                    "api.period_inactive: the API budget ended at {}",
+                    budget.period_end
+                ),
+                None,
+            ));
+        }
+        if !budget
+            .allowed_roles
+            .iter()
+            .any(|role| role == "implementer")
+        {
+            return Ok(denied(
+                "api.role_denied",
+                "api.role_denied: project budget does not allow the implementer role".into(),
+                None,
+            ));
+        }
+        let active_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM api_budget_reservations
+             WHERE budget_id = ?1
+               AND ((status = 'active' AND expires_at > ?2) OR status = 'dispatched')",
+            params![budget.id, now.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        if active_count >= i64::from(budget.max_concurrent_requests) {
+            return Ok(denied(
+                "api.concurrency_limit",
+                "api.concurrency_limit: project API concurrency ceiling reached".into(),
+                Some(budget.period_end),
+            ));
+        }
+        let (spent_currency, spent_tokens, spent_requests): (i64, i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(cost_micros), 0),
+                        COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
+                 FROM api_spend WHERE budget_id = ?1",
+            [&budget.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let (reserved_currency, reserved_tokens, reserved_requests): (i64, i64, i64) =
+            self.conn.query_row(
+                "SELECT COALESCE(SUM(reserved_currency_micros), 0),
+                        COALESCE(SUM(reserved_input_tokens + reserved_output_tokens), 0), COUNT(*)
+                 FROM api_budget_reservations
+                 WHERE budget_id = ?1
+                   AND ((status = 'active' AND expires_at > ?2) OR status = 'dispatched')",
+                params![budget.id, now.to_rfc3339()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let mut remaining = Vec::new();
+        for (reason_code, label, limit, used) in [
+            (
+                "api.currency_budget_exhausted",
+                "monetary",
+                budget.currency_limit_micros,
+                spent_currency.checked_add(reserved_currency),
+            ),
+            (
+                "api.token_budget_exhausted",
+                "token",
+                budget.token_limit,
+                spent_tokens.checked_add(reserved_tokens),
+            ),
+            (
+                "api.request_budget_exhausted",
+                "request",
+                budget.request_limit,
+                spent_requests.checked_add(reserved_requests),
+            ),
+        ] {
+            let Some(limit) = limit else { continue };
+            let used = used.ok_or_else(|| anyhow!("API route capacity accounting overflow"))?;
+            let limit_i64 = sql_u64(limit, "API route capacity limit")?;
+            if used >= limit_i64 {
+                return Ok(denied(
+                    reason_code,
+                    format!("{reason_code}: project API {label} budget has no remaining capacity"),
+                    Some(budget.period_end),
+                ));
+            }
+            remaining.push(((limit_i64 - used) as f64 / limit_i64 as f64) * 100.0);
+        }
+        if let Some(currency) = budget.currency.as_deref() {
+            let mut priced_model = false;
+            for model in &budget.allowed_models {
+                let found: bool = self.conn.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM api_model_prices
+                        WHERE provider = ?1 AND account = ?2 AND model = ?3 AND currency = ?4
+                          AND effective_from <= ?5
+                          AND (effective_to IS NULL OR effective_to > ?5)
+                    )",
+                    params![provider, account, model, currency, now.to_rfc3339()],
+                    |row| row.get(0),
+                )?;
+                priced_model |= found;
+            }
+            if !priced_model {
+                return Ok(denied(
+                    "api.pricing_evidence_missing",
+                    "api.pricing_evidence_missing: no allowed model has effective price evidence"
+                        .into(),
+                    None,
+                ));
+            }
+        }
+        Ok(ApiRouteCapacity {
+            allowed: true,
+            reason_code: "route.allowed".into(),
+            reason: "route.allowed: API policy and project budget gates passed".into(),
+            remaining_percent: remaining.into_iter().min_by(f64::total_cmp),
+            next_wake_at: None,
+        })
     }
 
     pub fn reserve_api_budget(

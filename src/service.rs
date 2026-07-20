@@ -1018,6 +1018,17 @@ impl Garnish {
             _ => bail!("task manual pin is incomplete in canonical state"),
         };
         let project = self.db.project(&task.project_id)?;
+        let api_route = adapter == "api";
+        let api_provider_allowed = !api_route || matches!(provider, "openai" | "anthropic");
+        let api_policy_allowed = !api_route || self.policy.api_allowed(provider);
+        let api_capacity = if api_route && api_provider_allowed {
+            Some(
+                self.db
+                    .api_route_capacity(&project.id, provider, account, now)?,
+            )
+        } else {
+            None
+        };
         let project_allowed = !project.scheduler_paused;
         let control = self.db.control_state()?;
         let operations_allowed = !control.pause_new_work && !control.emergency_stop;
@@ -1032,19 +1043,61 @@ impl Garnish {
         let (mut circuit_allowed, mut circuit_wake, mut circuit_reason) = self
             .db
             .adapter_circuit_gate(adapter, provider, account, now, false)?;
-        let quota: Vec<_> = self
-            .db
-            .list_quota()?
-            .into_iter()
-            .filter(|surface| surface.provider == provider && surface.account == account)
-            .collect();
-        let usage_forecast = self.usage_forecast_for_task(&task, adapter, provider, account)?;
+        let quota: Vec<_> = if api_route {
+            vec![]
+        } else {
+            self.db
+                .list_quota()?
+                .into_iter()
+                .filter(|surface| surface.provider == provider && surface.account == account)
+                .collect()
+        };
+        let usage_forecast = if api_route {
+            UsageForecast {
+                adapter: adapter.into(),
+                provider: provider.into(),
+                account: account.into(),
+                estimated_seconds: task.estimated_seconds,
+                uncertainty_percent: task.uncertainty_percent,
+                forecast_percent: 0.0,
+                source: "api_budget_capacity".into(),
+                sample_count: 0,
+                percentile: None,
+                lookback_limit: 0,
+            }
+        } else {
+            self.usage_forecast_for_task(&task, adapter, provider, account)?
+        };
         let forecast = usage_forecast.forecast_percent;
-        let required_headroom = quota
-            .iter()
-            .map(|surface| surface.reserve_percent + forecast)
-            .fold(self.policy.reserve_percent + forecast, f64::max);
-        let (quota_allowed, quota_reason_code, quota_reason) = if quota.is_empty() {
+        let required_headroom = if api_route {
+            0.0
+        } else {
+            quota
+                .iter()
+                .map(|surface| surface.reserve_percent + forecast)
+                .fold(self.policy.reserve_percent + forecast, f64::max)
+        };
+        let (quota_allowed, quota_reason_code, quota_reason) = if api_route {
+            let capacity = api_capacity.as_ref();
+            (
+                api_provider_allowed
+                    && api_policy_allowed
+                    && capacity.is_some_and(|capacity| capacity.allowed),
+                capacity.map_or("api.provider_denied", |capacity| {
+                    capacity.reason_code.as_str()
+                }),
+                if !api_provider_allowed {
+                    "api.provider_denied: api adapter supports only openai or anthropic".into()
+                } else if !api_policy_allowed {
+                    "api.policy_disabled: effective policy disables this API provider".into()
+                } else {
+                    capacity.map_or_else(
+                        || "api.disabled: project API budget is unavailable".into(),
+                        |capacity| capacity.reason.clone(),
+                    )
+                },
+            )
+        } else if quota.is_empty() {
             (
                 self.policy.unknown_quota_unattended,
                 "quota.unavailable",
@@ -1230,6 +1283,16 @@ impl Garnish {
             ("capability.missing".to_owned(), capability_reason)
         } else if !policy_allowed {
             (policy_reason_code.to_owned(), policy_reason)
+        } else if api_route && !api_provider_allowed {
+            (
+                "api.provider_denied".to_owned(),
+                "api.provider_denied: api adapter supports only openai or anthropic".into(),
+            )
+        } else if api_route && !api_policy_allowed {
+            (
+                "api.policy_disabled".to_owned(),
+                "api.policy_disabled: effective policy disables this API provider".into(),
+            )
         } else if !quota_allowed {
             (quota_reason_code.to_owned(), quota_reason)
         } else {
@@ -1238,9 +1301,15 @@ impl Garnish {
         let selected_adapter = allowed.then(|| adapter.to_owned());
         let selected_provider = allowed.then(|| provider.to_owned());
         let selected_account = allowed.then(|| account.to_owned());
-        let quota_wake = (!quota_allowed)
-            .then(|| quota.iter().filter_map(|surface| surface.reset_at).max())
-            .flatten();
+        let quota_wake = if api_route {
+            api_capacity
+                .as_ref()
+                .and_then(|capacity| capacity.next_wake_at)
+        } else {
+            (!quota_allowed)
+                .then(|| quota.iter().filter_map(|surface| surface.reset_at).max())
+                .flatten()
+        };
         let schedule_wake = (!schedule.eligible)
             .then_some(schedule.next_eligible_at)
             .flatten();
@@ -1249,10 +1318,16 @@ impl Garnish {
             .into_iter()
             .flatten()
             .max();
-        let minimum_effective_remaining_percent = quota
-            .iter()
-            .filter_map(|surface| surface.effective_remaining_percent)
-            .min_by(f64::total_cmp);
+        let minimum_effective_remaining_percent = if api_route {
+            api_capacity
+                .as_ref()
+                .and_then(|capacity| capacity.remaining_percent)
+        } else {
+            quota
+                .iter()
+                .filter_map(|surface| surface.effective_remaining_percent)
+                .min_by(f64::total_cmp)
+        };
         let decision = RouteDecision {
             id: Ulid::new().to_string(),
             task_id: task.id,
@@ -1573,6 +1648,25 @@ impl Garnish {
             ));
         }
 
+        let pin = task_route_pin(&task)?;
+        let mixed_paid_and_subscription = targets.iter().any(|target| target.adapter == "api")
+            && targets.iter().any(|target| target.adapter != "api");
+        if mixed_paid_and_subscription && pin.as_ref().is_none_or(|pin| pin.adapter != "api") {
+            for (target, decision) in &mut preliminary {
+                if target.adapter == "api" {
+                    decision.allowed = false;
+                    decision.selected_adapter = None;
+                    decision.selected_provider = None;
+                    decision.selected_account = None;
+                    decision.reason_code = "api.explicit_selection_required".into();
+                    decision.reason = "api.explicit_selection_required: a paid API candidate cannot be selected as fallback from a subscription route".into();
+                    decision.candidates[0].allowed = false;
+                    decision.candidates[0].reason_code = decision.reason_code.clone();
+                    decision.candidates[0].filter_reason = decision.reason.clone();
+                }
+            }
+        }
+
         let allowed_targets = preliminary
             .iter()
             .filter(|(_, decision)| decision.allowed)
@@ -1613,7 +1707,13 @@ impl Garnish {
             .collect::<BTreeMap<_, _>>();
         let mut inputs = Vec::with_capacity(allowed_targets.len());
         for target in &allowed_targets {
-            let (freshness, health, capabilities) = if target.adapter.starts_with("fake") {
+            let (freshness, health, capabilities) = if target.adapter == "api" {
+                (
+                    ProbeFreshness::Fresh,
+                    AdapterHealth::Healthy,
+                    api_adapter_capabilities(),
+                )
+            } else if target.adapter.starts_with("fake") {
                 let probe = AgentKind::Fake.probe();
                 (
                     ProbeFreshness::Fresh,
@@ -1642,14 +1742,27 @@ impl Garnish {
                     surface.provider == target.provider && surface.account == target.account
                 })
                 .collect::<Vec<_>>();
-            let remaining_percent = surfaces
-                .iter()
-                .filter_map(|surface| surface.effective_remaining_percent)
-                .min_by(|left, right| left.total_cmp(right));
-            let reserve_percent = surfaces
-                .iter()
-                .map(|surface| surface.reserve_percent)
-                .fold(self.policy.reserve_percent, f64::max);
+            let remaining_percent = if target.adapter == "api" {
+                preliminary
+                    .iter()
+                    .find(|(candidate, _)| candidate == target)
+                    .and_then(|(_, decision)| {
+                        decision.candidates[0].minimum_effective_remaining_percent
+                    })
+            } else {
+                surfaces
+                    .iter()
+                    .filter_map(|surface| surface.effective_remaining_percent)
+                    .min_by(|left, right| left.total_cmp(right))
+            };
+            let reserve_percent = if target.adapter == "api" {
+                0.0
+            } else {
+                surfaces
+                    .iter()
+                    .map(|surface| surface.reserve_percent)
+                    .fold(self.policy.reserve_percent, f64::max)
+            };
             inputs.push(RoutingCandidateInput {
                 identity: CandidateIdentity {
                     adapter: target.adapter.clone(),
@@ -1786,6 +1899,29 @@ impl Garnish {
             candidate.filter_reason = decision.reason.clone();
             candidate.score = None;
             candidate.score_components = None;
+        }
+        if decision.allowed
+            && selected_target
+                .as_ref()
+                .is_some_and(|target| target.adapter == "api")
+        {
+            decision.allowed = false;
+            decision.selected_adapter = None;
+            decision.selected_provider = None;
+            decision.selected_account = None;
+            decision.reason_code = "api.scheduler_execution_unavailable".into();
+            decision.reason = "api.scheduler_execution_unavailable: automated API claims remain disabled until an exact request and budget reservation can be bound atomically".into();
+            if let Some(candidate) = decision.candidates.iter_mut().find(|candidate| {
+                candidate.adapter == "api"
+                    && candidate.provider == selected_target.as_ref().expect("checked").provider
+                    && candidate.account == selected_target.as_ref().expect("checked").account
+            }) {
+                candidate.allowed = false;
+                candidate.reason_code = decision.reason_code.clone();
+                candidate.filter_reason = decision.reason.clone();
+                candidate.score = None;
+                candidate.score_components = None;
+            }
         }
         self.db.record_route(&decision)?;
         let selected_target = decision.allowed.then_some(selected_target).flatten();
@@ -2614,6 +2750,28 @@ fn evaluate_adapter_capabilities(adapter: &str, required: &[String]) -> (bool, S
     if required.is_empty() {
         return (true, "no task-specific capabilities are required".into());
     }
+    if adapter == "api" {
+        let capabilities = api_adapter_capabilities();
+        let missing = required
+            .iter()
+            .filter(|required| !capabilities.contains(required))
+            .cloned()
+            .collect::<Vec<_>>();
+        return if missing.is_empty() {
+            (
+                true,
+                "API adapter satisfies every required capability".into(),
+            )
+        } else {
+            (
+                false,
+                format!(
+                    "capability.missing: API adapter lacks {}",
+                    missing.join(",")
+                ),
+            )
+        };
+    }
     let kind = if adapter.starts_with("fake") {
         Some(AgentKind::Fake)
     } else {
@@ -2657,6 +2815,10 @@ fn evaluate_adapter_capabilities(adapter: &str, required: &[String]) -> (bool, S
             ),
         )
     }
+}
+
+fn api_adapter_capabilities() -> Vec<String> {
+    vec!["agent.headless".into(), "agent.tool_policy".into()]
 }
 
 #[cfg(test)]
@@ -2882,6 +3044,48 @@ mod tests {
             fake_write_path: Some("result.txt".into()),
             fake_write_content: Some("done\n".into()),
         }
+    }
+
+    fn enable_fixture_api_route(garnish: &mut Garnish, project_id: &str, now: DateTime<Utc>) {
+        garnish.policy.openai_api_enabled = true;
+        garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project_id.into(),
+                provider: "openai".into(),
+                account: "paid".into(),
+                enabled: true,
+                secret_reference: "env:FIXTURE_API_KEY".into(),
+                currency: Some("USD".into()),
+                currency_limit_micros: Some(1_000_000),
+                token_limit: Some(100_000),
+                request_limit: Some(10),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::days(1),
+                allowed_models: vec!["model-fixture".into()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["implementer".into()],
+                max_output_tokens: 1_000,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "explicit paid routing fixture".into(),
+            })
+            .unwrap();
+        garnish
+            .configure_api_model_price(&NewApiModelPrice {
+                provider: "openai".into(),
+                account: "paid".into(),
+                model: "model-fixture".into(),
+                currency: "USD".into(),
+                input_micros_per_million: 1_000_000,
+                cached_input_micros_per_million: 500_000,
+                cache_creation_input_micros_per_million: 1_500_000,
+                output_micros_per_million: 2_000_000,
+                effective_from: now - Duration::minutes(1),
+                effective_to: Some(now + Duration::days(1)),
+                source: "fixture price evidence".into(),
+                reason: "explicit paid routing fixture".into(),
+            })
+            .unwrap();
     }
 
     fn prepare_active_run(garnish: &mut Garnish, task: &Task, run_id: &str, now: DateTime<Utc>) {
@@ -3317,6 +3521,155 @@ mod tests {
             assert!(!String::from_utf8_lossy(&state).contains(canary));
             assert!(!String::from_utf8_lossy(&backup_state).contains(canary));
         }
+    }
+
+    #[test]
+    fn api_route_uses_project_budget_not_subscription_quota_and_fails_closed() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+
+        let denied = garnish
+            .route_task_at(&task.id, "api", "openai", "paid", now)
+            .unwrap();
+        assert!(!denied.allowed);
+        assert_eq!(denied.reason_code, "api.policy_disabled");
+        assert!(denied.quota.is_empty());
+
+        enable_fixture_api_route(&mut garnish, &project.id, now);
+        let allowed = garnish
+            .route_task_at(&task.id, "api", "openai", "paid", now)
+            .unwrap();
+        assert!(allowed.allowed);
+        assert_eq!(allowed.reason_code, "route.allowed");
+        assert!(allowed.quota.is_empty());
+        assert_eq!(allowed.candidates[0].forecast_percent, 0.0);
+        assert_eq!(allowed.candidates[0].forecast_source, "api_budget_capacity");
+        assert_eq!(
+            allowed.candidates[0].minimum_effective_remaining_percent,
+            Some(100.0)
+        );
+        garnish
+            .reserve_api_budget(&ApiReservationRequest {
+                project_id: project.id,
+                task_id: task.id.clone(),
+                provider: "openai".into(),
+                account: "paid".into(),
+                model: "model-fixture".into(),
+                role: "implementer".into(),
+                request_digest: "d".repeat(64),
+                reserved_currency_micros: 100,
+                reserved_input_tokens: 10,
+                reserved_output_tokens: 10,
+                now,
+                expires_at: now + Duration::minutes(5),
+            })
+            .unwrap();
+        let saturated = garnish
+            .route_task_at(&task.id, "api", "openai", "paid", now)
+            .unwrap();
+        assert!(!saturated.allowed);
+        assert_eq!(saturated.reason_code, "api.concurrency_limit");
+    }
+
+    #[test]
+    fn low_subscription_quota_never_selects_a_paid_api_fallback() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        enable_fixture_api_route(&mut garnish, &project.id, now);
+        garnish
+            .set_quota(
+                "fake",
+                "subscription",
+                "five_hour",
+                Some(5.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let targets = vec![
+            RouteTarget {
+                adapter: "fake".into(),
+                provider: "fake".into(),
+                account: "subscription".into(),
+            },
+            RouteTarget {
+                adapter: "api".into(),
+                provider: "openai".into(),
+                account: "paid".into(),
+            },
+        ];
+        let (decision, selected) = garnish
+            .route_task_candidates_at(&task.id, &targets, now)
+            .unwrap();
+        assert!(!decision.allowed);
+        assert!(selected.is_none());
+        let api = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.adapter == "api")
+            .unwrap();
+        assert_eq!(api.reason_code, "api.explicit_selection_required");
+        let subscription = decision
+            .candidates
+            .iter()
+            .find(|candidate| candidate.adapter == "fake")
+            .unwrap();
+        assert_eq!(subscription.reason_code, "quota.insufficient");
+    }
+
+    #[test]
+    fn explicit_api_pin_reaches_budget_gate_but_scheduler_claim_remains_disabled() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        enable_fixture_api_route(&mut garnish, &project.id, now);
+        garnish
+            .set_task_route_pin(&task.id, "api", "openai", "paid", "explicit paid API route")
+            .unwrap();
+        let (decision, selected) = garnish
+            .route_task_candidates_at(
+                &task.id,
+                &[
+                    RouteTarget {
+                        adapter: "fake".into(),
+                        provider: "fake".into(),
+                        account: "subscription".into(),
+                    },
+                    RouteTarget {
+                        adapter: "api".into(),
+                        provider: "openai".into(),
+                        account: "paid".into(),
+                    },
+                ],
+                now,
+            )
+            .unwrap();
+        assert!(!decision.allowed);
+        assert!(selected.is_none());
+        assert_eq!(decision.reason_code, "api.scheduler_execution_unavailable");
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Ready);
+        assert!(
+            garnish
+                .api_reservations(Some("fixture"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

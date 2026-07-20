@@ -1,7 +1,8 @@
 # Phase 4 portability checkpoint
 
 - Date: 2026-07-20
-- Scope: Schema 15 API budget control plane, network-free OpenAI/Anthropic fixture contracts, and protected secret references
+- Evidence boundary: Git commit `5627fb0` (`phase 4 pt4`)
+- Scope: Schema 16 API budget/pricing control plane, categorized provider usage, fake-only execution lifecycle, and protected secret references
 - Result: passed on macOS, native Linux, and WSL2
 
 ## Safety conditions
@@ -14,7 +15,7 @@ The portability script removed `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `ANTHR
 - Rust: 1.97.1
 - Cargo: 1.97.1
 - Strict Clippy: passed
-- Tests: 119 passed, 0 failed, 2 explicitly ignored
+- Tests: 129 passed, 0 failed, 2 explicitly ignored
 
 The macOS suite was run directly because `scripts/test-phase4-portability` deliberately accepts only Linux and WSL2. This avoids presenting a Linux portability check as a macOS test while preserving the same format, lint, and fixture-only test gates.
 
@@ -25,7 +26,7 @@ The macOS suite was run directly because `scripts/test-phase4-portability` delib
 - Cargo: 1.97.1
 - Script: `./scripts/test-phase4-portability`
 - Strict Clippy: passed
-- Tests: 119 passed, 0 failed, 2 explicitly ignored
+- Tests: 129 passed, 0 failed, 2 explicitly ignored
 - Terminal evidence: `Phase 4 quota-free portability checkpoint passed on linux`
 
 ## WSL2
@@ -36,11 +37,11 @@ The macOS suite was run directly because `scripts/test-phase4-portability` delib
 - Cargo: 1.97.1
 - Script: `./scripts/test-phase4-portability`
 - Strict Clippy: passed
-- Tests: 119 passed, 0 failed, 2 explicitly ignored
+- Tests: 129 passed, 0 failed, 2 explicitly ignored
 - Terminal evidence: `Phase 4 quota-free portability checkpoint passed on wsl2`
 
 The script's terminal success is emitted only after format, strict Clippy, and the complete locked workspace test suite succeed with provider credential variables removed.
 
 ## Conclusion
 
-P4-14 is established for the current intermediate scope: the normal macOS/Linux/WSL2 suites are fixture-only and quota-free. This is not Phase 4 exit evidence. Real provider transports, secret projection, routing integration, controlled extensions, and any explicitly opted-in paid smoke test remain incomplete.
+P4-14 is established for the Schema 16 intermediate scope: the normal macOS/Linux/WSL2 suites are fixture-only and quota-free. This is not Phase 4 exit evidence. Real provider transports, routing integration, controlled extensions, and any explicitly opted-in paid smoke test remain incomplete.
