@@ -157,7 +157,7 @@ garnish --data-dir .garnish-state quota forecast --adapter codex --provider code
 
 ### Phase 4 API budget control plane
 
-Schema 19 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas, adds append-only model-price evidence, per-task exact request plans, and durable bounded dispatch-attempt evidence. It has no real HTTP transport: configuration, fixture execution, and these read commands cannot make a provider request or spend credit.
+Schema 19 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas, adds append-only model-price evidence, per-task exact request plans, and durable bounded dispatch-attempt evidence. The normal CLI and scheduler do not activate the compiled live transport: configuration, fixture execution, and these read commands cannot make a provider request or spend credit.
 
 ```console
 cargo run --locked -- --data-dir .garnish-state api budget-status
@@ -172,9 +172,26 @@ cargo run --locked -- --data-dir .garnish-state api plan-set --help
 
 These eight commands contain no placeholders; the two `--help` commands print required fields without changing state. A project budget can be configured through `api budget-set`, but configuration alone never enables spending: effective policy is independently default-deny, and no subscription-quota condition can select paid API use. Price rates are explicit integer currency micros per million tokens and are never fetched or guessed. Secret fields accept only a locator shaped as `env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`; they never accept a key value. The authenticated read-only dashboard shows API budgets, exact task-plan counts, reserved and attempted requests, and settled usage under **Agents & quotas**.
 
-Protected secret resolution is host-side and bounded. On Unix, `file:` targets must be regular files owned by the Garnish user with no group/other permissions (normally mode `0600`); symlinks are rejected. `keychain:` currently requires macOS. WSL2 and native Linux use `env:` or a protected Linux-side file. No API transport is enabled yet, so users should not configure or test a live credential at this stage.
+Protected secret resolution is host-side and bounded. On Unix, `file:` targets must be regular files owned by the Garnish user with no group/other permissions (normally mode `0600`); symlinks are rejected. `keychain:` currently requires macOS. WSL2 and native Linux use `env:` or a protected Linux-side file. A live credential is resolved only after the complete budget/request boundary passes and only for the explicitly opted-in smoke test described below.
 
-API routing uses the literal adapter key `api` with provider `openai` or `anthropic`; the account is the configured Garnish account label. Paid capacity is checked against the project API budget, never subscription percentages. In a mixed subscription/API candidate set, the API lane cannot act as fallback: it requires an exact task pin. An enabled `api plan-set` revision binds the current canonical task version, provider/account, model, role, bounds, retry count, template version, and request digest without storing a duplicate prompt. The scheduler rejects missing, disabled, stale, or mismatched plans and atomically reserves currency, tokens, and request count for every allowed attempt before claiming the task. The fake-transport execution boundary retries only explicitly classified rate-limit or transient provider responses within that reservation. Authentication and other terminal failures stop immediately; transport or authoritative-response uncertainty is retained and never replayed automatically. There is still no real HTTP transport.
+API routing uses the literal adapter key `api` with provider `openai` or `anthropic`; the account is the configured Garnish account label. Paid capacity is checked against the project API budget, never subscription percentages. In a mixed subscription/API candidate set, the API lane cannot act as fallback: it requires an exact task pin. An enabled `api plan-set` revision binds the current canonical task version, provider/account, model, role, bounds, retry count, template version, and request digest without storing a duplicate prompt. The scheduler rejects missing, disabled, stale, or mismatched plans and atomically reserves currency, tokens, and request count for every allowed attempt before claiming the task. The execution boundary retries only explicitly classified rate-limit or transient provider responses within that reservation. Authentication and other terminal failures stop immediately; transport or authoritative-response uncertainty is retained and never replayed automatically. The compiled live transport is not wired into normal scheduler execution.
+
+### Explicit paid API smoke test
+
+`scripts/test-real-api-smoke` is the only current live provider entry point. Do not run it as part of normal testing: it makes exactly one API request and the provider may charge it. It disables redirects, proxy inheritance, and implicit HTTP retries; reserves one request with a 32-output-token ceiling; uses a temporary database; and configures no currency price evidence. OpenAI requests set `store: false`. A timeout remains an uncertain attempted request and must not be rerun automatically.
+
+The values `EXACT_MODEL_ID` and `YOUR_REAL_OPENAI_API_KEY` are placeholders below. Replace them with an exact provider model ID and the real credential. The credential stays in an environment variable and never enters a Garnish argument or repository file. These commands prepare an OpenAI smoke test but do not run it until the final script command:
+
+```console
+export OPENAI_API_KEY='YOUR_REAL_OPENAI_API_KEY'
+export GARNISH_REAL_API_PROVIDER='openai'
+export GARNISH_REAL_API_MODEL='EXACT_MODEL_ID'
+export GARNISH_REAL_API_SECRET_REFERENCE='env:OPENAI_API_KEY'
+export GARNISH_ACKNOWLEDGE_PAID_API='I_ACCEPT_ONE_PAID_API_REQUEST'
+./scripts/test-real-api-smoke
+```
+
+For Anthropic, use `ANTHROPIC_API_KEY`, provider `anthropic`, secret reference `env:ANTHROPIC_API_KEY`, and an exact Anthropic model ID. No API call is required for the current development checkpoint; run this only when explicitly choosing to spend one request.
 
 Successful fake execution now creates separate implementer and verifier run records. The quota-free `garnish-command-verifier:local:default` is independently selected, receives a clean detached verification worktree and its own evidence directory, and runs only the task's predeclared verification argv. It is a deterministic command verifier, not a claim of semantic agent review. Default policy requires a different verifier adapter; project policy can also require a different provider.
 

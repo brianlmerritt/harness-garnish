@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, io::Read, time::Duration as StdDuration};
 
 const MAX_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_EVENTS: usize = 100_000;
@@ -17,6 +17,8 @@ const MAX_INSTRUCTIONS_BYTES: usize = 256 * 1024;
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOOLS: usize = 64;
+const DEFAULT_LIVE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_LIVE_TIMEOUT_SECONDS: u64 = 300;
 
 #[derive(Clone, PartialEq)]
 pub struct ApiToolDefinition {
@@ -66,6 +68,7 @@ pub struct PreparedApiRequest {
     secret_header_prefix: &'static [u8],
     secret: SecretValue,
     body: Vec<u8>,
+    streamed: bool,
 }
 
 impl PreparedApiRequest {
@@ -110,12 +113,228 @@ impl fmt::Debug for PreparedApiRequest {
             .field("body", &"[REDACTED]")
             .field("body_bytes", &self.body.len())
             .field("body_sha256", &self.body_sha256())
+            .field("streamed", &self.streamed)
             .finish()
     }
 }
 
 pub trait ApiTransport {
     fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveApiTransportConfig {
+    pub network_enabled: bool,
+    pub connect_timeout: StdDuration,
+    pub request_timeout: StdDuration,
+    pub max_response_bytes: usize,
+}
+
+impl Default for LiveApiTransportConfig {
+    fn default() -> Self {
+        Self {
+            network_enabled: false,
+            connect_timeout: StdDuration::from_secs(10),
+            request_timeout: StdDuration::from_secs(120),
+            max_response_bytes: DEFAULT_LIVE_RESPONSE_BYTES,
+        }
+    }
+}
+
+pub struct LiveApiTransport {
+    client: reqwest::blocking::Client,
+    max_response_bytes: usize,
+}
+
+impl fmt::Debug for LiveApiTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LiveApiTransport")
+            .field("fixed_provider_endpoints", &true)
+            .field("redirects", &false)
+            .field("environment_proxy", &false)
+            .field("implicit_retries", &false)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .finish()
+    }
+}
+
+impl LiveApiTransport {
+    pub fn new(config: LiveApiTransportConfig) -> Result<Self> {
+        if !config.network_enabled {
+            bail!("api.live_transport_disabled: explicit network opt-in is required");
+        }
+        validate_live_duration(config.connect_timeout, "connect timeout")?;
+        validate_live_duration(config.request_timeout, "request timeout")?;
+        if config.connect_timeout > config.request_timeout {
+            bail!("api.live_transport_config: connect timeout exceeds request timeout");
+        }
+        if config.max_response_bytes == 0 || config.max_response_bytes > MAX_PAYLOAD_BYTES {
+            bail!(
+                "api.live_transport_config: response limit must be within 1..={MAX_PAYLOAD_BYTES} bytes"
+            );
+        }
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            bail!("api.live_transport_init: TLS crypto provider initialization failed");
+        }
+        let client = reqwest::blocking::Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .referer(false)
+            .retry(reqwest::retry::never())
+            .connect_timeout(config.connect_timeout)
+            .timeout(config.request_timeout)
+            .user_agent(concat!("harness-garnish/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|_| anyhow!("api.live_transport_init: HTTPS client initialization failed"))?;
+        Ok(Self {
+            client,
+            max_response_bytes: config.max_response_bytes,
+        })
+    }
+
+    fn build_request(&self, request: &PreparedApiRequest) -> Result<reqwest::blocking::Request> {
+        validate_live_endpoint(request.provider(), request.endpoint())?;
+        request.with_sensitive_parts(
+            |endpoint, public_headers, secret_name, secret_prefix, secret, body| {
+                let mut builder = self.client.post(endpoint);
+                for (name, value) in public_headers {
+                    let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|_| anyhow!("api.live_transport_header: invalid public header"))?;
+                    let value = reqwest::header::HeaderValue::from_str(value)
+                        .map_err(|_| anyhow!("api.live_transport_header: invalid public header"))?;
+                    builder = builder.header(name, value);
+                }
+                builder = builder.header(
+                    reqwest::header::ACCEPT,
+                    if request.streamed {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                );
+                let secret_name =
+                    reqwest::header::HeaderName::from_bytes(secret_name.as_bytes())
+                        .map_err(|_| anyhow!("api.live_transport_header: invalid secret header"))?;
+                let mut secret_header = Vec::with_capacity(secret_prefix.len() + secret.len());
+                secret_header.extend_from_slice(secret_prefix);
+                secret_header.extend_from_slice(secret);
+                let secret_value = reqwest::header::HeaderValue::from_bytes(&secret_header);
+                clear_sensitive_bytes(&mut secret_header);
+                let mut secret_value = secret_value
+                    .map_err(|_| anyhow!("api.live_transport_header: invalid secret value"))?;
+                secret_value.set_sensitive(true);
+                builder
+                    .header(secret_name, secret_value)
+                    .body(body.to_vec())
+                    .build()
+                    .map_err(|_| anyhow!("api.live_transport_request: request construction failed"))
+            },
+        )
+    }
+}
+
+impl ApiTransport for LiveApiTransport {
+    fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse> {
+        let http_request = self.build_request(request)?;
+        let mut response = self
+            .client
+            .execute(http_request)
+            .map_err(|_| anyhow!("api.live_transport_failed: HTTPS request failed"))?;
+        let status_code = response.status().as_u16();
+        let request_id_header = match request.provider() {
+            "openai" => "x-request-id",
+            "anthropic" => "request-id",
+            _ => bail!("api.provider_denied: unsupported API provider"),
+        };
+        let request_id = response
+            .headers()
+            .get(request_id_header)
+            .ok_or_else(|| anyhow!("api.live_transport_response: provider request ID is missing"))?
+            .to_str()
+            .map_err(|_| anyhow!("api.live_transport_response: provider request ID is invalid"))?
+            .to_owned();
+        validate_live_content_type(response.headers(), request.streamed, status_code)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_response_bytes as u64)
+        {
+            bail!("api.live_transport_response: response body exceeds configured limit");
+        }
+        let body = read_bounded_response(&mut response, self.max_response_bytes)?;
+        ApiTransportResponse::new(status_code, request_id, body, request.streamed)
+    }
+}
+
+fn validate_live_duration(value: StdDuration, name: &str) -> Result<()> {
+    if value.is_zero() || value > StdDuration::from_secs(MAX_LIVE_TIMEOUT_SECONDS) {
+        bail!(
+            "api.live_transport_config: {name} must be within 1..={MAX_LIVE_TIMEOUT_SECONDS} seconds"
+        );
+    }
+    Ok(())
+}
+
+fn validate_live_endpoint(provider: &str, endpoint: &str) -> Result<()> {
+    let expected = match provider {
+        "openai" => "https://api.openai.com/v1/responses",
+        "anthropic" => "https://api.anthropic.com/v1/messages",
+        _ => bail!("api.provider_denied: unsupported API provider"),
+    };
+    if endpoint != expected {
+        bail!("api.live_transport_endpoint: provider endpoint is not allowlisted");
+    }
+    Ok(())
+}
+
+fn validate_live_content_type(
+    headers: &reqwest::header::HeaderMap,
+    streamed: bool,
+    status_code: u16,
+) -> Result<()> {
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .ok_or_else(|| anyhow!("api.live_transport_response: content type is missing"))?
+        .to_str()
+        .map_err(|_| anyhow!("api.live_transport_response: content type is invalid"))?
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let expected = if streamed && (200..=299).contains(&status_code) {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    if content_type != expected {
+        bail!("api.live_transport_response: unexpected content type");
+    }
+    Ok(())
+}
+
+fn read_bounded_response(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    reader
+        .take((limit + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| anyhow!("api.live_transport_failed: response body read failed"))?;
+    if body.len() > limit {
+        bail!("api.live_transport_response: response body exceeds configured limit");
+    }
+    Ok(body)
+}
+
+fn clear_sensitive_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        // Match SecretValue's best-effort volatile clearing for the temporary
+        // authorization-header assembly buffer.
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
 }
 
 pub struct ApiTransportResponse {
@@ -244,6 +463,7 @@ pub(crate) fn prepare_api_request(
         secret_header_prefix,
         secret,
         body,
+        streamed: spec.stream,
     })
 }
 
@@ -386,6 +606,7 @@ fn build_openai_body(spec: &ApiRequestSpec) -> Result<Vec<u8>> {
         "max_output_tokens": spec.max_output_tokens,
         "tools": tools,
         "stream": spec.stream,
+        "store": false,
     }))
     .map_err(Into::into)
 }
@@ -1378,6 +1599,7 @@ mod tests {
                         assert_eq!(prefix, b"Bearer ");
                         assert_eq!(body["max_output_tokens"], 100);
                         assert_eq!(body["tools"][0]["strict"], true);
+                        assert_eq!(body["store"], false);
                     }
                     "anthropic" => {
                         assert_eq!(endpoint, "https://api.anthropic.com/v1/messages");
@@ -1391,6 +1613,116 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_transport_is_explicit_bounded_and_builds_redacted_fixed_requests() {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        use tempfile::tempdir;
+
+        const SECRET: &str = "live-transport-secret-canary-never-debug-05";
+        let denied = LiveApiTransport::new(LiveApiTransportConfig::default())
+            .unwrap_err()
+            .to_string();
+        assert!(denied.contains("api.live_transport_disabled"));
+
+        let invalid = LiveApiTransport::new(LiveApiTransportConfig {
+            network_enabled: true,
+            connect_timeout: StdDuration::from_secs(3),
+            request_timeout: StdDuration::from_secs(2),
+            max_response_bytes: 1024,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(invalid.contains("connect timeout exceeds"));
+
+        let transport = LiveApiTransport::new(LiveApiTransportConfig {
+            network_enabled: true,
+            connect_timeout: StdDuration::from_secs(2),
+            request_timeout: StdDuration::from_secs(5),
+            max_response_bytes: 1024,
+        })
+        .unwrap();
+        let transport_debug = format!("{transport:?}");
+        assert!(transport_debug.contains("implicit_retries: false"));
+        assert!(transport_debug.contains("environment_proxy: false"));
+
+        let directory = tempdir().unwrap();
+        let secret_path = directory.path().join("api-key");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secret_path)
+            .unwrap();
+        writeln!(file, "{SECRET}").unwrap();
+        drop(file);
+        let now = Utc::now();
+        for provider in ["openai", "anthropic"] {
+            let budget = request_budget(provider, format!("file:{}", secret_path.display()), now);
+            let spec = request_spec(provider);
+            let digest = api_request_digest(&budget, &spec, now).unwrap();
+            let prepared = prepare_api_request(&budget, &spec, now, &digest).unwrap();
+            let http_request = transport.build_request(&prepared).unwrap();
+            assert_eq!(http_request.method(), reqwest::Method::POST);
+            assert_eq!(http_request.url().as_str(), prepared.endpoint());
+            assert_eq!(
+                http_request.headers().get(reqwest::header::ACCEPT).unwrap(),
+                "text/event-stream"
+            );
+            let secret_header = http_request
+                .headers()
+                .get(if provider == "openai" {
+                    "authorization"
+                } else {
+                    "x-api-key"
+                })
+                .unwrap();
+            assert!(secret_header.is_sensitive());
+            let debug = format!("{http_request:?}");
+            for canary in [
+                SECRET,
+                "system-canary-never-debug-01",
+                "prompt-canary-never-debug-02",
+            ] {
+                assert!(!debug.contains(canary));
+            }
+            let body = http_request.body().unwrap().as_bytes().unwrap();
+            assert!(
+                body.windows("prompt-canary-never-debug-02".len())
+                    .any(|part| { part == "prompt-canary-never-debug-02".as_bytes() })
+            );
+        }
+
+        assert!(
+            validate_live_endpoint("openai", "https://example.invalid/v1/responses")
+                .unwrap_err()
+                .to_string()
+                .contains("not allowlisted")
+        );
+    }
+
+    #[test]
+    fn live_response_headers_and_body_bounds_fail_closed() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("text/event-stream; charset=utf-8"),
+        );
+        validate_live_content_type(&headers, true, 200).unwrap();
+        assert!(validate_live_content_type(&headers, false, 200).is_err());
+        assert!(validate_live_content_type(&headers, true, 429).is_err());
+
+        let mut exact = std::io::Cursor::new(vec![b'x'; 8]);
+        assert_eq!(read_bounded_response(&mut exact, 8).unwrap().len(), 8);
+        let mut oversized = std::io::Cursor::new(vec![b'x'; 9]);
+        assert!(
+            read_bounded_response(&mut oversized, 8)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds configured limit")
+        );
     }
 
     #[test]

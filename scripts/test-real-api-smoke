@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+required=(
+  GARNISH_REAL_API_PROVIDER
+  GARNISH_REAL_API_MODEL
+  GARNISH_REAL_API_SECRET_REFERENCE
+  GARNISH_ACKNOWLEDGE_PAID_API
+)
+for name in "${required[@]}"; do
+  if [[ -z "${!name:-}" ]]; then
+    echo "error: $name is required" >&2
+    exit 2
+  fi
+done
+
+case "$GARNISH_REAL_API_PROVIDER" in
+  openai)
+    endpoint='https://api.openai.com/v1/responses'
+    ;;
+  anthropic)
+    endpoint='https://api.anthropic.com/v1/messages'
+    ;;
+  *)
+    echo 'error: GARNISH_REAL_API_PROVIDER must be openai or anthropic' >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$GARNISH_ACKNOWLEDGE_PAID_API" != 'I_ACCEPT_ONE_PAID_API_REQUEST' ]]; then
+  echo 'error: GARNISH_ACKNOWLEDGE_PAID_API must equal I_ACCEPT_ONE_PAID_API_REQUEST' >&2
+  exit 2
+fi
+
+case "$GARNISH_REAL_API_SECRET_REFERENCE" in
+  env:*)
+    secret_name="${GARNISH_REAL_API_SECRET_REFERENCE#env:}"
+    if [[ ! "$secret_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo 'error: the env: secret reference has an invalid variable name' >&2
+      exit 2
+    fi
+    if [[ -z "${!secret_name:-}" ]]; then
+      echo "error: the referenced credential variable $secret_name is unavailable" >&2
+      exit 2
+    fi
+    ;;
+  file:*)
+    secret_path="${GARNISH_REAL_API_SECRET_REFERENCE#file:}"
+    if [[ "$secret_path" != /* || ! -f "$secret_path" ]]; then
+      echo 'error: file: must name an existing absolute credential file' >&2
+      exit 2
+    fi
+    ;;
+  keychain:*)
+    if [[ "$(uname -s)" != 'Darwin' ]]; then
+      echo 'error: keychain: credential references require macOS' >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo 'error: the credential reference must use env:, file:, or keychain:' >&2
+    exit 2
+    ;;
+esac
+
+echo 'REAL PAID API SMOKE TEST'
+echo "provider: $GARNISH_REAL_API_PROVIDER"
+echo "model: $GARNISH_REAL_API_MODEL"
+echo "endpoint: $endpoint"
+echo "credential reference: $GARNISH_REAL_API_SECRET_REFERENCE (value will not be printed)"
+echo 'network requests: exactly 1; redirects, proxies, and implicit HTTP retries disabled'
+echo 'maximum output: 32 tokens; request timeout: 120 seconds; response limit: 1 MiB'
+echo 'cost: the provider may charge this request; this smoke test has token/request ceilings but no currency price evidence'
+echo 'state: temporary local database; provider prompts and output are not persisted by Garnish'
+
+cargo test --locked service::tests::real_paid_api_smoke_is_explicit_and_accounted \
+  -- --ignored --exact --nocapture

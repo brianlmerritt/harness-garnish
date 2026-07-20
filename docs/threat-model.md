@@ -80,6 +80,7 @@ Failure or inability to inspect any mandatory property yields `secure_container=
 | Dirty-tree loss | Worktree creation overwrites user edits | Preflight status and base snapshot; no destructive Git; task-owned worktrees only | Dirty-tree fixtures remain byte-identical |
 | Approval spoof/replay | Old approval reused for broader push | Bind approval to action digest, target, actor, scope, expiry, and nonce; consume one-shot approvals atomically | Replay/expired/altered requests fail |
 | Quota/budget overrun | Five-hour quota empties before checkpoint | Per-surface headroom; five-minute maximum checkpoint; shorter guard interval; provider cancellation; API hard budgets | Boundary simulations pause without starting unsafe phase |
+| Hidden HTTP replay or credential redirection | Client retries a protocol failure, follows a redirect, or inherits a proxy without a matching durable attempt | Fixed provider HTTPS endpoints; no redirects, proxy inheritance, referrer, or client retries; bounded response identity/type/size checks | Quota-free request-construction and fail-closed boundary fixtures; separately ignored paid smoke test |
 | Resource exhaustion | Fork bomb, unbounded logs/retries/disk | PID/CPU/memory/disk/output limits; retry budget; circuit breaker; global pause and emergency stop | Failure-injection tests and bounded retained evidence |
 | Dependency/cache poisoning | One project seeds shared build cache | Pinned setup phase, network separation, trust-scoped caches, lockfile verification/SBOM where required | Cross-project cache tests |
 | Unauthenticated control API | LAN actor starts an agent | Loopback binding, bearer/session authentication, CSRF/Host validation, no remote exposure by default | Non-loopback/unauthenticated requests fail |
@@ -131,4 +132,3 @@ Treat Windows, WSL2, and Docker Desktop boundaries separately. Avoid `/mnt/c` so
 - Models can make harmful changes within granted scope; independent verification reduces but does not remove this risk.
 - Quota forecasts are uncertain and provider reports may be stale.
 - A compromised host can defeat local controls. Garnish protects projects from tasks, not the host from its administrator.
-

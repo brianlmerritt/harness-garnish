@@ -4171,6 +4171,116 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "real-paid-api: requires the explicit scripts/test-real-api-smoke opt-in"]
+    fn real_paid_api_smoke_is_explicit_and_accounted() {
+        use crate::api_providers::{
+            LiveApiTransport, LiveApiTransportConfig, api_request_conservative_input_token_bound,
+            api_request_digest,
+        };
+        use std::time::Duration as StdDuration;
+
+        const ACKNOWLEDGEMENT: &str = "I_ACCEPT_ONE_PAID_API_REQUEST";
+        assert_eq!(
+            std::env::var("GARNISH_ACKNOWLEDGE_PAID_API").as_deref(),
+            Ok(ACKNOWLEDGEMENT),
+            "the paid API acknowledgement is missing or incorrect"
+        );
+        let provider = std::env::var("GARNISH_REAL_API_PROVIDER")
+            .expect("GARNISH_REAL_API_PROVIDER is required");
+        assert!(
+            matches!(provider.as_str(), "openai" | "anthropic"),
+            "GARNISH_REAL_API_PROVIDER must be openai or anthropic"
+        );
+        let model =
+            std::env::var("GARNISH_REAL_API_MODEL").expect("GARNISH_REAL_API_MODEL is required");
+        let secret_reference = std::env::var("GARNISH_REAL_API_SECRET_REFERENCE")
+            .expect("GARNISH_REAL_API_SECRET_REFERENCE is required");
+
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        fixture_repo(&source);
+        let now = Utc::now();
+        let mut garnish = Garnish::open(directory.path().join("data")).unwrap();
+        match provider.as_str() {
+            "openai" => garnish.policy.openai_api_enabled = true,
+            "anthropic" => garnish.policy.anthropic_api_enabled = true,
+            _ => unreachable!(),
+        }
+        let project = garnish
+            .add_project("real-api-smoke", "Real API smoke", &source)
+            .unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        let budget = garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id.clone(),
+                provider: provider.clone(),
+                account: "smoke".into(),
+                enabled: true,
+                secret_reference,
+                currency: None,
+                currency_limit_micros: None,
+                token_limit: Some(65_536),
+                request_limit: Some(1),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::minutes(10),
+                allowed_models: vec![model.clone()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["planner".into()],
+                max_output_tokens: 32,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "explicit one-request paid API smoke test".into(),
+            })
+            .unwrap();
+        let spec = ApiRequestSpec {
+            provider: provider.clone(),
+            model: model.clone(),
+            instructions: "Return only the requested text. Do not call tools.".into(),
+            input: "Reply with exactly: OK".into(),
+            max_output_tokens: 32,
+            tools: vec![],
+            stream: false,
+        };
+        let reserved_input_tokens =
+            api_request_conservative_input_token_bound(&budget, &spec, now).unwrap();
+        let reservation = garnish
+            .reserve_api_budget(&ApiReservationRequest {
+                project_id: project.id,
+                task_id: task.id,
+                provider,
+                account: "smoke".into(),
+                model,
+                role: "planner".into(),
+                request_digest: api_request_digest(&budget, &spec, now).unwrap(),
+                reserved_currency_micros: 0,
+                reserved_input_tokens,
+                reserved_output_tokens: 32,
+                reserved_attempts: 1,
+                now,
+                expires_at: now + Duration::minutes(5),
+            })
+            .unwrap();
+        let mut transport = LiveApiTransport::new(LiveApiTransportConfig {
+            network_enabled: true,
+            connect_timeout: StdDuration::from_secs(10),
+            request_timeout: StdDuration::from_secs(120),
+            max_response_bytes: 1024 * 1024,
+        })
+        .unwrap();
+        let result = garnish
+            .execute_reserved_api_request(&reservation.id, &spec, &mut transport, now)
+            .unwrap();
+        assert_eq!(result.attempts.len(), 1);
+        assert_eq!(result.attempts[0].status, "succeeded");
+        assert_eq!(result.spend.reservation_id, reservation.id);
+        assert!(result.spend.input_tokens <= reserved_input_tokens);
+        assert!(result.spend.output_tokens <= 32);
+        assert_eq!(result.spend.cost_micros, 0);
+        assert_eq!(result.spend.currency, None);
+    }
+
     #[test]
     fn api_route_uses_project_budget_not_subscription_quota_and_fails_closed() {
         let dir = tempdir().unwrap();
