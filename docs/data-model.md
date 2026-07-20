@@ -167,7 +167,7 @@ Reservations are forecasts and prevent the local scheduler from overcommitting; 
 
 Schema 11 creates one percentage reservation per relevant surface in the same immediate transaction as the scheduler claim and capacity locks. Claim heartbeat, claim-to-run conversion, runtime checkpoints, completion, failure, cancellation, graceful scheduler stop, emergency stop, and orphan recovery renew or release the reservation with an explicit status/reason. Concurrent claims sum active reservations before admission.
 
-### `api_budgets`, `api_model_prices`, and `api_spend`
+### `api_budgets`, `api_request_plans`, `api_model_prices`, and `api_spend`
 
 Schema 16 materializes the network-free API accounting control plane and durable pricing evidence.
 
@@ -175,11 +175,15 @@ Schema 16 materializes the network-free API accounting control plane and durable
 
 Budget revisions are append-only. Secret references are locators with one of three strict forms—`env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`—not credential values. Monetary admission uses integer micros and an explicit three-letter currency. At least one currency, token, or request ceiling is mandatory.
 
-`api_budget_reservations`: `id`, `budget_id`, `project_id`, `task_id`, `provider`, `account`, `model`, `role`, `request_digest`, worst-case currency/input-token/output-token reservations, `status`, `created_at`, `expires_at`, `dispatch_claimed_at`, `settled_at`, `release_reason`, `claim_id`, `run_id`.
+`api_request_plans`: append-only `id`, `task_id`, exact `task_version`, provider/account, enabled flag, model/role, per-attempt input/output maxima, retry maximum, streaming flag, template version, request digest, reason, creation time, and superseded revision. Canonical task content is rendered deterministically at admission; the plan does not persist a second prompt copy.
+
+`api_budget_reservations`: `id`, `budget_id`, `project_id`, `task_id`, `provider`, `account`, `model`, `role`, `request_digest`, aggregate worst-case currency/input-token/output-token reservations, reserved request-attempt count, per-attempt input/output maxima, `status`, `created_at`, `expires_at`, `dispatch_claimed_at`, `settled_at`, `release_reason`, `claim_id`, `run_id`.
 
 Reservation admission runs in an immediate transaction and includes committed spend plus every active or dispatched reservation. An undispatched reservation can be released or expires once; claiming dispatch is single-use. After dispatch, uncertain provider outcome retains the reservation until authenticated settlement instead of incorrectly returning budget.
 
 Schema 17 adds the scheduler binding. An exact paid request must be explicitly pinned, is hashed without persisting its prompt, and has its worst-case monetary reservation calculated from the effective price record. The scheduler claim, capacity locks, and reservation commit together or all roll back. Claim heartbeat and claim-to-run conversion renew the bound reservation; stop, expiry, emergency stop, pre-dispatch completion/failure, and orphan recovery release it once. A bound reservation cannot be manually released or dispatched before its claim becomes a run.
+
+Schema 18 adds durable per-task request plans and retry-aware reservation totals. A paid scheduler route must match the latest enabled plan and current task version. Before the claim commits, Garnish multiplies per-attempt currency and token maxima by `1 + max_retries` and reserves the same number of request attempts. Actual retry dispatch is not yet implemented; this schema guarantees budget headroom if that execution loop is added.
 
 `api_model_prices`: `id`, provider/account/model/currency identity, integer-micro rates per million uncached-input/cache-read/cache-creation/output tokens, `effective_from/to`, `source`, `reason`, `created_at`, `supersedes_id`.
 

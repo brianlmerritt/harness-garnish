@@ -4,21 +4,24 @@ use crate::{
         run_invocation_with_tick, safe_write,
     },
     api_providers::{
-        ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest, api_request_digest,
-        parse_api_transport_response, prepare_api_request,
+        ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest,
+        api_request_conservative_content_token_bound, api_request_conservative_input_token_bound,
+        api_request_content_digest, api_request_digest, parse_api_transport_response,
+        prepare_api_request,
     },
     db::Database,
     domain::{
         AgentCapabilityProbe, AgentCapabilityStatus, ApiBudget, ApiBudgetReservation,
-        ApiClaimReservationRequest, ApiModelPrice, ApiReservationRequest, ApiSettlement, ApiSpend,
-        ApprovalRequest, BackupRecord, CalendarException, CalendarProfile, CheckpointAction,
-        CircuitBreaker, ControlState, DayKind, EmergencyStopResult, FailureCategory,
-        LocalNotification, NewApiBudget, NewApiModelPrice, NewTask, Project, ProjectLink,
-        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan,
-        RetryState, RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint, RunRecord,
-        RunSummary, ScheduleEvaluation, SchedulerApiClaim, SchedulerClaim, SchedulerClaimRejection,
-        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
-        SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
+        ApiClaimReservationRequest, ApiModelPrice, ApiRequestPlan, ApiReservationRequest,
+        ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
+        CheckpointAction, CircuitBreaker, ControlState, DayKind, EmergencyStopResult,
+        FailureCategory, LocalNotification, NewApiBudget, NewApiModelPrice, NewApiRequestPlan,
+        NewTask, Project, ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface,
+        QuotaUsageSample, RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget,
+        RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation, SchedulerApiClaim,
+        SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary,
+        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
+        UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -43,6 +46,8 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use ulid::Ulid;
+
+const API_TASK_TEMPLATE_VERSION: &str = "task-v1";
 
 pub struct Garnish {
     data_dir: PathBuf,
@@ -96,7 +101,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 16,
+            schema_version: 18,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -401,6 +406,125 @@ impl Garnish {
         self.db.list_latest_api_budgets(project_id.as_deref())
     }
 
+    pub fn configure_api_request_plan(
+        &mut self,
+        config: &NewApiRequestPlan,
+    ) -> Result<ApiRequestPlan> {
+        self.configure_api_request_plan_at(config, Utc::now())
+    }
+
+    pub fn configure_api_request_plan_at(
+        &mut self,
+        config: &NewApiRequestPlan,
+        now: DateTime<Utc>,
+    ) -> Result<ApiRequestPlan> {
+        let task = self.db.task(&config.task_id)?;
+        if task.pinned_adapter.as_deref() != Some("api")
+            || task.pinned_provider.as_deref() != Some(config.provider.as_str())
+            || task.pinned_account.as_deref() != Some(config.account.as_str())
+        {
+            bail!("api.explicit_selection_required: task must be pinned to this paid API identity");
+        }
+        let budget =
+            self.db
+                .latest_api_budget(&task.project_id, &config.provider, &config.account)?;
+        let spec = render_task_api_request(
+            &task,
+            &config.provider,
+            &config.model,
+            config.max_output_tokens,
+            config.stream,
+        )?;
+        let conservative_input = if config.enabled {
+            if !budget.allowed_roles.contains(&config.role) {
+                bail!("api.role_denied: role is not in the project allowlist");
+            }
+            if config.max_retries > budget.max_retries {
+                bail!("api.retry_limit: request plan exceeds the project retry ceiling");
+            }
+            api_request_conservative_input_token_bound(&budget, &spec, now)?
+        } else {
+            api_request_conservative_content_token_bound(&spec)?
+        };
+        if config.max_input_tokens < conservative_input {
+            bail!(
+                "api.input_limit: request plan reserves {} input tokens but at least {} are required",
+                config.max_input_tokens,
+                conservative_input
+            );
+        }
+        let digest = if config.enabled {
+            api_request_digest(&budget, &spec, now)?
+        } else {
+            api_request_content_digest(&spec)?
+        };
+        self.db.configure_api_request_plan(
+            config,
+            task.version,
+            API_TASK_TEMPLATE_VERSION,
+            &digest,
+            now,
+        )
+    }
+
+    pub fn api_request_plans(&self, task: Option<&str>) -> Result<Vec<ApiRequestPlan>> {
+        let task_id = task
+            .map(|value| self.db.task(value).map(|task| task.id))
+            .transpose()?;
+        self.db.list_latest_api_request_plans(task_id.as_deref())
+    }
+
+    fn planned_api_request_at(
+        &self,
+        task: &Task,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(ApiRequestPlan, ApiRequestSpec, ApiBudget)> {
+        let plan = self.db.latest_api_request_plan(&task.id)?;
+        if !plan.enabled {
+            bail!("api.request_plan_disabled: the latest request plan is disabled");
+        }
+        if plan.task_version != task.version {
+            bail!(
+                "api.request_plan_stale: plan task version {} differs from canonical version {}",
+                plan.task_version,
+                task.version
+            );
+        }
+        if plan.template_version != API_TASK_TEMPLATE_VERSION {
+            bail!("api.request_plan_template_unknown: request plan template is unsupported");
+        }
+        if plan.provider != provider || plan.account != account {
+            bail!("api.request_plan_identity_mismatch: plan differs from the selected API route");
+        }
+        let budget = self
+            .db
+            .latest_api_budget(&task.project_id, provider, account)?;
+        if !budget.allowed_roles.contains(&plan.role) {
+            bail!("api.role_denied: role is not in the project allowlist");
+        }
+        if plan.max_retries > budget.max_retries {
+            bail!("api.retry_limit: request plan exceeds the project retry ceiling");
+        }
+        let spec = render_task_api_request(
+            task,
+            provider,
+            &plan.model,
+            plan.max_output_tokens,
+            plan.stream,
+        )?;
+        let conservative_input = api_request_conservative_input_token_bound(&budget, &spec, now)?;
+        if conservative_input > plan.max_input_tokens {
+            bail!("api.request_plan_input_stale: rendered request exceeds its input reservation");
+        }
+        let digest = api_request_digest(&budget, &spec, now)?;
+        if digest != plan.request_digest {
+            bail!("api.request_plan_digest_mismatch: rendered request differs from its plan");
+        }
+        Ok((plan, spec, budget))
+    }
+
     pub fn api_reservations(&self, project: Option<&str>) -> Result<Vec<ApiBudgetReservation>> {
         let project_id = project
             .map(|value| self.db.project(value).map(|project| project.id))
@@ -469,11 +593,6 @@ impl Garnish {
         let budget = self
             .db
             .latest_api_budget(&task.project_id, provider, account)?;
-        if budget.max_retries != 0 {
-            bail!(
-                "api.retry_execution_unavailable: exact scheduler claims currently require zero retries"
-            );
-        }
         let request_digest = api_request_digest(&budget, spec, now)?;
         let reserved_currency_micros = match budget.currency.as_deref() {
             Some(currency) => {
@@ -513,6 +632,7 @@ impl Garnish {
                 reserved_currency_micros,
                 reserved_input_tokens,
                 reserved_output_tokens: spec.max_output_tokens,
+                reserved_attempts: budget.max_retries + 1,
             },
         )?;
         Ok(SchedulerApiClaim { claim, reservation })
@@ -539,7 +659,7 @@ impl Garnish {
         if spec.provider != reservation.provider || spec.model != reservation.model {
             bail!("api.reservation_mismatch: provider or model differs from the reservation");
         }
-        if spec.max_output_tokens != reservation.reserved_output_tokens {
+        if spec.max_output_tokens != reservation.per_attempt_output_tokens {
             bail!("api.reservation_mismatch: output maximum differs from the reservation");
         }
         let latest = self.db.latest_api_budget(
@@ -1754,6 +1874,26 @@ impl Garnish {
             }
         }
 
+        for (target, decision) in &mut preliminary {
+            if target.adapter == "api"
+                && decision.allowed
+                && let Err(error) =
+                    self.planned_api_request_at(&task, &target.provider, &target.account, now)
+            {
+                let reason = error.to_string();
+                let reason_code = api_error_reason_code(&reason);
+                decision.allowed = false;
+                decision.selected_adapter = None;
+                decision.selected_provider = None;
+                decision.selected_account = None;
+                decision.reason_code = reason_code.into();
+                decision.reason = reason.clone();
+                decision.candidates[0].allowed = false;
+                decision.candidates[0].reason_code = reason_code.into();
+                decision.candidates[0].filter_reason = reason;
+            }
+        }
+
         let allowed_targets = preliminary
             .iter()
             .filter(|(_, decision)| decision.allowed)
@@ -1987,29 +2127,6 @@ impl Garnish {
             candidate.score = None;
             candidate.score_components = None;
         }
-        if decision.allowed
-            && selected_target
-                .as_ref()
-                .is_some_and(|target| target.adapter == "api")
-        {
-            decision.allowed = false;
-            decision.selected_adapter = None;
-            decision.selected_provider = None;
-            decision.selected_account = None;
-            decision.reason_code = "api.scheduler_execution_unavailable".into();
-            decision.reason = "api.scheduler_execution_unavailable: automated API claims remain disabled until an exact request and budget reservation can be bound atomically".into();
-            if let Some(candidate) = decision.candidates.iter_mut().find(|candidate| {
-                candidate.adapter == "api"
-                    && candidate.provider == selected_target.as_ref().expect("checked").provider
-                    && candidate.account == selected_target.as_ref().expect("checked").account
-            }) {
-                candidate.allowed = false;
-                candidate.reason_code = decision.reason_code.clone();
-                candidate.filter_reason = decision.reason.clone();
-                candidate.score = None;
-                candidate.score_components = None;
-            }
-        }
         self.db.record_route(&decision)?;
         let selected_target = decision.allowed.then_some(selected_target).flatten();
         Ok((decision, selected_target))
@@ -2115,40 +2232,101 @@ impl Garnish {
             let selected_target = selected_target.ok_or_else(|| {
                 anyhow::anyhow!("allowed multi-candidate route has no selected target")
             })?;
-            match self.db.claim_task_for_scheduler_with_route_limits(
-                instance_id,
-                leader_generation,
-                &task.id,
-                task.version,
-                now,
-                claim_ttl,
-                max_active_claims,
-                Some(&decision.id),
-                &[],
-                &selected_target.adapter,
-                &selected_target.provider,
-                &selected_target.account,
-                max_active_per_adapter,
-                max_active_per_account,
-                decision
-                    .candidates
-                    .iter()
-                    .find(|candidate| {
-                        candidate.adapter == selected_target.adapter
-                            && candidate.provider == selected_target.provider
-                            && candidate.account == selected_target.account
-                    })
-                    .map(|candidate| candidate.forecast_percent)
-                    .ok_or_else(|| anyhow::anyhow!("selected route has no forecast evidence"))?,
-            ) {
+            let claim_result = if selected_target.adapter == "api" {
+                (|| -> Result<SchedulerClaim> {
+                    let (plan, spec, budget) = self.planned_api_request_at(
+                        &task,
+                        &selected_target.provider,
+                        &selected_target.account,
+                        now,
+                    )?;
+                    let reserved_currency_micros = match budget.currency.as_deref() {
+                        Some(currency) => {
+                            let price = self.db.effective_api_model_price(
+                                &selected_target.provider,
+                                &selected_target.account,
+                                &spec.model,
+                                currency,
+                                now,
+                            )?;
+                            worst_case_api_cost_micros(
+                                &price,
+                                plan.max_input_tokens,
+                                plan.max_output_tokens,
+                            )?
+                        }
+                        None => 0,
+                    };
+                    let (claim, _) = self.db.claim_task_for_scheduler_with_api_reservation(
+                        instance_id,
+                        leader_generation,
+                        &task.id,
+                        task.version,
+                        now,
+                        claim_ttl,
+                        max_active_claims,
+                        &decision.id,
+                        &[],
+                        &selected_target.provider,
+                        &selected_target.account,
+                        max_active_per_adapter,
+                        max_active_per_account,
+                        &ApiClaimReservationRequest {
+                            model: plan.model,
+                            role: plan.role,
+                            request_digest: plan.request_digest,
+                            reserved_currency_micros,
+                            reserved_input_tokens: plan.max_input_tokens,
+                            reserved_output_tokens: plan.max_output_tokens,
+                            reserved_attempts: plan.max_retries + 1,
+                        },
+                    )?;
+                    Ok(claim)
+                })()
+            } else {
+                self.db.claim_task_for_scheduler_with_route_limits(
+                    instance_id,
+                    leader_generation,
+                    &task.id,
+                    task.version,
+                    now,
+                    claim_ttl,
+                    max_active_claims,
+                    Some(&decision.id),
+                    &[],
+                    &selected_target.adapter,
+                    &selected_target.provider,
+                    &selected_target.account,
+                    max_active_per_adapter,
+                    max_active_per_account,
+                    decision
+                        .candidates
+                        .iter()
+                        .find(|candidate| {
+                            candidate.adapter == selected_target.adapter
+                                && candidate.provider == selected_target.provider
+                                && candidate.account == selected_target.account
+                        })
+                        .map(|candidate| candidate.forecast_percent)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("selected route has no forecast evidence")
+                        })?,
+                )
+            };
+            match claim_result {
                 Ok(claim) => claims.push(claim),
                 Err(error) => {
                     let message = error.to_string();
-                    let reason_code = error
-                        .downcast_ref::<SchedulerClaimRejection>()
-                        .map_or("scheduler.claim_conflict", |rejection| {
-                            rejection.reason_code()
-                        });
+                    let reason_code = error.downcast_ref::<SchedulerClaimRejection>().map_or_else(
+                        || {
+                            if message.starts_with("api.") {
+                                api_error_reason_code(&message)
+                            } else {
+                                "scheduler.claim_conflict"
+                            }
+                        },
+                        |rejection| rejection.reason_code(),
+                    );
                     self.db.record_scheduler_wake(
                         &task.id,
                         reason_code,
@@ -2697,6 +2875,37 @@ fn is_wsl2() -> bool {
             .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
 }
 
+fn render_task_api_request(
+    task: &Task,
+    provider: &str,
+    model: &str,
+    max_output_tokens: u64,
+    stream: bool,
+) -> Result<ApiRequestSpec> {
+    let input = serde_json::to_string(&serde_json::json!({
+        "task_id": task.id,
+        "task_version": task.version,
+        "title": task.title,
+        "goal": task.goal,
+        "rationale": task.rationale,
+        "scope": task.scope,
+        "non_scope": task.non_scope,
+        "acceptance": task.acceptance,
+        "verification_argv": task.verification_argv,
+        "risk_class": task.risk_class,
+        "required_capabilities": task.required_capabilities,
+    }))?;
+    Ok(ApiRequestSpec {
+        provider: provider.into(),
+        model: model.into(),
+        instructions: "Execute only the supplied canonical task. Respect scope and return a concise implementation result with verification evidence.".into(),
+        input,
+        max_output_tokens,
+        tools: vec![],
+        stream,
+    })
+}
+
 #[cfg(unix)]
 fn secure_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -2906,6 +3115,15 @@ fn evaluate_adapter_capabilities(adapter: &str, required: &[String]) -> (bool, S
 
 fn api_adapter_capabilities() -> Vec<String> {
     vec!["agent.headless".into(), "agent.tool_policy".into()]
+}
+
+fn api_error_reason_code(message: &str) -> &str {
+    let candidate = message.split_once(':').map_or(message, |(code, _)| code);
+    if candidate.starts_with("api.") {
+        candidate
+    } else {
+        "api.request_plan_invalid"
+    }
 }
 
 fn worst_case_api_cost_micros(
@@ -3376,6 +3594,7 @@ mod tests {
             reserved_currency_micros: 400,
             reserved_input_tokens: 10,
             reserved_output_tokens: 20,
+            reserved_attempts: 1,
             now,
             expires_at: now + Duration::minutes(5),
         };
@@ -3594,6 +3813,7 @@ mod tests {
                 reserved_currency_micros: 100,
                 reserved_input_tokens: 8,
                 reserved_output_tokens: 18,
+                reserved_attempts: 1,
                 now,
                 expires_at: now + Duration::minutes(5),
             })
@@ -3678,6 +3898,7 @@ mod tests {
                 reserved_currency_micros: 100,
                 reserved_input_tokens: 10,
                 reserved_output_tokens: 10,
+                reserved_attempts: 1,
                 now,
                 expires_at: now + Duration::minutes(5),
             })
@@ -3743,7 +3964,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_api_pin_reaches_budget_gate_but_scheduler_claim_remains_disabled() {
+    fn explicit_api_pin_requires_a_durable_exact_request_plan() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("source");
         fixture_repo(&source);
@@ -3775,13 +3996,141 @@ mod tests {
             .unwrap();
         assert!(!decision.allowed);
         assert!(selected.is_none());
-        assert_eq!(decision.reason_code, "api.scheduler_execution_unavailable");
+        assert_eq!(decision.reason_code, "api.request_plan_missing");
         assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Ready);
         assert!(
             garnish
                 .api_reservations(Some("fixture"))
                 .unwrap()
                 .is_empty()
+        );
+
+        let disabled = garnish
+            .configure_api_request_plan_at(
+                &NewApiRequestPlan {
+                    task_id: task.id.clone(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                    enabled: false,
+                    model: "model-fixture".into(),
+                    role: "implementer".into(),
+                    max_input_tokens: 10_000,
+                    max_output_tokens: 50,
+                    max_retries: 0,
+                    stream: false,
+                    reason: "keep paid execution disabled".into(),
+                },
+                now,
+            )
+            .unwrap();
+        assert!(!disabled.enabled);
+        let (decision, selected) = garnish
+            .route_task_candidates_at(
+                &task.id,
+                &[RouteTarget {
+                    adapter: "api".into(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                }],
+                now,
+            )
+            .unwrap();
+        assert!(!decision.allowed);
+        assert!(selected.is_none());
+        assert_eq!(decision.reason_code, "api.request_plan_disabled");
+    }
+
+    #[test]
+    fn scheduler_uses_current_request_plan_and_reserves_every_retry_attempt_atomically() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        enable_fixture_api_route(&mut garnish, &project.id, now);
+        garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id.clone(),
+                provider: "openai".into(),
+                account: "paid".into(),
+                enabled: true,
+                secret_reference: "env:FIXTURE_API_KEY".into(),
+                currency: Some("USD".into()),
+                currency_limit_micros: Some(1_000_000),
+                token_limit: Some(100_000),
+                request_limit: Some(10),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::days(1),
+                allowed_models: vec!["model-fixture".into()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["implementer".into()],
+                max_output_tokens: 1_000,
+                max_retries: 2,
+                max_concurrent_requests: 1,
+                reason: "retry-aware plan fixture".into(),
+            })
+            .unwrap();
+        garnish
+            .set_task_route_pin(&task.id, "api", "openai", "paid", "explicit paid API route")
+            .unwrap();
+        let plan = garnish
+            .configure_api_request_plan_at(
+                &NewApiRequestPlan {
+                    task_id: task.id.clone(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                    enabled: true,
+                    model: "model-fixture".into(),
+                    role: "implementer".into(),
+                    max_input_tokens: 10_000,
+                    max_output_tokens: 50,
+                    max_retries: 2,
+                    stream: false,
+                    reason: "exact scheduler request fixture".into(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(plan.task_version, garnish.task(&task.id).unwrap().version);
+        assert_eq!(garnish.api_request_plans(Some(&task.id)).unwrap().len(), 1);
+
+        garnish
+            .register_scheduler("planned-api", "fixture", 1, now)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("planned-api", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let tick = garnish
+            .scheduler_tick_candidates_with_limits_at(
+                "planned-api",
+                leader.generation,
+                &[RouteTarget {
+                    adapter: "api".into(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                }],
+                now,
+                1,
+                1,
+                1,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        let reservations = garnish.api_reservations(Some("fixture")).unwrap();
+        assert_eq!(reservations.len(), 1);
+        let reservation = &reservations[0];
+        assert_eq!(reservation.reserved_requests, 3);
+        assert_eq!(reservation.per_attempt_input_tokens, 10_000);
+        assert_eq!(reservation.per_attempt_output_tokens, 50);
+        assert_eq!(reservation.reserved_input_tokens, 30_000);
+        assert_eq!(reservation.reserved_output_tokens, 150);
+        assert_eq!(reservation.reserved_currency_micros, 45_300);
+        assert_eq!(
+            reservation.claim_id.as_deref(),
+            Some(tick.claims[0].id.as_str())
         );
     }
 
@@ -4195,6 +4544,7 @@ mod tests {
                 reserved_currency_micros: 100,
                 reserved_input_tokens: 10,
                 reserved_output_tokens: 20,
+                reserved_attempts: 1,
                 now,
                 expires_at: now + Duration::minutes(5),
             })

@@ -479,6 +479,9 @@ pub struct ApiBudgetReservation {
     pub reserved_currency_micros: u64,
     pub reserved_input_tokens: u64,
     pub reserved_output_tokens: u64,
+    pub reserved_requests: u32,
+    pub per_attempt_input_tokens: u64,
+    pub per_attempt_output_tokens: u64,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -501,6 +504,7 @@ pub struct ApiReservationRequest {
     pub reserved_currency_micros: u64,
     pub reserved_input_tokens: u64,
     pub reserved_output_tokens: u64,
+    pub reserved_attempts: u32,
     pub now: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -513,6 +517,43 @@ pub struct ApiClaimReservationRequest {
     pub reserved_currency_micros: u64,
     pub reserved_input_tokens: u64,
     pub reserved_output_tokens: u64,
+    pub reserved_attempts: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiRequestPlan {
+    pub id: String,
+    pub task_id: String,
+    pub task_version: i64,
+    pub provider: String,
+    pub account: String,
+    pub enabled: bool,
+    pub model: String,
+    pub role: String,
+    pub max_input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub max_retries: u32,
+    pub stream: bool,
+    pub template_version: String,
+    pub request_digest: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub supersedes_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApiRequestPlan {
+    pub task_id: String,
+    pub provider: String,
+    pub account: String,
+    pub enabled: bool,
+    pub model: String,
+    pub role: String,
+    pub max_input_tokens: u64,
+    pub max_output_tokens: u64,
+    pub max_retries: u32,
+    pub stream: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]

@@ -1,9 +1,9 @@
 use crate::{
     Garnish,
     domain::{
-        AgentCapabilityStatus, ApiBudget, ApiBudgetReservation, ApiModelPrice, ApiSpend,
-        ApprovalRequest, LocalNotification, Project, QuotaCollectionAttempt, QuotaSurface,
-        SchedulerWake, Task, TaskStatus,
+        AgentCapabilityStatus, ApiBudget, ApiBudgetReservation, ApiModelPrice, ApiRequestPlan,
+        ApiSpend, ApprovalRequest, LocalNotification, Project, QuotaCollectionAttempt,
+        QuotaSurface, SchedulerWake, Task, TaskStatus,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -48,6 +48,7 @@ pub struct OperatorSnapshot {
     pub agents: Vec<AgentCapabilityStatus>,
     pub quotas: Vec<QuotaSurface>,
     pub api_budgets: Vec<ApiBudget>,
+    pub api_request_plans: Vec<ApiRequestPlan>,
     pub api_reservations: Vec<ApiBudgetReservation>,
     pub api_spend: Vec<ApiSpend>,
     pub api_prices: Vec<ApiModelPrice>,
@@ -70,6 +71,7 @@ pub fn operator_snapshot(garnish: &Garnish) -> Result<OperatorSnapshot> {
         agents: garnish.agent_capability_status()?,
         quotas: garnish.quota()?,
         api_budgets: garnish.api_budgets(None)?,
+        api_request_plans: garnish.api_request_plans(None)?,
         api_reservations: garnish.api_reservations(None)?,
         api_spend: garnish.api_spend(None)?,
         api_prices: garnish.api_model_prices()?,
@@ -716,6 +718,20 @@ fn render_api_budgets(snapshot: &OperatorSnapshot) -> String {
                 reservation.budget_id == budget.id
                     && matches!(reservation.status.as_str(), "active" | "dispatched")
             })
+            .fold(0_u64, |total, reservation| {
+                total.saturating_add(u64::from(reservation.reserved_requests))
+            });
+        let planned = snapshot
+            .api_request_plans
+            .iter()
+            .filter(|plan| {
+                plan.provider == budget.provider
+                    && plan.account == budget.account
+                    && snapshot
+                        .tasks
+                        .iter()
+                        .any(|task| task.id == plan.task_id && task.project_id == budget.project_id)
+            })
             .count();
         let spent = snapshot
             .api_spend
@@ -755,12 +771,11 @@ fn render_api_budgets(snapshot: &OperatorSnapshot) -> String {
         );
         let _ = write!(
             html,
-            "<article class=\"quota-row\"><div><strong>{} · {}</strong><small>{} · {}</small></div><div><strong>{} reservations · {} settled</strong><small>{} cost micros · {} tokens used</small></div><span class=\"badge {class}\">{status}</span></article>",
+            "<article class=\"quota-row\"><div><strong>{} · {}</strong><small>{} · {}</small></div><div><strong>{planned} plans · {reserved} attempts reserved · {} settled</strong><small>{} cost micros · {} tokens used</small></div><span class=\"badge {class}\">{status}</span></article>",
             title_case(&budget.provider),
             escape_html(&budget.account),
             escape_html(project),
             escape_html(&ceilings),
-            reserved,
             spent.2,
             spent.0,
             spent.1,

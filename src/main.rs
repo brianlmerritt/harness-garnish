@@ -5,8 +5,8 @@ use harness_garnish::{
     Garnish,
     adapters::AgentKind,
     domain::{
-        DayAffinity, DayKind, NewApiBudget, NewApiModelPrice, NewTask, RouteTarget,
-        SchedulerDaemonConfig,
+        DayAffinity, DayKind, NewApiBudget, NewApiModelPrice, NewApiRequestPlan, NewTask,
+        RouteTarget, SchedulerDaemonConfig,
     },
     web_ui::{UiServerConfig, serve_ui},
 };
@@ -278,6 +278,37 @@ enum ApiCommand {
     },
     PriceSet(ApiPriceSet),
     PriceStatus,
+    PlanSet(ApiPlanSet),
+    PlanStatus {
+        #[arg(long)]
+        task: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct ApiPlanSet {
+    #[arg(long)]
+    task: String,
+    #[arg(long)]
+    provider: String,
+    #[arg(long, default_value = "default")]
+    account: String,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    enabled: bool,
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    role: String,
+    #[arg(long)]
+    max_input_tokens: u64,
+    #[arg(long)]
+    max_output_tokens: u64,
+    #[arg(long, default_value_t = 0)]
+    max_retries: u32,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    stream: bool,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args)]
@@ -952,6 +983,24 @@ fn run() -> Result<()> {
                 })?)
             }
             ApiCommand::PriceStatus => print_json(&garnish.api_model_prices()?),
+            ApiCommand::PlanSet(args) => {
+                print_json(&garnish.configure_api_request_plan(&NewApiRequestPlan {
+                    task_id: args.task,
+                    provider: args.provider,
+                    account: args.account,
+                    enabled: args.enabled,
+                    model: args.model,
+                    role: args.role,
+                    max_input_tokens: args.max_input_tokens,
+                    max_output_tokens: args.max_output_tokens,
+                    max_retries: args.max_retries,
+                    stream: args.stream,
+                    reason: args.reason,
+                })?)
+            }
+            ApiCommand::PlanStatus { task } => {
+                print_json(&garnish.api_request_plans(task.as_deref())?)
+            }
         },
         Command::Schedule { command } => match command {
             ScheduleCommand::Configure {

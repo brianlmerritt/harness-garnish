@@ -248,6 +248,38 @@ pub fn api_request_digest(
     Ok(hex::encode(Sha256::digest(body)))
 }
 
+pub fn api_request_content_digest(spec: &ApiRequestSpec) -> Result<String> {
+    validate_request_shape(spec)?;
+    let body = build_api_request_body(spec)?;
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        bail!("api.request_bounds: serialized request body exceeds byte limit");
+    }
+    Ok(hex::encode(Sha256::digest(body)))
+}
+
+pub fn api_request_conservative_input_token_bound(
+    budget: &ApiBudget,
+    spec: &ApiRequestSpec,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    validate_request_against_budget(budget, spec, now)?;
+    let body = build_api_request_body(spec)?;
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        bail!("api.request_bounds: serialized request body exceeds byte limit");
+    }
+    // One UTF-8 byte per token is deliberately conservative for admission control.
+    u64::try_from(body.len()).map_err(|_| anyhow!("api.request_bounds: request size overflow"))
+}
+
+pub fn api_request_conservative_content_token_bound(spec: &ApiRequestSpec) -> Result<u64> {
+    validate_request_shape(spec)?;
+    let body = build_api_request_body(spec)?;
+    if body.len() > MAX_REQUEST_BODY_BYTES {
+        bail!("api.request_bounds: serialized request body exceeds byte limit");
+    }
+    u64::try_from(body.len()).map_err(|_| anyhow!("api.request_bounds: request size overflow"))
+}
+
 fn build_api_request_body(spec: &ApiRequestSpec) -> Result<Vec<u8>> {
     match spec.provider.as_str() {
         "openai" => build_openai_body(spec),
@@ -261,6 +293,7 @@ fn validate_request_against_budget(
     spec: &ApiRequestSpec,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    validate_request_shape(spec)?;
     if !budget.enabled {
         bail!("api.disabled: the latest project API budget is disabled");
     }
@@ -273,8 +306,24 @@ fn validate_request_against_budget(
     if !budget.allowed_models.contains(&spec.model) {
         bail!("api.model_denied: model is not in the project allowlist");
     }
-    if spec.max_output_tokens == 0 || spec.max_output_tokens > budget.max_output_tokens {
+    if spec.max_output_tokens > budget.max_output_tokens {
         bail!("api.output_limit: request exceeds the project output-token ceiling");
+    }
+    for tool in &spec.tools {
+        if !budget.allowed_tools.contains(&tool.name) {
+            bail!("api.tool_denied: tool is not in the project allowlist");
+        }
+    }
+    Ok(())
+}
+
+fn validate_request_shape(spec: &ApiRequestSpec) -> Result<()> {
+    if !matches!(spec.provider.as_str(), "openai" | "anthropic") {
+        bail!("api.provider_denied: unsupported API provider");
+    }
+    validate_name(&spec.model, "API model")?;
+    if spec.max_output_tokens == 0 {
+        bail!("api.output_limit: request output-token maximum must be greater than zero");
     }
     if spec.instructions.is_empty() || spec.instructions.len() > MAX_INSTRUCTIONS_BYTES {
         bail!("api.request_bounds: instructions must be nonempty and bounded");
@@ -290,9 +339,6 @@ fn validate_request_against_budget(
         validate_name(&tool.name, "API tool name")?;
         if !names.insert(tool.name.as_str()) {
             bail!("api.tool_duplicate: request tool names must be unique");
-        }
-        if !budget.allowed_tools.contains(&tool.name) {
-            bail!("api.tool_denied: tool is not in the project allowlist");
         }
         if tool.description.is_empty() || tool.description.len() > 10_000 {
             bail!("api.tool_invalid: tool description must be nonempty and bounded");

@@ -6,6 +6,8 @@ use tempfile::tempdir;
 #[test]
 fn api_budget_configuration_is_explicit_and_stable_json() {
     let dir = tempdir().unwrap();
+    let period_start = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let period_end = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
     let repository = dir.path().join("repository");
     fs::create_dir(&repository).unwrap();
     assert!(
@@ -56,9 +58,9 @@ fn api_budget_configuration_is_explicit_and_stable_json() {
             "--request-limit",
             "100",
             "--period-start",
-            "2026-07-20T00:00:00Z",
+            period_start.as_str(),
             "--period-end",
-            "2026-08-20T00:00:00Z",
+            period_end.as_str(),
             "--model",
             "gpt-fixture",
             "--role",
@@ -95,6 +97,98 @@ fn api_budget_configuration_is_explicit_and_stable_json() {
     let budgets: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(budgets.as_array().unwrap().len(), 1);
     assert_eq!(budgets[0]["enabled"], true);
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "task",
+            "add",
+            "--project",
+            "fixture",
+            "--title",
+            "Planned API task",
+            "--goal",
+            "Exercise the durable request plan contract",
+            "--accept",
+            "plan is durable",
+            "--verify-argv",
+            "[\"true\"]",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let task: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let task_id = task["id"].as_str().unwrap();
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "task",
+            "pin",
+            task_id,
+            "--adapter",
+            "api",
+            "--provider",
+            "openai",
+            "--account",
+            "default",
+            "--reason",
+            "explicit paid API selection",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "api",
+            "plan-set",
+            "--task",
+            task_id,
+            "--provider",
+            "openai",
+            "--account",
+            "default",
+            "--model",
+            "gpt-fixture",
+            "--role",
+            "planner",
+            "--max-input-tokens",
+            "10000",
+            "--max-output-tokens",
+            "512",
+            "--reason",
+            "bounded exact task request",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["task_id"], task_id);
+    assert_eq!(plan["template_version"], "task-v1");
+    assert_eq!(plan["request_digest"].as_str().unwrap().len(), 64);
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "api",
+            "plan-status",
+            "--task",
+            task_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let plans: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plans.as_array().unwrap().len(), 1);
+    assert_eq!(plans[0]["max_input_tokens"], 10_000);
 }
 
 #[test]
@@ -524,7 +618,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 17);
+    assert_eq!(value["schema_version"], 18);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")
