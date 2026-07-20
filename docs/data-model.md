@@ -167,9 +167,9 @@ Reservations are forecasts and prevent the local scheduler from overcommitting; 
 
 Schema 11 creates one percentage reservation per relevant surface in the same immediate transaction as the scheduler claim and capacity locks. Claim heartbeat, claim-to-run conversion, runtime checkpoints, completion, failure, cancellation, graceful scheduler stop, emergency stop, and orphan recovery renew or release the reservation with an explicit status/reason. Concurrent claims sum active reservations before admission.
 
-### `api_budgets` and `api_spend`
+### `api_budgets`, `api_model_prices`, and `api_spend`
 
-Schema 15 materializes the network-free API accounting control plane.
+Schema 16 materializes the network-free API accounting control plane and durable pricing evidence.
 
 `api_budgets`: `id`, `project_id`, `provider`, `account`, `enabled`, `secret_reference`, `currency`, `currency_limit_micros`, `token_limit`, `request_limit`, `period_start/end`, model/tool/role allowlists, `max_output_tokens`, `max_retries`, `max_concurrent_requests`, `reason`, `created_at`, `supersedes_id`.
 
@@ -179,9 +179,13 @@ Budget revisions are append-only. Secret references are locators with one of thr
 
 Reservation admission runs in an immediate transaction and includes committed spend plus every active or dispatched reservation. An undispatched reservation can be released or expires once; claiming dispatch is single-use. After dispatch, uncertain provider outcome retains the reservation until authenticated settlement instead of incorrectly returning budget.
 
-`api_spend`: `id`, `budget_id`, `reservation_id`, `provider_request_id_hash`, `model`, input/output tokens, `cost_micros`, `currency`, `source`, `observed_at`.
+`api_model_prices`: `id`, provider/account/model/currency identity, integer-micro rates per million uncached-input/cache-read/cache-creation/output tokens, `effective_from/to`, `source`, `reason`, `created_at`, `supersedes_id`.
 
-Settlement is single-use, cannot exceed the claimed maximum, and stores only the provider request-ID hash and bounded usage evidence. Prompts, responses, raw request IDs, and credentials are not accounting fields. Subscription quota never satisfies an API budget and API funds never imply subscription headroom.
+Price records are append-only and operator supplied. Garnish never embeds a provider price, model alias, or cache multiplier. An effective record must match the reservation identity and settlement currency exactly.
+
+`api_spend`: `id`, `budget_id`, `reservation_id`, `provider_request_id_hash`, `model`, total/cached/cache-creation input tokens, output tokens, `cost_micros`, `currency`, `pricing_evidence_id`, `source`, `observed_at`.
+
+Settlement is single-use, cannot exceed the claimed maximum, and stores only the provider request-ID hash and bounded usage evidence. Monetary settlement recomputes cost from the cited effective price record with checked integer arithmetic; the categorized input counts cannot exceed the provider-reported input total. Prompts, responses, raw request IDs, and credentials are not accounting fields. Subscription quota never satisfies an API budget and API funds never imply subscription headroom.
 
 ## Policy and integration entities
 

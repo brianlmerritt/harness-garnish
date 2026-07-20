@@ -3,18 +3,22 @@ use crate::{
         AgentKind, FakeSandbox, Invocation, ProbeResult, probe_aoe, probe_docker, probe_podman,
         run_invocation_with_tick, safe_write,
     },
-    api_providers::{ApiRequestSpec, PreparedApiRequest, prepare_api_request},
+    api_providers::{
+        ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest,
+        parse_api_transport_response, prepare_api_request,
+    },
     db::Database,
     domain::{
         AgentCapabilityProbe, AgentCapabilityStatus, ApiBudget, ApiBudgetReservation,
-        ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord,
-        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ControlState,
-        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewApiBudget, NewTask,
-        Project, ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface,
-        QuotaUsageSample, RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget,
-        RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation, SchedulerClaim,
-        SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
-        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
+        ApiModelPrice, ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest,
+        BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
+        ControlState, DayKind, EmergencyStopResult, FailureCategory, LocalNotification,
+        NewApiBudget, NewApiModelPrice, NewTask, Project, ProjectLink, QuotaCollectionAttempt,
+        QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteCandidate,
+        RouteDecision, RouteTarget, RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation,
+        SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary,
+        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
+        UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -31,6 +35,7 @@ use crate::{
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -61,6 +66,12 @@ pub struct SupervisedInvocationResult {
     pub circuit: CircuitBreaker,
 }
 
+#[derive(Debug, Clone)]
+pub struct ApiExecutionResult {
+    pub response: ApiProviderResponse,
+    pub spend: ApiSpend,
+}
+
 impl Garnish {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
@@ -85,7 +96,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 15,
+            schema_version: 16,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -404,6 +415,17 @@ impl Garnish {
         self.db.list_api_spend(project_id.as_deref())
     }
 
+    pub fn configure_api_model_price(
+        &mut self,
+        config: &NewApiModelPrice,
+    ) -> Result<ApiModelPrice> {
+        self.db.configure_api_model_price(config)
+    }
+
+    pub fn api_model_prices(&self) -> Result<Vec<ApiModelPrice>> {
+        self.db.list_api_model_prices()
+    }
+
     pub fn reserve_api_budget(
         &mut self,
         request: &ApiReservationRequest,
@@ -450,6 +472,64 @@ impl Garnish {
         now: DateTime<Utc>,
     ) -> Result<ApiBudgetReservation> {
         self.db.claim_api_dispatch(reservation_id, now)
+    }
+
+    pub fn execute_reserved_api_request<T: ApiTransport>(
+        &mut self,
+        reservation_id: &str,
+        spec: &ApiRequestSpec,
+        transport: &mut T,
+        now: DateTime<Utc>,
+    ) -> Result<ApiExecutionResult> {
+        let prepared = self.prepare_reserved_api_request(reservation_id, spec, now)?;
+        let active_reservation = self.db.api_reservation(reservation_id)?;
+        let budget = self.db.api_budget(&active_reservation.budget_id)?;
+        let pricing_evidence = budget
+            .currency
+            .as_deref()
+            .map(|currency| {
+                self.db.effective_api_model_price(
+                    &active_reservation.provider,
+                    &active_reservation.account,
+                    &active_reservation.model,
+                    currency,
+                    now,
+                )
+            })
+            .transpose()?;
+        let reservation = self.claim_api_dispatch(reservation_id, now)?;
+        let transport_response = transport.send(&prepared)?;
+        let response = parse_api_transport_response(&reservation.provider, &transport_response)?;
+        if response.provider != reservation.provider || response.model != reservation.model {
+            bail!("api.response_identity_mismatch: provider response differs from reservation");
+        }
+        let (cost_micros, pricing_evidence_id) = match pricing_evidence {
+            Some(price) => {
+                let cost = crate::api_pricing::calculate_api_cost_micros(
+                    &price,
+                    response.input_tokens,
+                    response.cached_input_tokens,
+                    response.cache_creation_input_tokens,
+                    response.output_tokens,
+                )?;
+                (cost, Some(price.id))
+            }
+            None => (0, None),
+        };
+        let spend = self.db.settle_api_reservation(&ApiSettlement {
+            reservation_id: reservation.id,
+            provider_request_id_hash: hex::encode(Sha256::digest(response.request_id.as_bytes())),
+            input_tokens: response.input_tokens,
+            cached_input_tokens: response.cached_input_tokens,
+            cache_creation_input_tokens: response.cache_creation_input_tokens,
+            output_tokens: response.output_tokens,
+            cost_micros,
+            currency: budget.currency,
+            pricing_evidence_id,
+            source: "provider_reported".into(),
+            observed_at: now,
+        })?;
+        Ok(ApiExecutionResult { response, spend })
     }
 
     pub fn release_api_reservation(
@@ -3007,18 +3087,71 @@ mod tests {
                 )
                 .is_err()
         );
+        let price = garnish
+            .configure_api_model_price(&NewApiModelPrice {
+                provider: "openai".into(),
+                account: "default".into(),
+                model: "gpt-fixture".into(),
+                currency: "USD".into(),
+                input_micros_per_million: 1_000_000,
+                cached_input_micros_per_million: 500_000,
+                cache_creation_input_micros_per_million: 1_500_000,
+                output_micros_per_million: 1_000_000,
+                effective_from: now,
+                effective_to: Some(now + Duration::days(30)),
+                source: "fixture price evidence".into(),
+                reason: "quota-free accounting fixture".into(),
+            })
+            .unwrap();
+        let replacement_price = garnish
+            .configure_api_model_price(&NewApiModelPrice {
+                provider: "openai".into(),
+                account: "default".into(),
+                model: "gpt-fixture".into(),
+                currency: "USD".into(),
+                input_micros_per_million: 1_000_000,
+                cached_input_micros_per_million: 500_000,
+                cache_creation_input_micros_per_million: 1_500_000,
+                output_micros_per_million: 1_000_000,
+                effective_from: now,
+                effective_to: Some(now + Duration::days(30)),
+                source: "replacement fixture price evidence".into(),
+                reason: "verify superseded evidence fails closed".into(),
+            })
+            .unwrap();
         let settlement = ApiSettlement {
             reservation_id: reservation.id,
             provider_request_id_hash: "b".repeat(64),
             input_tokens: 8,
+            cached_input_tokens: 2,
+            cache_creation_input_tokens: 1,
             output_tokens: 18,
-            cost_micros: 300,
+            cost_micros: 26,
             currency: Some("USD".into()),
+            pricing_evidence_id: Some(replacement_price.id),
             source: "provider_reported".into(),
             observed_at: now + Duration::seconds(3),
         };
+        let mut superseded = settlement.clone();
+        superseded.pricing_evidence_id = Some(price.id);
+        assert!(
+            garnish
+                .settle_api_reservation(&superseded)
+                .unwrap_err()
+                .to_string()
+                .contains("api.pricing_evidence_superseded")
+        );
+        let mut incorrect = settlement.clone();
+        incorrect.cost_micros += 1;
+        assert!(
+            garnish
+                .settle_api_reservation(&incorrect)
+                .unwrap_err()
+                .to_string()
+                .contains("api.cost_mismatch")
+        );
         let spend = garnish.settle_api_reservation(&settlement).unwrap();
-        assert_eq!(spend.cost_micros, 300);
+        assert_eq!(spend.cost_micros, 26);
         assert!(garnish.settle_api_reservation(&settlement).is_err());
         assert_eq!(garnish.api_spend(Some("fixture")).unwrap().len(), 1);
 
@@ -3028,6 +3161,162 @@ mod tests {
         second.expires_at = now + Duration::minutes(5);
         let denied = garnish.reserve_api_budget(&second).unwrap_err();
         assert!(denied.to_string().contains("api.request_budget_exhausted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_api_lifecycle_prepares_dispatches_prices_and_settles_once() {
+        use crate::api_providers::{ApiTransportResponse, api_request_digest};
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        struct FakeTransport {
+            sends: usize,
+        }
+        impl ApiTransport for FakeTransport {
+            fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse> {
+                self.sends += 1;
+                request.with_sensitive_parts(|endpoint, _, _, _, secret, body| {
+                    assert_eq!(endpoint, "https://api.openai.com/v1/responses");
+                    assert_eq!(secret, b"fixture-secret-never-persist");
+                    let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+                    assert_eq!(body["model"], "gpt-fixture");
+                });
+                ApiTransportResponse::new(
+                    200,
+                    "provider-request-fixture".into(),
+                    br#"{
+                        "id":"response-fixture","object":"response","status":"completed",
+                        "model":"gpt-fixture",
+                        "output":[{"type":"message","status":"completed","role":"assistant",
+                          "content":[{"type":"output_text","text":"sensitive output","annotations":[]}]}],
+                        "usage":{"input_tokens":8,
+                          "input_tokens_details":{"cached_tokens":2,"cache_write_tokens":1},
+                          "output_tokens":18,"total_tokens":26}
+                    }"#
+                    .to_vec(),
+                    false,
+                )
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let secret_path = dir.path().join("provider-key");
+        let mut secret_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secret_path)
+            .unwrap();
+        writeln!(secret_file, "fixture-secret-never-persist").unwrap();
+        drop(secret_file);
+
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        garnish.policy.openai_api_enabled = true;
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        let budget = garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id.clone(),
+                provider: "openai".into(),
+                account: "default".into(),
+                enabled: true,
+                secret_reference: format!("file:{}", secret_path.display()),
+                currency: Some("USD".into()),
+                currency_limit_micros: Some(1_000),
+                token_limit: Some(1_000),
+                request_limit: Some(10),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::days(1),
+                allowed_models: vec!["gpt-fixture".into()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["planner".into()],
+                max_output_tokens: 18,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "fake lifecycle".into(),
+            })
+            .unwrap();
+        let price = garnish
+            .configure_api_model_price(&NewApiModelPrice {
+                provider: "openai".into(),
+                account: "default".into(),
+                model: "gpt-fixture".into(),
+                currency: "USD".into(),
+                input_micros_per_million: 1_000_000,
+                cached_input_micros_per_million: 500_000,
+                cache_creation_input_micros_per_million: 1_500_000,
+                output_micros_per_million: 1_000_000,
+                effective_from: now - Duration::minutes(1),
+                effective_to: Some(now + Duration::days(1)),
+                source: "fixture evidence".into(),
+                reason: "fake lifecycle".into(),
+            })
+            .unwrap();
+        let spec = ApiRequestSpec {
+            provider: "openai".into(),
+            model: "gpt-fixture".into(),
+            instructions: "sensitive instructions".into(),
+            input: "sensitive prompt".into(),
+            max_output_tokens: 18,
+            tools: vec![],
+            stream: false,
+        };
+        let digest = api_request_digest(&budget, &spec, now).unwrap();
+        let reservation = garnish
+            .reserve_api_budget(&ApiReservationRequest {
+                project_id: project.id,
+                task_id: task.id,
+                provider: "openai".into(),
+                account: "default".into(),
+                model: "gpt-fixture".into(),
+                role: "planner".into(),
+                request_digest: digest,
+                reserved_currency_micros: 100,
+                reserved_input_tokens: 8,
+                reserved_output_tokens: 18,
+                now,
+                expires_at: now + Duration::minutes(5),
+            })
+            .unwrap();
+        let mut transport = FakeTransport { sends: 0 };
+        let result = garnish
+            .execute_reserved_api_request(&reservation.id, &spec, &mut transport, now)
+            .unwrap();
+        assert_eq!(transport.sends, 1);
+        assert_eq!(result.spend.cost_micros, 26);
+        assert_eq!(result.spend.cached_input_tokens, 2);
+        assert_eq!(result.spend.cache_creation_input_tokens, 1);
+        assert_eq!(
+            result.spend.pricing_evidence_id.as_deref(),
+            Some(price.id.as_str())
+        );
+        assert_ne!(
+            result.spend.provider_request_id_hash,
+            "provider-request-fixture"
+        );
+        assert!(
+            garnish
+                .execute_reserved_api_request(&reservation.id, &spec, &mut transport, now)
+                .is_err()
+        );
+        assert_eq!(transport.sends, 1);
+        let backup_path = dir.path().join("state-backup.db");
+        let backup = garnish.create_backup(Some(&backup_path)).unwrap();
+        let state = fs::read(garnish.data_dir().join("state.db")).unwrap();
+        let backup_state = fs::read(backup.path).unwrap();
+        for canary in [
+            "fixture-secret-never-persist",
+            "sensitive instructions",
+            "sensitive prompt",
+            "sensitive output",
+            "provider-request-fixture",
+        ] {
+            assert!(!String::from_utf8_lossy(&state).contains(canary));
+            assert!(!String::from_utf8_lossy(&backup_state).contains(canary));
+        }
     }
 
     #[test]

@@ -1,12 +1,13 @@
 use crate::{
     domain::{
-        AgentCapabilityProbe, ApiBudget, ApiBudgetReservation, ApiReservationRequest,
-        ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
-        CheckpointAction, CircuitBreaker, ClaimedRunStart, ControlState, DayKind,
-        EmergencyStopResult, FailureCategory, LocalNotification, NewApiBudget, NewTask, Project,
-        ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample,
-        RetryPlan, RetryState, RouteDecision, RunCheckpoint, RunRecord, SchedulerClaim,
-        SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
+        AgentCapabilityProbe, ApiBudget, ApiBudgetReservation, ApiModelPrice,
+        ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord,
+        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ClaimedRunStart,
+        ControlState, DayKind, EmergencyStopResult, FailureCategory, LocalNotification,
+        NewApiBudget, NewApiModelPrice, NewTask, Project, ProjectLink, QuotaCollectionAttempt,
+        QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteDecision,
+        RunCheckpoint, RunRecord, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader,
+        SchedulerWake, Task, TaskStatus,
     },
     quota::QuotaObservation,
     schedule,
@@ -24,7 +25,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 pub struct Database {
     path: PathBuf,
@@ -473,6 +474,9 @@ impl Database {
         }
         if current < 15 {
             tx.execute_batch(MIGRATION_15)?;
+        }
+        if current < 16 {
+            tx.execute_batch(MIGRATION_16)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -2799,6 +2803,121 @@ impl Database {
         Ok(reservation)
     }
 
+    pub fn configure_api_model_price(
+        &mut self,
+        config: &NewApiModelPrice,
+    ) -> Result<ApiModelPrice> {
+        validate_api_model_price(config)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let supersedes_id = tx
+            .query_row(
+                "SELECT id FROM api_model_prices
+                 WHERE provider = ?1 AND account = ?2 AND model = ?3 AND currency = ?4
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![
+                    config.provider,
+                    config.account,
+                    config.model,
+                    config.currency
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let price = ApiModelPrice {
+            id: Ulid::new().to_string(),
+            provider: config.provider.clone(),
+            account: config.account.clone(),
+            model: config.model.clone(),
+            currency: config.currency.clone(),
+            input_micros_per_million: config.input_micros_per_million,
+            cached_input_micros_per_million: config.cached_input_micros_per_million,
+            cache_creation_input_micros_per_million: config.cache_creation_input_micros_per_million,
+            output_micros_per_million: config.output_micros_per_million,
+            effective_from: config.effective_from,
+            effective_to: config.effective_to,
+            source: config.source.clone(),
+            reason: config.reason.clone(),
+            created_at: Utc::now(),
+            supersedes_id,
+        };
+        tx.execute(
+            "INSERT INTO api_model_prices(
+                id, provider, account, model, currency, input_micros_per_million,
+                cached_input_micros_per_million, cache_creation_input_micros_per_million,
+                output_micros_per_million, effective_from, effective_to, source, reason,
+                created_at, supersedes_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                price.id,
+                price.provider,
+                price.account,
+                price.model,
+                price.currency,
+                sql_u64(price.input_micros_per_million, "input price")?,
+                sql_u64(price.cached_input_micros_per_million, "cached input price")?,
+                sql_u64(
+                    price.cache_creation_input_micros_per_million,
+                    "cache-creation input price"
+                )?,
+                sql_u64(price.output_micros_per_million, "output price")?,
+                price.effective_from.to_rfc3339(),
+                price.effective_to.map(|value| value.to_rfc3339()),
+                price.source,
+                price.reason,
+                price.created_at.to_rfc3339(),
+                price.supersedes_id,
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "api.price_configured",
+            "control_plane",
+            &price,
+        )?;
+        tx.commit()?;
+        Ok(price)
+    }
+
+    pub fn list_api_model_prices(&self) -> Result<Vec<ApiModelPrice>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{API_MODEL_PRICE_SELECT} ORDER BY created_at DESC, id DESC"
+        ))?;
+        Ok(stmt
+            .query_map([], map_api_model_price)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn effective_api_model_price(
+        &self,
+        provider: &str,
+        account: &str,
+        model: &str,
+        currency: &str,
+        at: DateTime<Utc>,
+    ) -> Result<ApiModelPrice> {
+        self.conn
+            .query_row(
+                &format!(
+                    "{API_MODEL_PRICE_SELECT}
+                     WHERE provider = ?1 AND account = ?2 AND model = ?3 AND currency = ?4
+                       AND effective_from <= ?5
+                       AND (effective_to IS NULL OR effective_to > ?5)
+                     ORDER BY effective_from DESC, created_at DESC, id DESC LIMIT 1"
+                ),
+                params![provider, account, model, currency, at.to_rfc3339()],
+                map_api_model_price,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                anyhow!("api.pricing_evidence_missing: no effective price matches the request")
+            })
+    }
+
     pub fn settle_api_reservation(&mut self, settlement: &ApiSettlement) -> Result<ApiSpend> {
         validate_sha256(
             &settlement.provider_request_id_hash,
@@ -2823,6 +2942,13 @@ impl Database {
         {
             bail!("api.settlement_exceeds_reservation: provider usage exceeds the claimed maximum");
         }
+        if settlement
+            .cached_input_tokens
+            .checked_add(settlement.cache_creation_input_tokens)
+            .is_none_or(|categorized| categorized > settlement.input_tokens)
+        {
+            bail!("api.usage_inconsistent: categorized input tokens exceed input tokens");
+        }
         let budget_currency: Option<String> = tx.query_row(
             "SELECT currency FROM api_budgets WHERE id = ?1",
             [&reservation.budget_id],
@@ -2831,6 +2957,76 @@ impl Database {
         if settlement.currency != budget_currency {
             bail!("api.currency_mismatch: settlement currency differs from the budget");
         }
+        let pricing_evidence = match (&settlement.currency, &settlement.pricing_evidence_id) {
+            (Some(_), Some(id)) => Some(
+                tx.query_row(
+                    &format!("{API_MODEL_PRICE_SELECT} WHERE id = ?1"),
+                    [id],
+                    map_api_model_price,
+                )
+                .optional()?
+                .ok_or_else(|| anyhow!("api.pricing_evidence_missing: price record not found"))?,
+            ),
+            (Some(_), None) => {
+                bail!("api.pricing_evidence_missing: monetary settlement requires price evidence")
+            }
+            (None, Some(_)) => {
+                bail!(
+                    "api.pricing_evidence_unexpected: token-only settlement cannot cite currency pricing"
+                )
+            }
+            (None, None) => None,
+        };
+        if let Some(price) = pricing_evidence.as_ref() {
+            if price.provider != reservation.provider
+                || price.account != reservation.account
+                || price.model != reservation.model
+                || Some(price.currency.as_str()) != settlement.currency.as_deref()
+            {
+                bail!("api.pricing_evidence_mismatch: price identity differs from reservation");
+            }
+            if settlement.observed_at < price.effective_from
+                || price
+                    .effective_to
+                    .is_some_and(|end| settlement.observed_at >= end)
+            {
+                bail!("api.pricing_evidence_inactive: price was not effective at observation time");
+            }
+            let effective_id = tx
+                .query_row(
+                    "SELECT id FROM api_model_prices
+                     WHERE provider = ?1 AND account = ?2 AND model = ?3 AND currency = ?4
+                       AND effective_from <= ?5
+                       AND (effective_to IS NULL OR effective_to > ?5)
+                     ORDER BY effective_from DESC, created_at DESC, id DESC LIMIT 1",
+                    params![
+                        price.provider,
+                        price.account,
+                        price.model,
+                        price.currency,
+                        settlement.observed_at.to_rfc3339(),
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if effective_id.as_deref() != Some(price.id.as_str()) {
+                bail!(
+                    "api.pricing_evidence_superseded: settlement must cite the effective price revision"
+                );
+            }
+            let calculated = crate::api_pricing::calculate_api_cost_micros(
+                price,
+                settlement.input_tokens,
+                settlement.cached_input_tokens,
+                settlement.cache_creation_input_tokens,
+                settlement.output_tokens,
+            )?;
+            if calculated != settlement.cost_micros {
+                bail!("api.cost_mismatch: settlement cost does not match pricing evidence");
+            }
+        } else if settlement.cost_micros != 0 {
+            bail!("api.currency_missing: token-only settlement cost must be zero");
+        }
         let spend = ApiSpend {
             id: Ulid::new().to_string(),
             budget_id: reservation.budget_id.clone(),
@@ -2838,17 +3034,21 @@ impl Database {
             provider_request_id_hash: settlement.provider_request_id_hash.clone(),
             model: reservation.model.clone(),
             input_tokens: settlement.input_tokens,
+            cached_input_tokens: settlement.cached_input_tokens,
+            cache_creation_input_tokens: settlement.cache_creation_input_tokens,
             output_tokens: settlement.output_tokens,
             cost_micros: settlement.cost_micros,
             currency: settlement.currency.clone(),
+            pricing_evidence_id: settlement.pricing_evidence_id.clone(),
             source: settlement.source.clone(),
             observed_at: settlement.observed_at,
         };
         tx.execute(
             "INSERT INTO api_spend(
                 id, budget_id, reservation_id, provider_request_id_hash, model,
-                input_tokens, output_tokens, cost_micros, currency, source, observed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                input_tokens, cached_input_tokens, cache_creation_input_tokens,
+                output_tokens, cost_micros, currency, pricing_evidence_id, source, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 spend.id,
                 spend.budget_id,
@@ -2856,9 +3056,15 @@ impl Database {
                 spend.provider_request_id_hash,
                 spend.model,
                 sql_u64(spend.input_tokens, "input tokens")?,
+                sql_u64(spend.cached_input_tokens, "cached input tokens")?,
+                sql_u64(
+                    spend.cache_creation_input_tokens,
+                    "cache-creation input tokens"
+                )?,
                 sql_u64(spend.output_tokens, "output tokens")?,
                 sql_u64(spend.cost_micros, "API cost")?,
                 spend.currency,
+                spend.pricing_evidence_id,
                 spend.source,
                 spend.observed_at.to_rfc3339(),
             ],
@@ -2908,8 +3114,9 @@ impl Database {
 
     pub fn list_api_spend(&self, project_id: Option<&str>) -> Result<Vec<ApiSpend>> {
         let base = "SELECT s.id, s.budget_id, s.reservation_id, s.provider_request_id_hash,
-                           s.model, s.input_tokens, s.output_tokens, s.cost_micros,
-                           s.currency, s.source, s.observed_at
+                           s.model, s.input_tokens, s.cached_input_tokens,
+                           s.cache_creation_input_tokens, s.output_tokens, s.cost_micros,
+                           s.currency, s.pricing_evidence_id, s.source, s.observed_at
                     FROM api_spend s
                     JOIN api_budgets b ON b.id = s.budget_id";
         let sql = if project_id.is_some() {
@@ -4719,6 +4926,49 @@ fn validate_api_reservation_request(request: &ApiReservationRequest) -> Result<(
     Ok(())
 }
 
+fn validate_api_model_price(config: &NewApiModelPrice) -> Result<()> {
+    if !matches!(config.provider.as_str(), "openai" | "anthropic") {
+        bail!("API price provider must be openai or anthropic");
+    }
+    validate_api_names("accounts", std::slice::from_ref(&config.account), true)?;
+    validate_api_names("models", std::slice::from_ref(&config.model), true)?;
+    if config.currency.len() != 3
+        || !config
+            .currency
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase())
+    {
+        bail!("API price currency must be a three-letter uppercase ASCII code");
+    }
+    for (label, value) in [
+        ("input price", config.input_micros_per_million),
+        ("cached input price", config.cached_input_micros_per_million),
+        (
+            "cache-creation input price",
+            config.cache_creation_input_micros_per_million,
+        ),
+        ("output price", config.output_micros_per_million),
+    ] {
+        sql_u64(value, label)?;
+    }
+    if config.input_micros_per_million == 0 || config.output_micros_per_million == 0 {
+        bail!("API uncached input and output prices must be greater than zero");
+    }
+    if let Some(end) = config.effective_to
+        && (end <= config.effective_from
+            || end - config.effective_from > chrono::Duration::days(366))
+    {
+        bail!("API price validity must be positive and no longer than 366 days");
+    }
+    if config.source.trim().is_empty() || config.source.chars().count() > 500 {
+        bail!("API price source must contain 1..=500 characters");
+    }
+    if config.reason.trim().is_empty() || config.reason.chars().count() > 1000 {
+        bail!("API price reason must contain 1..=1000 characters");
+    }
+    Ok(())
+}
+
 const API_BUDGET_SELECT: &str = "SELECT
     id, project_id, provider, account, enabled, secret_reference, currency,
     currency_limit_micros, token_limit, request_limit, period_start, period_end,
@@ -4732,6 +4982,13 @@ const API_RESERVATION_SELECT: &str = "SELECT
     reserved_output_tokens, status, created_at, expires_at, dispatch_claimed_at,
     settled_at, release_reason
  FROM api_budget_reservations";
+
+const API_MODEL_PRICE_SELECT: &str = "SELECT
+    id, provider, account, model, currency, input_micros_per_million,
+    cached_input_micros_per_million, cache_creation_input_micros_per_million,
+    output_micros_per_million, effective_from, effective_to, source, reason,
+    created_at, supersedes_id
+ FROM api_model_prices";
 
 fn map_api_budget(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiBudget> {
     Ok(ApiBudget {
@@ -4792,11 +5049,35 @@ fn map_api_spend(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiSpend> {
         provider_request_id_hash: row.get(3)?,
         model: row.get(4)?,
         input_tokens: nonnegative_u64(row, 5)?,
-        output_tokens: nonnegative_u64(row, 6)?,
-        cost_micros: nonnegative_u64(row, 7)?,
-        currency: row.get(8)?,
-        source: row.get(9)?,
-        observed_at: parse_time(row.get(10)?)?,
+        cached_input_tokens: nonnegative_u64(row, 6)?,
+        cache_creation_input_tokens: nonnegative_u64(row, 7)?,
+        output_tokens: nonnegative_u64(row, 8)?,
+        cost_micros: nonnegative_u64(row, 9)?,
+        currency: row.get(10)?,
+        pricing_evidence_id: row.get(11)?,
+        source: row.get(12)?,
+        observed_at: parse_time(row.get(13)?)?,
+    })
+}
+
+fn map_api_model_price(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiModelPrice> {
+    let effective_to: Option<String> = row.get(10)?;
+    Ok(ApiModelPrice {
+        id: row.get(0)?,
+        provider: row.get(1)?,
+        account: row.get(2)?,
+        model: row.get(3)?,
+        currency: row.get(4)?,
+        input_micros_per_million: nonnegative_u64(row, 5)?,
+        cached_input_micros_per_million: nonnegative_u64(row, 6)?,
+        cache_creation_input_micros_per_million: nonnegative_u64(row, 7)?,
+        output_micros_per_million: nonnegative_u64(row, 8)?,
+        effective_from: parse_time(row.get(9)?)?,
+        effective_to: effective_to.map(parse_time).transpose()?,
+        source: row.get(11)?,
+        reason: row.get(12)?,
+        created_at: parse_time(row.get(13)?)?,
+        supersedes_id: row.get(14)?,
     })
 }
 
@@ -5822,6 +6103,35 @@ CREATE TABLE api_spend (
 CREATE INDEX idx_api_spend_budget ON api_spend(budget_id, observed_at);
 "#;
 
+const MIGRATION_16: &str = r#"
+CREATE TABLE api_model_prices (
+    id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL CHECK(provider IN ('openai', 'anthropic')),
+    account TEXT NOT NULL CHECK(length(account) BETWEEN 1 AND 200),
+    model TEXT NOT NULL CHECK(length(model) BETWEEN 1 AND 200),
+    currency TEXT NOT NULL CHECK(length(currency) = 3),
+    input_micros_per_million INTEGER NOT NULL CHECK(input_micros_per_million > 0),
+    cached_input_micros_per_million INTEGER NOT NULL CHECK(cached_input_micros_per_million >= 0),
+    cache_creation_input_micros_per_million INTEGER NOT NULL CHECK(cache_creation_input_micros_per_million >= 0),
+    output_micros_per_million INTEGER NOT NULL CHECK(output_micros_per_million > 0),
+    effective_from TEXT NOT NULL,
+    effective_to TEXT,
+    source TEXT NOT NULL CHECK(length(source) BETWEEN 1 AND 500),
+    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 1000),
+    created_at TEXT NOT NULL,
+    supersedes_id TEXT REFERENCES api_model_prices(id)
+);
+
+CREATE INDEX idx_api_model_prices_identity
+    ON api_model_prices(provider, account, model, currency, effective_from DESC, created_at DESC);
+
+ALTER TABLE api_spend ADD COLUMN cached_input_tokens INTEGER NOT NULL DEFAULT 0
+    CHECK(cached_input_tokens >= 0);
+ALTER TABLE api_spend ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0
+    CHECK(cache_creation_input_tokens >= 0);
+ALTER TABLE api_spend ADD COLUMN pricing_evidence_id TEXT REFERENCES api_model_prices(id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6318,7 +6628,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 15);
+        assert_eq!(migrated.schema_version(), 16);
         assert!(migrated.list_latest_api_budgets(None).unwrap().is_empty());
         assert!(migrated.list_api_reservations(None).unwrap().is_empty());
         assert!(migrated.list_api_spend(None).unwrap().is_empty());
@@ -6327,13 +6637,13 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
                  WHERE type = 'table' AND name IN (
-                    'api_budgets', 'api_budget_reservations', 'api_spend'
+                    'api_budgets', 'api_budget_reservations', 'api_spend', 'api_model_prices'
                  )",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(table_count, 3);
+        assert_eq!(table_count, 4);
         let backup = fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -6348,6 +6658,50 @@ mod tests {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn schema_fifteen_migration_adds_pricing_evidence_and_categorized_usage_with_backup() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("state.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch(MIGRATION_15).unwrap();
+        connection.pragma_update(None, "user_version", 15).unwrap();
+        drop(connection);
+
+        let migrated = Database::open(&database_path).unwrap();
+        assert_eq!(migrated.schema_version(), 16);
+        assert!(migrated.list_api_model_prices().unwrap().is_empty());
+        let column_count: i64 = migrated
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('api_spend')
+                 WHERE name IN (
+                    'cached_input_tokens', 'cache_creation_input_tokens', 'pricing_evidence_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 3);
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("v15") && name.ends_with("backup.db"))
+            })
+            .expect("schema-15 backup");
+        let backup_connection = Connection::open(backup).unwrap();
+        let integrity: String = backup_connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let backup_version: i64 = backup_connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, 15);
     }
 
     #[test]

@@ -4,7 +4,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use harness_garnish::{
     Garnish,
     adapters::AgentKind,
-    domain::{DayAffinity, DayKind, NewApiBudget, NewTask, RouteTarget, SchedulerDaemonConfig},
+    domain::{
+        DayAffinity, DayKind, NewApiBudget, NewApiModelPrice, NewTask, RouteTarget,
+        SchedulerDaemonConfig,
+    },
     web_ui::{UiServerConfig, serve_ui},
 };
 use serde::Serialize;
@@ -273,6 +276,39 @@ enum ApiCommand {
         #[arg(long)]
         project: Option<String>,
     },
+    PriceSet(ApiPriceSet),
+    PriceStatus,
+}
+
+#[derive(Args)]
+struct ApiPriceSet {
+    #[arg(long)]
+    provider: String,
+    #[arg(long, default_value = "default")]
+    account: String,
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    currency: String,
+    #[arg(long)]
+    input_micros_per_million: u64,
+    #[arg(long)]
+    cached_input_micros_per_million: u64,
+    #[arg(long)]
+    cache_creation_input_micros_per_million: u64,
+    #[arg(long)]
+    output_micros_per_million: u64,
+    #[arg(long, help = "RFC3339 inclusive effective time")]
+    effective_from: String,
+    #[arg(long, help = "RFC3339 exclusive effective time")]
+    effective_to: Option<String>,
+    #[arg(
+        long,
+        help = "Human-verifiable price-list URL or other evidence locator"
+    )]
+    source: String,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args)]
@@ -898,6 +934,24 @@ fn run() -> Result<()> {
                 print_json(&garnish.api_reservations(project.as_deref())?)
             }
             ApiCommand::Spend { project } => print_json(&garnish.api_spend(project.as_deref())?),
+            ApiCommand::PriceSet(args) => {
+                print_json(&garnish.configure_api_model_price(&NewApiModelPrice {
+                    provider: args.provider,
+                    account: args.account,
+                    model: args.model,
+                    currency: args.currency,
+                    input_micros_per_million: args.input_micros_per_million,
+                    cached_input_micros_per_million: args.cached_input_micros_per_million,
+                    cache_creation_input_micros_per_million:
+                        args.cache_creation_input_micros_per_million,
+                    output_micros_per_million: args.output_micros_per_million,
+                    effective_from: parse_required_time(&args.effective_from)?,
+                    effective_to: parse_optional_time(args.effective_to.as_deref())?,
+                    source: args.source,
+                    reason: args.reason,
+                })?)
+            }
+            ApiCommand::PriceStatus => print_json(&garnish.api_model_prices()?),
         },
         Command::Schedule { command } => match command {
             ScheduleCommand::Configure {

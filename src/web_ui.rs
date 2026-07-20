@@ -1,9 +1,9 @@
 use crate::{
     Garnish,
     domain::{
-        AgentCapabilityStatus, ApiBudget, ApiBudgetReservation, ApiSpend, ApprovalRequest,
-        LocalNotification, Project, QuotaCollectionAttempt, QuotaSurface, SchedulerWake, Task,
-        TaskStatus,
+        AgentCapabilityStatus, ApiBudget, ApiBudgetReservation, ApiModelPrice, ApiSpend,
+        ApprovalRequest, LocalNotification, Project, QuotaCollectionAttempt, QuotaSurface,
+        SchedulerWake, Task, TaskStatus,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -50,6 +50,7 @@ pub struct OperatorSnapshot {
     pub api_budgets: Vec<ApiBudget>,
     pub api_reservations: Vec<ApiBudgetReservation>,
     pub api_spend: Vec<ApiSpend>,
+    pub api_prices: Vec<ApiModelPrice>,
     pub approvals: Vec<ApprovalRequest>,
     pub notifications: Vec<LocalNotification>,
     pub scheduler_wakes: Vec<SchedulerWake>,
@@ -71,6 +72,7 @@ pub fn operator_snapshot(garnish: &Garnish) -> Result<OperatorSnapshot> {
         api_budgets: garnish.api_budgets(None)?,
         api_reservations: garnish.api_reservations(None)?,
         api_spend: garnish.api_spend(None)?,
+        api_prices: garnish.api_model_prices()?,
         approvals: garnish.approvals(100)?,
         notifications: garnish.local_notifications(true, 40)?,
         scheduler_wakes,
@@ -685,7 +687,7 @@ fn render_agents(snapshot: &OperatorSnapshot) -> String {
 }
 
 fn render_api_budgets(snapshot: &OperatorSnapshot) -> String {
-    if snapshot.api_budgets.is_empty() {
+    if snapshot.api_budgets.is_empty() && snapshot.api_prices.is_empty() {
         return empty_state(
             "No API budgets enabled",
             "OpenAI and Anthropic API access remains denied until a project budget and effective policy explicitly allow it.",
@@ -762,6 +764,32 @@ fn render_api_budgets(snapshot: &OperatorSnapshot) -> String {
             spent.2,
             spent.0,
             spent.1,
+        );
+    }
+    for price in snapshot.api_prices.iter().take(20) {
+        let effective = if snapshot.evaluated_at < price.effective_from {
+            ("neutral", "Future")
+        } else if price
+            .effective_to
+            .is_some_and(|effective_to| snapshot.evaluated_at >= effective_to)
+        {
+            ("neutral", "Expired")
+        } else {
+            ("good", "Effective")
+        };
+        let _ = write!(
+            html,
+            "<article class=\"quota-row\"><div><strong>{} · {} · {}</strong><small>{} · append-only price evidence</small></div><div><strong>{}/{}/{}/{} micros</strong><small>uncached/cache-read/cache-create/output per million tokens</small></div><span class=\"badge {}\">{}</span></article>",
+            title_case(&price.provider),
+            escape_html(&price.account),
+            escape_html(&price.model),
+            escape_html(&price.currency),
+            price.input_micros_per_million,
+            price.cached_input_micros_per_million,
+            price.cache_creation_input_micros_per_million,
+            price.output_micros_per_million,
+            effective.0,
+            effective.1,
         );
     }
     html.push_str("</div>");

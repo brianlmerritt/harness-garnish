@@ -98,6 +98,63 @@ fn api_budget_configuration_is_explicit_and_stable_json() {
 }
 
 #[test]
+fn api_model_price_evidence_is_append_only_and_stable_json() {
+    let dir = tempdir().unwrap();
+    let data = dir.path().join("state");
+    let set = |reason: &str| {
+        cargo_bin_cmd!("garnish")
+            .args([
+                "--data-dir",
+                data.to_str().unwrap(),
+                "api",
+                "price-set",
+                "--provider",
+                "openai",
+                "--account",
+                "default",
+                "--model",
+                "model-fixture",
+                "--currency",
+                "USD",
+                "--input-micros-per-million",
+                "2000000",
+                "--cached-input-micros-per-million",
+                "500000",
+                "--cache-creation-input-micros-per-million",
+                "2500000",
+                "--output-micros-per-million",
+                "8000000",
+                "--effective-from",
+                "2026-07-20T00:00:00Z",
+                "--source",
+                "https://example.invalid/fixture-price-evidence",
+                "--reason",
+                reason,
+            ])
+            .output()
+            .unwrap()
+    };
+    let first = set("initial fixture evidence");
+    assert!(first.status.success());
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["input_micros_per_million"], 2_000_000);
+    assert!(first["supersedes_id"].is_null());
+
+    let second = set("replacement fixture evidence");
+    assert!(second.status.success());
+    let second: Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["supersedes_id"], first["id"]);
+
+    let status = cargo_bin_cmd!("garnish")
+        .args(["--data-dir", data.to_str().unwrap(), "api", "price-status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let prices: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(prices.as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn quota_usage_evidence_and_forecast_commands_are_stable_json() {
     let dir = tempdir().unwrap();
     let output = cargo_bin_cmd!("garnish")
@@ -467,7 +524,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 15);
+    assert_eq!(value["schema_version"], 16);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

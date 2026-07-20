@@ -38,7 +38,7 @@ Normal tests use fake transports and fixtures. No test reads a real API key, rea
 | P4-14 | Normal macOS/Linux/WSL2 suites use fake transports only and consume no provider subscription quota or paid API credit. |
 | P4-15 | Remote approval, MCP, skill, and ACP inputs cannot bypass core policy, action-digest approvals, quota/budget gates, sandbox attestation, or independent verification. |
 
-## First slice status
+## Intermediate status
 
 Schema 15 now implements network-free project API budgets and atomic reservations/settlement. Stable CLI JSON plus fake-only default-deny, validation, concurrent overcommit, restart recovery, dispatch, settlement, replay, migration-backup, and request-exhaustion tests pass on macOS. After adding the provider fixture contracts, the 2026-07-20 normal suite passed 115 tests with the two explicitly opt-in real-container tests ignored; it made no provider request and consumed no subscription quota or API credit.
 
@@ -48,7 +48,13 @@ The protected-reference slice centralizes exact `env:NAME`, `file:/absolute/path
 
 The request-boundary slice constructs only the fixed OpenAI Responses and Anthropic Messages HTTPS endpoints. It repeats active-period, provider, model, tool, and output-ceiling checks before resolving a secret, bounds instructions/input/tools/body, and keeps prompts, outputs, bodies, raw response/request IDs, and authorization material out of `Debug` and serialization. A transport trait receives sensitive parts only through an explicitly named closure; the crate does not yet provide a real HTTP implementation. Fake transport fixtures prove request shapes, header placement, response parsing, and redacted provider failures without network access. Service preparation requires effective-policy permission, a live undispatched reservation, exact provider/model/output/request digest, and the still-latest budget revision. The macOS suite passes 123 tests with the two real-container tests explicitly ignored.
 
-This is intermediate evidence, not Phase 4 exit. Linux and WSL2 both passed `./scripts/test-phase4-portability`; combined macOS/Linux/WSL2 evidence is recorded in [`phase-4-portability-checkpoint.md`](phase-4-portability-checkpoint.md).
+Schema 16 adds append-only provider/account/model/currency price evidence and preserves uncached input, cache-read input, cache-creation input, and output categories. OpenAI's documented `usage.input_tokens_details.cached_tokens` and `cache_write_tokens` meanings are treated as usage evidence, not pricing constants ([official prompt-caching contract](https://developers.openai.com/api/docs/guides/prompt-caching#requirements)). Rates are user-supplied integer currency micros per million tokens; no provider model, price, or cache multiplier is a program constant. Cost is calculated with checked integer arithmetic and a single final upward rounding. Monetary settlement requires the exact price record, verifies its identity and effective interval, recomputes cost, and remains single-use.
+
+The transport-agnostic execution boundary is now complete for fake transports: exact request preparation precedes the dispatch claim; authoritative fixture usage selects the already-verified effective price; the raw provider request ID is hashed; and the reservation settles once. A canary test verifies that secret, prompt, instructions, response text, and raw request ID do not enter SQLite or a verified backup. This is machine evidence for the local accounting lifecycle, not authorization for real network traffic. The crate still has no real HTTP transport.
+
+The 2026-07-20 macOS quota-free suite passed 129 tests with 2 opt-in real-container tests ignored. Strict Clippy with warnings denied also passed. No provider transport, credential, subscription quota, or paid API credit was used.
+
+This is intermediate evidence, not Phase 4 exit. The recorded Linux/WSL2 checkpoint covers Schema 15 and remains in [`phase-4-portability-checkpoint.md`](phase-4-portability-checkpoint.md). Schema 16 requires a fresh Linux/WSL2 portability run after the macOS verification and user-managed Git update.
 
 ## Explicit non-goals
 

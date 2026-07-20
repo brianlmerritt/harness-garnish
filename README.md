@@ -157,15 +157,17 @@ garnish --data-dir .garnish-state quota forecast --adapter codex --provider code
 
 ### Phase 4 API budget control plane
 
-Schema 15 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas. It has no HTTP transport yet: configuration, fixture parsing, and these read commands cannot make a provider request or spend credit.
+Schema 16 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas and adds append-only model-price evidence with exact categorized-token costing. It has no real HTTP transport: configuration, fixture execution, and these read commands cannot make a provider request or spend credit.
 
 ```console
 cargo run --locked -- --data-dir .garnish-state api budget-status
 cargo run --locked -- --data-dir .garnish-state api reservations
 cargo run --locked -- --data-dir .garnish-state api spend
+cargo run --locked -- --data-dir .garnish-state api price-status
+cargo run --locked -- --data-dir .garnish-state api price-set --help
 ```
 
-These three commands contain no placeholders. A project budget can be configured through `api budget-set`, but configuration alone never enables spending: effective policy is independently default-deny, and no subscription-quota condition can select paid API use. Secret fields accept only a locator shaped as `env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`; they never accept a key value. The authenticated read-only dashboard shows API budgets, outstanding reservations, and settled usage under **Agents & quotas**.
+These five commands contain no placeholders; the last prints the required pricing-evidence fields without changing state. A project budget can be configured through `api budget-set`, but configuration alone never enables spending: effective policy is independently default-deny, and no subscription-quota condition can select paid API use. Price rates are explicit integer currency micros per million tokens and are never fetched or guessed. Secret fields accept only a locator shaped as `env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`; they never accept a key value. The authenticated read-only dashboard shows API budgets, outstanding reservations, and settled usage under **Agents & quotas**.
 
 Protected secret resolution is host-side and bounded. On Unix, `file:` targets must be regular files owned by the Garnish user with no group/other permissions (normally mode `0600`); symlinks are rejected. `keychain:` currently requires macOS. WSL2 and native Linux use `env:` or a protected Linux-side file. No API transport is enabled yet, so users should not configure or test a live credential at this stage.
 

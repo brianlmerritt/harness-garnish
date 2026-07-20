@@ -508,9 +508,12 @@ pub struct ApiSettlement {
     pub reservation_id: String,
     pub provider_request_id_hash: String,
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub cost_micros: u64,
     pub currency: Option<String>,
+    pub pricing_evidence_id: Option<String>,
     pub source: String,
     pub observed_at: DateTime<Utc>,
 }
@@ -523,11 +526,49 @@ pub struct ApiSpend {
     pub provider_request_id_hash: String,
     pub model: String,
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub cost_micros: u64,
     pub currency: Option<String>,
+    pub pricing_evidence_id: Option<String>,
     pub source: String,
     pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiModelPrice {
+    pub id: String,
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    pub currency: String,
+    pub input_micros_per_million: u64,
+    pub cached_input_micros_per_million: u64,
+    pub cache_creation_input_micros_per_million: u64,
+    pub output_micros_per_million: u64,
+    pub effective_from: DateTime<Utc>,
+    pub effective_to: Option<DateTime<Utc>>,
+    pub source: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub supersedes_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApiModelPrice {
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    pub currency: String,
+    pub input_micros_per_million: u64,
+    pub cached_input_micros_per_million: u64,
+    pub cache_creation_input_micros_per_million: u64,
+    pub output_micros_per_million: u64,
+    pub effective_from: DateTime<Utc>,
+    pub effective_to: Option<DateTime<Utc>>,
+    pub source: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

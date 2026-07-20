@@ -404,6 +404,8 @@ pub struct ApiProviderResponse {
     pub terminal_status: ApiTerminalStatus,
     pub output: Vec<ApiOutputItem>,
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
 }
 
@@ -418,6 +420,11 @@ impl fmt::Debug for ApiProviderResponse {
             .field("terminal_status", &self.terminal_status)
             .field("output_items", &self.output.len())
             .field("input_tokens", &self.input_tokens)
+            .field("cached_input_tokens", &self.cached_input_tokens)
+            .field(
+                "cache_creation_input_tokens",
+                &self.cache_creation_input_tokens,
+            )
             .field("output_tokens", &self.output_tokens)
             .finish()
     }
@@ -533,6 +540,22 @@ fn parse_openai_value(request_id: &str, value: &Value) -> Result<ApiProviderResp
         .get("usage")
         .ok_or_else(|| anyhow!("openai.usage_missing: completed response requires usage"))?;
     let input_tokens = required_u64(usage, "input_tokens", "OpenAI input tokens")?;
+    let details = usage.get("input_tokens_details");
+    if details.is_some_and(|value| !value.is_object()) {
+        bail!("openai.usage_details_invalid: input token details must be an object");
+    }
+    let cached_input_tokens = optional_u64(details, "cached_tokens", "OpenAI cached input tokens")?;
+    let cache_creation_input_tokens = optional_u64(
+        details,
+        "cache_write_tokens",
+        "OpenAI cache-write input tokens",
+    )?;
+    if cached_input_tokens
+        .checked_add(cache_creation_input_tokens)
+        .is_none_or(|categorized| categorized > input_tokens)
+    {
+        bail!("openai.usage_inconsistent: categorized input tokens exceed input tokens");
+    }
     let output_tokens = required_u64(usage, "output_tokens", "OpenAI output tokens")?;
     let total_tokens = required_u64(usage, "total_tokens", "OpenAI total tokens")?;
     if input_tokens.checked_add(output_tokens) != Some(total_tokens) {
@@ -558,6 +581,8 @@ fn parse_openai_value(request_id: &str, value: &Value) -> Result<ApiProviderResp
         },
         output,
         input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
         output_tokens,
     })
 }
@@ -648,7 +673,7 @@ fn parse_anthropic_value(request_id: &str, value: &Value) -> Result<ApiProviderR
     let usage = value
         .get("usage")
         .ok_or_else(|| anyhow!("anthropic.usage_missing: message requires usage"))?;
-    let input_tokens = anthropic_input_tokens(usage)?;
+    let input_usage = anthropic_input_usage(usage)?;
     let output_tokens = required_u64(usage, "output_tokens", "Anthropic output tokens")?;
     Ok(ApiProviderResponse {
         provider: "anthropic".into(),
@@ -657,7 +682,9 @@ fn parse_anthropic_value(request_id: &str, value: &Value) -> Result<ApiProviderR
         model: model.into(),
         terminal_status,
         output,
-        input_tokens,
+        input_tokens: input_usage.total,
+        cached_input_tokens: input_usage.cached,
+        cache_creation_input_tokens: input_usage.cache_creation,
         output_tokens,
     })
 }
@@ -691,6 +718,8 @@ pub fn parse_anthropic_response_stream(
     let mut response_id = None;
     let mut model = None;
     let mut input_tokens = None;
+    let mut cached_input_tokens = None;
+    let mut cache_creation_input_tokens = None;
     let mut output_tokens = None;
     let mut terminal = None;
     let mut blocks = BTreeMap::<usize, StreamBlock>::new();
@@ -738,7 +767,10 @@ pub fn parse_anthropic_response_stream(
                 })?;
                 response_id = Some(id.to_owned());
                 model = Some(model_value.to_owned());
-                input_tokens = Some(anthropic_input_tokens(usage)?);
+                let input_usage = anthropic_input_usage(usage)?;
+                input_tokens = Some(input_usage.total);
+                cached_input_tokens = Some(input_usage.cached);
+                cache_creation_input_tokens = Some(input_usage.cache_creation);
             }
             "content_block_start" => {
                 ensure_anthropic_started(&response_id)?;
@@ -901,6 +933,8 @@ pub fn parse_anthropic_response_stream(
         terminal_status: terminal.unwrap_or(ApiTerminalStatus::Paused),
         output,
         input_tokens: input_tokens.unwrap_or_default(),
+        cached_input_tokens: cached_input_tokens.unwrap_or_default(),
+        cache_creation_input_tokens: cache_creation_input_tokens.unwrap_or_default(),
         output_tokens: output_tokens.unwrap_or_default(),
     })
 }
@@ -1103,18 +1137,42 @@ fn anthropic_terminal(value: &str) -> Result<ApiTerminalStatus> {
     }
 }
 
-fn anthropic_input_tokens(usage: &Value) -> Result<u64> {
-    let mut total = required_u64(usage, "input_tokens", "Anthropic input tokens")?;
-    for key in ["cache_creation_input_tokens", "cache_read_input_tokens"] {
-        if let Some(value) = usage.get(key) {
-            total = total
-                .checked_add(value.as_u64().ok_or_else(|| {
-                    anyhow!("api.schema_drift: Anthropic cache tokens are invalid")
-                })?)
-                .ok_or_else(|| anyhow!("anthropic.usage_overflow: input token total overflow"))?;
-        }
+struct ApiInputUsage {
+    total: u64,
+    cached: u64,
+    cache_creation: u64,
+}
+
+fn anthropic_input_usage(usage: &Value) -> Result<ApiInputUsage> {
+    let base = required_u64(usage, "input_tokens", "Anthropic input tokens")?;
+    let cache_creation = optional_u64(
+        Some(usage),
+        "cache_creation_input_tokens",
+        "Anthropic cache-creation input tokens",
+    )?;
+    let cached = optional_u64(
+        Some(usage),
+        "cache_read_input_tokens",
+        "Anthropic cache-read input tokens",
+    )?;
+    let total = base
+        .checked_add(cache_creation)
+        .and_then(|value| value.checked_add(cached))
+        .ok_or_else(|| anyhow!("anthropic.usage_overflow: input token total overflow"))?;
+    Ok(ApiInputUsage {
+        total,
+        cached,
+        cache_creation,
+    })
+}
+
+fn optional_u64(object: Option<&Value>, key: &str, label: &str) -> Result<u64> {
+    match object.and_then(|value| value.get(key)) {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow!("api.schema_drift: {label} are invalid")),
     }
-    Ok(total)
 }
 
 fn ensure_anthropic_started(response_id: &Option<String>) -> Result<()> {
@@ -1142,7 +1200,7 @@ mod tests {
             "content":[{"type":"output_text","text":"fixture result","annotations":[]}],
             "additive_future_field":true
         }],
-        "usage":{"input_tokens":12,"output_tokens":5,"total_tokens":17,"future":1},
+        "usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2},"output_tokens":5,"total_tokens":17,"future":1},
         "additive_future_field":{"safe":"ignored"}
     }"#;
 
@@ -1384,6 +1442,8 @@ mod tests {
             parse_openai_response("req_fixture_001", OPENAI_RESPONSE.as_bytes()).unwrap();
         assert_eq!(response.provider, "openai");
         assert_eq!(response.input_tokens, 12);
+        assert_eq!(response.cached_input_tokens, 3);
+        assert_eq!(response.cache_creation_input_tokens, 2);
         assert_eq!(response.output_tokens, 5);
         assert_eq!(response.terminal_status, ApiTerminalStatus::Completed);
         let debug = format!("{response:?}");
@@ -1398,7 +1458,7 @@ mod tests {
         );
 
         let missing_usage = OPENAI_RESPONSE.replace(
-            r#""usage":{"input_tokens":12,"output_tokens":5,"total_tokens":17,"future":1},"#,
+            r#""usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2},"output_tokens":5,"total_tokens":17,"future":1},"#,
             "",
         );
         assert!(parse_openai_response("req_fixture_001", missing_usage.as_bytes()).is_err());
@@ -1438,6 +1498,8 @@ mod tests {
             parse_anthropic_response("req_fixture_002", ANTHROPIC_RESPONSE.as_bytes()).unwrap();
         assert_eq!(response.provider, "anthropic");
         assert_eq!(response.input_tokens, 15);
+        assert_eq!(response.cached_input_tokens, 3);
+        assert_eq!(response.cache_creation_input_tokens, 2);
         assert_eq!(response.output_tokens, 4);
         assert_eq!(response.terminal_status, ApiTerminalStatus::ToolUse);
         assert!(matches!(
