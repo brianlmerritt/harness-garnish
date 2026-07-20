@@ -16,7 +16,7 @@ The Linux scheduler/daemon midpoint passed on a user-provided VPS on 2026-07-19.
 - Scheduler recovery counts were zero on the clean fixture, as expected.
 - State directory mode was `0700`; SQLite database mode was `0600`.
 
-## Remaining Linux runtime evidence
+## Initial Linux runtime evidence
 
 Neither Podman nor Docker was installed on the VPS, so the script recorded both runtime probes as skipped. This does not invalidate the scheduler, signal, process-cleanup, filesystem-permission, or restart midpoint. It does mean Harness Garnish does not yet claim Linux container-runtime conformance. Rootless Podman and/or Docker capability and sandbox conformance must be run later on a host where the selected runtime is installed.
 
@@ -37,4 +37,4 @@ The corrected quota-free bundle passed on 2026-07-20:
 - `podman info` succeeded and reported a healthy rootless runtime.
 - Docker was not installed, so Docker conformance remains separate and opt-in.
 
-This closes the Linux midpoint and rootless-Podman capability probe. The backend-specific Podman sandbox conformance test is now available through `scripts/test-podman-conformance`, but this evidence remains capability-only until the VPS is rerun with `GARNISH_REAL_PODMAN_IMAGE` set to a local digest-pinned image.
+This closed the Linux midpoint and rootless-Podman capability probe. Full Podman and Docker conformance subsequently passed on the same VPS; see `phase-2-linux-container-conformance.md`.

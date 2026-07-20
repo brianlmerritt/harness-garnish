@@ -125,6 +125,8 @@ After cloning the repository on an Ubuntu or Debian host, run the quota-free Lin
 
 It runs formatting, lint, build and tests; exercises bounded and signal-driven daemon shutdown; verifies private state permissions; and reports rootless Podman and Docker health when installed. The 2026-07-20 VPS run passed this checkpoint and confirmed a healthy rootless Podman capability probe.
 
+Real rootless-Podman 4.9.3 and Docker 29.6.2 conformance subsequently passed on that Ubuntu VPS. The captured runtime and attestation evidence is in [`docs/phase-2-linux-container-conformance.md`](docs/phase-2-linux-container-conformance.md).
+
 The hardened Podman sandbox lifecycle is a separate, explicit opt-in because it needs a real local image. These commands pull Alpine once, derive its real digest automatically, and then run with further pulls and container networking disabled:
 
 ```console
