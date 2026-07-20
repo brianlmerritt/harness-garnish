@@ -68,6 +68,9 @@ fn task(
         day_affinity: harness_garnish::domain::DayAffinity::Both,
         deadline_at: None,
         required_capabilities: vec![],
+        pinned_adapter: None,
+        pinned_provider: None,
+        pinned_account: None,
         fake_write_path: Some(write_path.into()),
         fake_write_content: Some("done\n".into()),
     }

@@ -117,7 +117,29 @@ garnish --data-dir .garnish-state agent refresh --valid-seconds 300
 garnish --data-dir .garnish-state agent status
 ```
 
-A missing or unsupported CLI is recorded as evidence rather than treated as healthy. The pure multi-candidate kernel now hard-filters probe freshness, health, capabilities, quota headroom, and exact manual pins before applying a deterministic recorded score. Durable pin configuration and scheduler integration are the next Phase 3 slice.
+A missing or unsupported CLI is recorded as evidence rather than treated as healthy. The pure multi-candidate kernel hard-filters probe freshness, health, capabilities, quota headroom, and exact manual pins before applying a deterministic recorded score.
+
+Schema 9 makes task pins durable and lets scheduler ticks/daemons consider multiple route identities. Pin changes always require a reason:
+
+```console
+garnish --data-dir .garnish-state task pin TASK_ID --adapter codex --provider openai --account primary --reason "preserve session continuity"
+garnish --data-dir .garnish-state task unpin TASK_ID --reason "continuity no longer required"
+garnish --data-dir .garnish-state scheduler tick --instance local-1 --generation 1 --candidate codex:openai:primary --candidate claude:anthropic:max
+```
+
+`TASK_ID` is a placeholder for the ID returned by `task add`. Candidate values are real configured identities, not fallback API permissions. A pin cannot bypass capability, health, policy, quota, or concurrency gates.
+
+Schema 11 adds the current CodexBar usage JSON contract, append-only quota observations, five-minute freshness by default, and atomic scheduler reservations. A real refresh may read provider authentication state and access the network, but it does not submit an agent task. It is always an explicit command:
+
+```console
+brew install --cask codexbar
+codexbar --version
+garnish --data-dir .garnish-state quota refresh-codexbar --provider codex --account default --source auto --valid-seconds 300
+garnish --data-dir .garnish-state quota status
+garnish --data-dir .garnish-state quota reservations
+```
+
+After the macOS cask install, open CodexBar and choose **Preferences → Advanced → Install CLI** before running `codexbar --version`. These commands contain no placeholders: `default` is the literal Garnish label for CodexBar's current/default account. To select a named CodexBar account, add `--collector-account ACCOUNT_LABEL`; `ACCOUNT_LABEL` is then a placeholder for the exact label in CodexBar configuration. Unknown, malformed, ambiguous, or stale provider evidence fails closed. Raw quota JSON is not retained; Garnish stores normalized surfaces and a SHA-256 payload digest. On Linux, the current official CLI formula is `brew install steipete/tap/codexbar`.
 
 Operational controls are durable and emit bounded JSON. `pause` stops new claims; `emergency-stop` also releases unstarted claims and requests graceful cancellation of active runs. Neither command claims a process has stopped until its supervisor records termination evidence.
 

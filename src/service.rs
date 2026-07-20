@@ -8,16 +8,21 @@ use crate::{
         AgentCapabilityProbe, AgentCapabilityStatus, BackupRecord, CalendarException,
         CalendarProfile, CheckpointAction, CircuitBreaker, ControlState, DayKind,
         EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project, ProjectLink,
-        QuotaSurface, RetryPlan, RetryState, RouteCandidate, RouteDecision, RunCheckpoint,
-        RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerClaimRejection,
-        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
-        SchedulerTick, SchedulerWake, Task, TaskStatus,
+        QuotaReservation, QuotaSurface, RetryPlan, RetryState, RouteCandidate, RouteDecision,
+        RouteTarget, RunCheckpoint, RunSummary, ScheduleEvaluation, SchedulerClaim,
+        SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
+        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
     policy::{EffectivePolicy, PolicyDecision},
     process::{ExitClassification, ProcessOutcome},
     projections::Projector,
+    quota::collect_codexbar,
+    routing::{
+        AdapterHealth, CandidateIdentity, ProbeFreshness, RoutingCandidateInput, RoutingRequest,
+        select_candidate,
+    },
     schedule,
 };
 use anyhow::{Result, bail};
@@ -77,7 +82,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 8,
+            schema_version: 11,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -257,6 +262,34 @@ impl Garnish {
         self.db.task(id)
     }
 
+    pub fn set_task_route_pin(
+        &mut self,
+        task_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        reason: &str,
+    ) -> Result<Task> {
+        let task = self.db.set_task_route_pin(
+            task_id,
+            Some((adapter, provider, account)),
+            reason,
+            Utc::now(),
+        )?;
+        let project = self.db.project(&task.project_id)?;
+        self.refresh_tasks(&project)?;
+        Ok(task)
+    }
+
+    pub fn clear_task_route_pin(&mut self, task_id: &str, reason: &str) -> Result<Task> {
+        let task = self
+            .db
+            .set_task_route_pin(task_id, None, reason, Utc::now())?;
+        let project = self.db.project(&task.project_id)?;
+        self.refresh_tasks(&project)?;
+        Ok(task)
+    }
+
     pub fn add_dependency(&mut self, task_id: &str, depends_on_task_id: &str) -> Result<Task> {
         let task = self.db.add_dependency(task_id, depends_on_task_id)?;
         let project = self.db.project(&task.project_id)?;
@@ -330,6 +363,34 @@ impl Garnish {
 
     pub fn quota(&self) -> Result<Vec<QuotaSurface>> {
         self.db.list_quota()
+    }
+
+    pub fn quota_reservations(&self) -> Result<Vec<QuotaReservation>> {
+        self.db.list_quota_reservations()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn refresh_quota_codexbar(
+        &mut self,
+        executable: Option<&Path>,
+        provider: &str,
+        account: &str,
+        collector_account: Option<&str>,
+        source: &str,
+        reserve_percent: f64,
+        valid_for: std::time::Duration,
+    ) -> Result<Vec<QuotaSurface>> {
+        let observations = collect_codexbar(
+            executable,
+            &self.data_dir,
+            provider,
+            account,
+            collector_account,
+            source,
+            reserve_percent,
+            valid_for,
+        )?;
+        self.db.record_quota_observations(&observations)
     }
 
     pub fn retry_state(&self, task_id: &str) -> Result<RetryState> {
@@ -439,9 +500,13 @@ impl Garnish {
             );
         let quota_available = !quota.is_empty()
             && quota.iter().all(|surface| {
-                surface
-                    .effective_remaining_percent
-                    .is_some_and(|remaining| remaining >= surface.reserve_percent + forecast)
+                (surface.override_reason.is_some()
+                    || surface
+                        .valid_until
+                        .is_none_or(|valid_until| valid_until > now))
+                    && surface
+                        .effective_remaining_percent
+                        .is_some_and(|remaining| remaining >= surface.reserve_percent + forecast)
             });
         let near_quota_boundary = quota_available
             && quota.iter().any(|surface| {
@@ -456,7 +521,17 @@ impl Garnish {
         } else if !policy_allowed {
             (CheckpointAction::Pause, "policy.revoked", None)
         } else if !quota_available {
-            (CheckpointAction::Pause, "quota.insufficient", None)
+            let reason = if quota.iter().any(|surface| {
+                surface.override_reason.is_none()
+                    && surface
+                        .valid_until
+                        .is_some_and(|valid_until| valid_until <= now)
+            }) {
+                "quota.stale"
+            } else {
+                "quota.insufficient"
+            };
+            (CheckpointAction::Pause, reason, None)
         } else if near_quota_boundary {
             (
                 CheckpointAction::ShortenCheckpoint,
@@ -584,7 +659,7 @@ impl Garnish {
         provider: &str,
         account: &str,
     ) -> Result<RouteDecision> {
-        self.route_task_at_mode(task_id, adapter, provider, account, Utc::now(), true)
+        self.route_task_at_mode(task_id, adapter, provider, account, Utc::now(), true, true)
     }
 
     pub fn route_task_at(
@@ -595,9 +670,10 @@ impl Garnish {
         account: &str,
         now: DateTime<Utc>,
     ) -> Result<RouteDecision> {
-        self.route_task_at_mode(task_id, adapter, provider, account, now, true)
+        self.route_task_at_mode(task_id, adapter, provider, account, now, true, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn route_task_at_mode(
         &mut self,
         task_id: &str,
@@ -606,6 +682,7 @@ impl Garnish {
         account: &str,
         now: DateTime<Utc>,
         claim_circuit_probe: bool,
+        record_decision: bool,
     ) -> Result<RouteDecision> {
         let task = self.db.task(task_id)?;
         if !matches!(task.status, TaskStatus::Ready | TaskStatus::Draft) {
@@ -615,6 +692,19 @@ impl Garnish {
             );
         }
         let dependencies_allowed = self.db.dependencies_satisfied(task_id)?;
+        let pin_allowed = match (
+            task.pinned_adapter.as_deref(),
+            task.pinned_provider.as_deref(),
+            task.pinned_account.as_deref(),
+        ) {
+            (None, None, None) => true,
+            (Some(pinned_adapter), Some(pinned_provider), Some(pinned_account)) => {
+                pinned_adapter == adapter
+                    && pinned_provider == provider
+                    && pinned_account == account
+            }
+            _ => bail!("task manual pin is incomplete in canonical state"),
+        };
         let project = self.db.project(&task.project_id)?;
         let project_allowed = !project.scheduler_paused;
         let control = self.db.control_state()?;
@@ -646,6 +736,21 @@ impl Garnish {
                 self.policy.unknown_quota_unattended,
                 "quota.unavailable",
                 "no quota surfaces are available for the selected account".to_owned(),
+            )
+        } else if let Some(surface) = quota.iter().find(|surface| {
+            surface.override_reason.is_none()
+                && surface
+                    .valid_until
+                    .is_some_and(|valid_until| valid_until <= now)
+        }) {
+            (
+                false,
+                "quota.stale",
+                format!(
+                    "quota_stale: {} expired at {}",
+                    surface.surface,
+                    surface.valid_until.expect("checked as present")
+                ),
             )
         } else if let Some(surface) = quota.iter().find(|surface| {
             surface.effective_remaining_percent.is_none()
@@ -714,6 +819,7 @@ impl Garnish {
             && operations_allowed
             && project_allowed
             && dependencies_allowed
+            && pin_allowed
             && schedule.eligible
             && deadline_allowed
             && retry_allowed
@@ -729,6 +835,7 @@ impl Garnish {
             && operations_allowed
             && project_allowed
             && dependencies_allowed
+            && pin_allowed
             && deadline_allowed
             && retry_allowed
             && circuit_allowed
@@ -766,6 +873,16 @@ impl Garnish {
             (
                 "dependency.incomplete".to_owned(),
                 "dependency.incomplete: one or more prerequisite tasks are not completed".into(),
+            )
+        } else if !pin_allowed {
+            (
+                "manual_pin.mismatch".to_owned(),
+                format!(
+                    "manual_pin.mismatch: task is pinned to {}:{}:{}",
+                    task.pinned_adapter.as_deref().unwrap_or("invalid"),
+                    task.pinned_provider.as_deref().unwrap_or("invalid"),
+                    task.pinned_account.as_deref().unwrap_or("invalid")
+                ),
             )
         } else if !schedule.eligible {
             (
@@ -806,6 +923,8 @@ impl Garnish {
             ("route.allowed".to_owned(), quota_reason)
         };
         let selected_adapter = allowed.then(|| adapter.to_owned());
+        let selected_provider = allowed.then(|| provider.to_owned());
+        let selected_account = allowed.then(|| account.to_owned());
         let quota_wake = (!quota_allowed)
             .then(|| quota.iter().filter_map(|surface| surface.reset_at).max())
             .flatten();
@@ -825,8 +944,10 @@ impl Garnish {
             id: Ulid::new().to_string(),
             task_id: task.id,
             selected_adapter,
+            selected_provider,
+            selected_account,
             allowed,
-            reason_code,
+            reason_code: reason_code.clone(),
             reason: reason.clone(),
             required_headroom_percent: required_headroom,
             candidates: vec![RouteCandidate {
@@ -834,9 +955,12 @@ impl Garnish {
                 provider: provider.to_owned(),
                 account: account.to_owned(),
                 allowed,
+                reason_code: reason_code.clone(),
                 filter_reason: reason.clone(),
                 forecast_percent: forecast,
                 minimum_effective_remaining_percent,
+                score: None,
+                score_components: None,
             }],
             next_wake_at,
             schedule: Some(schedule),
@@ -844,7 +968,9 @@ impl Garnish {
             policy_hash: self.policy.hash(),
             created_at: now,
         };
-        self.db.record_route(&decision)?;
+        if record_decision {
+            self.db.record_route(&decision)?;
+        }
         Ok(decision)
     }
 
@@ -863,8 +989,9 @@ impl Garnish {
             .collect::<Vec<_>>();
         let mut decisions = Vec::with_capacity(ready.len());
         for task in ready {
-            decisions
-                .push(self.route_task_at_mode(&task.id, adapter, provider, account, now, false)?);
+            decisions.push(
+                self.route_task_at_mode(&task.id, adapter, provider, account, now, false, true)?,
+            );
         }
         Ok(SchedulerPreview {
             evaluated_at: now,
@@ -958,6 +1085,15 @@ impl Garnish {
         if config.max_ticks == Some(0) {
             bail!("scheduler max ticks must be greater than zero when specified");
         }
+        let route_targets = if config.route_candidates.is_empty() {
+            vec![RouteTarget {
+                adapter: config.adapter.clone(),
+                provider: config.provider.clone(),
+                account: config.account.clone(),
+            }]
+        } else {
+            config.route_candidates.clone()
+        };
 
         let started_at = now();
         self.register_scheduler(
@@ -996,12 +1132,10 @@ impl Garnish {
                 )?;
                 scheduler_claims_recovered += self.recover_scheduler(tick_at)?.len();
                 run_leases_recovered += self.recover_at(tick_at)?.len();
-                let tick = self.scheduler_tick_with_limits_at(
+                let tick = self.scheduler_tick_candidates_with_limits_at(
                     &config.instance_id,
                     leader.generation,
-                    &config.adapter,
-                    &config.provider,
-                    &config.account,
+                    &route_targets,
                     tick_at,
                     config.max_active_claims,
                     config.max_active_per_adapter,
@@ -1027,11 +1161,19 @@ impl Garnish {
                                     claim.id
                                 )
                             })?;
+                        let selected_adapter = route.selected_adapter.clone().ok_or_else(|| {
+                            anyhow::anyhow!("allowed route has no selected adapter")
+                        })?;
+                        if !selected_adapter.starts_with("fake") {
+                            bail!(
+                                "--execute-fake cannot execute selected real adapter {selected_adapter}"
+                            );
+                        }
                         self.run_scheduler_claim(
                             claim,
                             &config.instance_id,
                             leader.generation,
-                            &config.adapter,
+                            &selected_adapter,
                             route,
                             tick_at,
                         )?;
@@ -1070,6 +1212,262 @@ impl Garnish {
                 shutdown_reason,
             }),
         }
+    }
+
+    fn route_task_candidates_at(
+        &mut self,
+        task_id: &str,
+        route_targets: &[RouteTarget],
+        now: DateTime<Utc>,
+    ) -> Result<(RouteDecision, Option<RouteTarget>)> {
+        let task = self.db.task(task_id)?;
+        let mut targets = route_targets.to_vec();
+        for target in &targets {
+            if [&target.adapter, &target.provider, &target.account]
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
+            {
+                bail!("route candidate adapter, provider, and account must be non-empty names");
+            }
+        }
+        targets.sort_by(|left, right| {
+            (&left.adapter, &left.provider, &left.account).cmp(&(
+                &right.adapter,
+                &right.provider,
+                &right.account,
+            ))
+        });
+        targets.dedup();
+        if targets.is_empty() {
+            bail!("scheduler requires at least one route candidate");
+        }
+
+        let mut preliminary = Vec::with_capacity(targets.len());
+        for target in &targets {
+            preliminary.push((
+                target.clone(),
+                self.route_task_at_mode(
+                    task_id,
+                    &target.adapter,
+                    &target.provider,
+                    &target.account,
+                    now,
+                    false,
+                    false,
+                )?,
+            ));
+        }
+
+        let allowed_targets = preliminary
+            .iter()
+            .filter(|(_, decision)| decision.allowed)
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        if allowed_targets.is_empty() {
+            let mut decision = preliminary[0].1.clone();
+            let pin = task_route_pin(&task)?;
+            if pin.as_ref().is_some_and(|pin| {
+                !targets.iter().any(|target| {
+                    target.adapter == pin.adapter
+                        && target.provider == pin.provider
+                        && target.account == pin.account
+                })
+            }) {
+                decision.reason_code = "manual_pin.unavailable".into();
+                decision.reason =
+                    "manual_pin.unavailable: the pinned route is not configured for this scheduler"
+                        .into();
+            }
+            decision.selected_adapter = None;
+            decision.selected_provider = None;
+            decision.selected_account = None;
+            decision.allowed = false;
+            decision.candidates = preliminary
+                .iter()
+                .map(|(_, candidate)| candidate.candidates[0].clone())
+                .collect();
+            self.db.record_route(&decision)?;
+            return Ok((decision, None));
+        }
+
+        let quota = self.db.list_quota()?;
+        let status = self
+            .agent_capability_status_at(now)?
+            .into_iter()
+            .map(|entry| (entry.adapter.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut inputs = Vec::with_capacity(allowed_targets.len());
+        for target in &allowed_targets {
+            let (freshness, health, capabilities) = if target.adapter.starts_with("fake") {
+                let probe = AgentKind::Fake.probe();
+                (
+                    ProbeFreshness::Fresh,
+                    AdapterHealth::Healthy,
+                    probe.capabilities,
+                )
+            } else if let Some(entry) = status.get(&target.adapter) {
+                let freshness = match entry.freshness.as_str() {
+                    "fresh" => ProbeFreshness::Fresh,
+                    "stale" => ProbeFreshness::Stale,
+                    _ => ProbeFreshness::Unknown,
+                };
+                let health = adapter_health(&entry.health);
+                let capabilities = entry
+                    .probe
+                    .as_ref()
+                    .map(|probe| probe.capabilities.clone())
+                    .unwrap_or_default();
+                (freshness, health, capabilities)
+            } else {
+                (ProbeFreshness::Unknown, AdapterHealth::Unknown, vec![])
+            };
+            let surfaces = quota
+                .iter()
+                .filter(|surface| {
+                    surface.provider == target.provider && surface.account == target.account
+                })
+                .collect::<Vec<_>>();
+            let remaining_percent = surfaces
+                .iter()
+                .filter_map(|surface| surface.effective_remaining_percent)
+                .min_by(|left, right| left.total_cmp(right));
+            let reserve_percent = surfaces
+                .iter()
+                .map(|surface| surface.reserve_percent)
+                .fold(self.policy.reserve_percent, f64::max);
+            inputs.push(RoutingCandidateInput {
+                identity: CandidateIdentity {
+                    adapter: target.adapter.clone(),
+                    provider: target.provider.clone(),
+                    account: target.account.clone(),
+                },
+                freshness,
+                health,
+                capabilities,
+                remaining_percent,
+                reserve_percent,
+                historical_success_percent: None,
+                continuity: false,
+                preference: 0.0,
+            });
+        }
+        let selection = select_candidate(
+            &RoutingRequest {
+                required_capabilities: task.required_capabilities.clone(),
+                forecast_percent: forecast_percent(&task),
+                pin: task_route_pin(&task)?.map(|pin| CandidateIdentity {
+                    adapter: pin.adapter,
+                    provider: pin.provider,
+                    account: pin.account,
+                }),
+            },
+            &inputs,
+        )?;
+        let evaluation_by_identity = selection
+            .evaluations
+            .iter()
+            .map(|evaluation| {
+                (
+                    (
+                        evaluation.identity.adapter.clone(),
+                        evaluation.identity.provider.clone(),
+                        evaluation.identity.account.clone(),
+                    ),
+                    evaluation,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let selected_target = selection.selected.as_ref().and_then(|selected| {
+            targets
+                .iter()
+                .find(|target| {
+                    target.adapter == selected.adapter
+                        && target.provider == selected.provider
+                        && target.account == selected.account
+                })
+                .cloned()
+        });
+        let mut decision = if let Some(target) = selected_target.as_ref() {
+            self.route_task_at_mode(
+                task_id,
+                &target.adapter,
+                &target.provider,
+                &target.account,
+                now,
+                true,
+                false,
+            )?
+        } else {
+            let mut denied = preliminary
+                .iter()
+                .find(|(_, decision)| decision.allowed)
+                .expect("allowed targets came from preliminary decisions")
+                .1
+                .clone();
+            denied.allowed = false;
+            denied.selected_adapter = None;
+            denied.selected_provider = None;
+            denied.selected_account = None;
+            denied.reason_code = selection.reason_code.clone();
+            denied.reason = format!(
+                "{}: no configured route candidate passed capability evidence and quota scoring",
+                selection.reason_code
+            );
+            denied
+        };
+        decision.candidates = preliminary
+            .iter()
+            .map(|(target, preliminary_decision)| {
+                let key = (
+                    target.adapter.clone(),
+                    target.provider.clone(),
+                    target.account.clone(),
+                );
+                if let Some(evaluation) = evaluation_by_identity.get(&key) {
+                    let score_components = evaluation.score.as_ref().map(|score| {
+                        serde_json::json!({
+                            "quota_margin": score.quota_margin,
+                            "reliability": score.reliability,
+                            "continuity_bonus": score.continuity_bonus,
+                            "preference": score.preference,
+                            "total": score.total,
+                        })
+                    });
+                    RouteCandidate {
+                        adapter: target.adapter.clone(),
+                        provider: target.provider.clone(),
+                        account: target.account.clone(),
+                        allowed: evaluation.allowed,
+                        reason_code: evaluation.reason_code.clone(),
+                        filter_reason: evaluation.reason.clone(),
+                        forecast_percent: forecast_percent(&task),
+                        minimum_effective_remaining_percent: preliminary_decision.candidates[0]
+                            .minimum_effective_remaining_percent,
+                        score: evaluation.score.as_ref().map(|score| score.total),
+                        score_components,
+                    }
+                } else {
+                    preliminary_decision.candidates[0].clone()
+                }
+            })
+            .collect();
+        if !decision.allowed
+            && let Some(target) = selected_target.as_ref()
+            && let Some(candidate) = decision.candidates.iter_mut().find(|candidate| {
+                candidate.adapter == target.adapter
+                    && candidate.provider == target.provider
+                    && candidate.account == target.account
+            })
+        {
+            candidate.allowed = false;
+            candidate.reason_code = decision.reason_code.clone();
+            candidate.filter_reason = decision.reason.clone();
+            candidate.score = None;
+            candidate.score_components = None;
+        }
+        self.db.record_route(&decision)?;
+        let selected_target = decision.allowed.then_some(selected_target).flatten();
+        Ok((decision, selected_target))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1112,6 +1510,37 @@ impl Garnish {
         max_active_per_account: usize,
         claim_ttl: std::time::Duration,
     ) -> Result<SchedulerTick> {
+        self.scheduler_tick_candidates_with_limits_at(
+            instance_id,
+            leader_generation,
+            &[RouteTarget {
+                adapter: adapter.into(),
+                provider: provider.into(),
+                account: account.into(),
+            }],
+            now,
+            max_active_claims,
+            max_active_per_adapter,
+            max_active_per_account,
+            claim_ttl,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scheduler_tick_candidates_with_limits_at(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        route_targets: &[RouteTarget],
+        now: DateTime<Utc>,
+        max_active_claims: usize,
+        max_active_per_adapter: usize,
+        max_active_per_account: usize,
+        claim_ttl: std::time::Duration,
+    ) -> Result<SchedulerTick> {
+        if route_targets.is_empty() {
+            bail!("scheduler requires at least one route candidate");
+        }
         self.db.recover_expired_scheduler_claims(now)?;
         let ready = self
             .db
@@ -1122,7 +1551,8 @@ impl Garnish {
         let mut decisions = Vec::with_capacity(ready.len());
         let mut claims: Vec<SchedulerClaim> = Vec::new();
         for task in ready {
-            let decision = self.route_task_at(&task.id, adapter, provider, account, now)?;
+            let (decision, selected_target) =
+                self.route_task_candidates_at(&task.id, route_targets, now)?;
             if !decision.allowed {
                 self.db.record_scheduler_wake(
                     &task.id,
@@ -1137,6 +1567,9 @@ impl Garnish {
                 decisions.push(decision);
                 continue;
             }
+            let selected_target = selected_target.ok_or_else(|| {
+                anyhow::anyhow!("allowed multi-candidate route has no selected target")
+            })?;
             match self.db.claim_task_for_scheduler_with_route_limits(
                 instance_id,
                 leader_generation,
@@ -1147,11 +1580,12 @@ impl Garnish {
                 max_active_claims,
                 Some(&decision.id),
                 &[],
-                adapter,
-                provider,
-                account,
+                &selected_target.adapter,
+                &selected_target.provider,
+                &selected_target.account,
                 max_active_per_adapter,
                 max_active_per_account,
+                forecast_percent(&task),
             ) {
                 Ok(claim) => claims.push(claim),
                 Err(error) => {
@@ -1641,6 +2075,32 @@ fn forecast_percent(task: &Task) -> f64 {
     (baseline * (1.0 + task.uncertainty_percent as f64 / 100.0)).clamp(1.0, 50.0)
 }
 
+fn task_route_pin(task: &Task) -> Result<Option<RouteTarget>> {
+    match (
+        task.pinned_adapter.as_ref(),
+        task.pinned_provider.as_ref(),
+        task.pinned_account.as_ref(),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(adapter), Some(provider), Some(account)) => Ok(Some(RouteTarget {
+            adapter: adapter.clone(),
+            provider: provider.clone(),
+            account: account.clone(),
+        })),
+        _ => bail!("task manual pin is incomplete in canonical state"),
+    }
+}
+
+fn adapter_health(value: &str) -> AdapterHealth {
+    match value {
+        "healthy" => AdapterHealth::Healthy,
+        "missing" => AdapterHealth::Missing,
+        "unsupported" => AdapterHealth::Unsupported,
+        "unhealthy" => AdapterHealth::Unhealthy,
+        _ => AdapterHealth::Unknown,
+    }
+}
+
 fn evaluate_adapter_capabilities(adapter: &str, required: &[String]) -> (bool, String) {
     if required.is_empty() {
         return (true, "no task-specific capabilities are required".into());
@@ -1855,6 +2315,9 @@ mod tests {
             day_affinity: crate::domain::DayAffinity::Both,
             deadline_at: None,
             required_capabilities: vec![],
+            pinned_adapter: None,
+            pinned_provider: None,
+            pinned_account: None,
             fake_write_path: Some("result.txt".into()),
             fake_write_content: Some("done\n".into()),
         }
@@ -1865,6 +2328,8 @@ mod tests {
             id: Ulid::new().to_string(),
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
+            selected_provider: Some("fake".into()),
+            selected_account: Some("test".into()),
             allowed: true,
             reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
@@ -1978,6 +2443,55 @@ mod tests {
     }
 
     #[test]
+    fn stale_provider_quota_fails_closed_but_a_live_override_remains_explicit() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        let observed_at = Utc::now() - Duration::minutes(10);
+        garnish
+            .db
+            .record_quota_observations(&[crate::quota::QuotaObservation {
+                provider: "fake".into(),
+                account: "test".into(),
+                surface: "five_hour".into(),
+                remaining_percent: 90.0,
+                reserve_percent: 20.0,
+                reset_at: None,
+                source: "codexbar:oauth".into(),
+                confidence: "provider_reported".into(),
+                observed_at,
+                valid_until: observed_at + Duration::minutes(5),
+                collector_contract: "codexbar-usage-json-v1".into(),
+                provider_version: Some("fixture".into()),
+                payload_sha256: "c".repeat(64),
+            }])
+            .unwrap();
+        let stale = garnish
+            .route_task(&task.id, "fake", "fake", "test")
+            .unwrap();
+        assert!(!stale.allowed);
+        assert_eq!(stale.reason_code, "quota.stale");
+
+        garnish
+            .override_quota(
+                "fake",
+                "test",
+                "five_hour",
+                90.0,
+                "fresh user observation",
+                Some(Utc::now() + Duration::minutes(5)),
+            )
+            .unwrap();
+        let overridden = garnish
+            .route_task(&task.id, "fake", "fake", "test")
+            .unwrap();
+        assert!(overridden.allowed);
+    }
+
+    #[test]
     fn operational_pause_declines_routes_with_stable_reason() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("source");
@@ -2008,6 +2522,61 @@ mod tests {
         garnish.resume_operations("maintenance complete").unwrap();
         assert!(
             garnish
+                .route_task(&task.id, "fake", "fake", "test")
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn durable_manual_pin_rejects_mismatch_without_bypassing_route_gates() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let data_dir = dir.path().join("data");
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let pinned = garnish
+            .set_task_route_pin(
+                &task.id,
+                "fake-secondary",
+                "fake",
+                "test",
+                "keep continuity",
+            )
+            .unwrap();
+        assert_eq!(pinned.pinned_adapter.as_deref(), Some("fake-secondary"));
+        drop(garnish);
+
+        let mut reopened = Garnish::open(&data_dir).unwrap();
+        let mismatch = reopened
+            .route_task(&task.id, "fake", "fake", "test")
+            .unwrap();
+        assert!(!mismatch.allowed);
+        assert_eq!(mismatch.reason_code, "manual_pin.mismatch");
+        let allowed = reopened
+            .route_task(&task.id, "fake-secondary", "fake", "test")
+            .unwrap();
+        assert!(allowed.allowed);
+        let cleared = reopened
+            .clear_task_route_pin(&task.id, "continuity no longer required")
+            .unwrap();
+        assert!(cleared.pinned_adapter.is_none());
+        assert!(
+            reopened
                 .route_task(&task.id, "fake", "fake", "test")
                 .unwrap()
                 .allowed
@@ -2575,6 +3144,136 @@ mod tests {
         assert_eq!(wake.reason_code, "scheduler.resource_locked");
     }
 
+    #[test]
+    fn scheduler_selects_scored_candidate_and_honors_durable_exact_pin() {
+        let dir = tempdir().unwrap();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let unpinned_root = dir.path().join("unpinned");
+        let pinned_root = dir.path().join("pinned");
+        let unavailable_root = dir.path().join("unavailable");
+        for root in [&unpinned_root, &pinned_root, &unavailable_root] {
+            fixture_repo(root);
+        }
+        let unpinned_project = garnish
+            .add_project("unpinned", "Unpinned", &unpinned_root)
+            .unwrap();
+        let pinned_project = garnish
+            .add_project("pinned", "Pinned", &pinned_root)
+            .unwrap();
+        let unavailable_project = garnish
+            .add_project("unavailable", "Unavailable", &unavailable_root)
+            .unwrap();
+        let unpinned = garnish.add_task(&task(unpinned_project.id)).unwrap();
+        let pinned = garnish.add_task(&task(pinned_project.id)).unwrap();
+        let unavailable = garnish.add_task(&task(unavailable_project.id)).unwrap();
+        garnish
+            .set_task_route_pin(
+                &pinned.id,
+                "fake-low",
+                "fake",
+                "low",
+                "preserve account continuity",
+            )
+            .unwrap();
+        garnish
+            .set_task_route_pin(
+                &unavailable.id,
+                "fake-missing",
+                "fake",
+                "missing",
+                "operator pin",
+            )
+            .unwrap();
+        for (account, remaining) in [("low", 40.0), ("high", 90.0)] {
+            garnish
+                .set_quota(
+                    "fake",
+                    account,
+                    "five_hour",
+                    Some(remaining),
+                    20.0,
+                    None,
+                    "fixture",
+                    None,
+                )
+                .unwrap();
+        }
+        garnish
+            .register_scheduler("multi-route", "fixture", 1, now)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("multi-route", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let targets = vec![
+            RouteTarget {
+                adapter: "fake-low".into(),
+                provider: "fake".into(),
+                account: "low".into(),
+            },
+            RouteTarget {
+                adapter: "fake-high".into(),
+                provider: "fake".into(),
+                account: "high".into(),
+            },
+        ];
+        let tick = garnish
+            .scheduler_tick_candidates_with_limits_at(
+                "multi-route",
+                leader.generation,
+                &targets,
+                now,
+                3,
+                3,
+                3,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(tick.claims.len(), 2);
+        let unpinned_decision = tick
+            .decisions
+            .iter()
+            .find(|decision| decision.task_id == unpinned.id)
+            .unwrap();
+        assert_eq!(
+            unpinned_decision.selected_adapter.as_deref(),
+            Some("fake-high")
+        );
+        assert_eq!(unpinned_decision.selected_account.as_deref(), Some("high"));
+        assert_eq!(unpinned_decision.candidates.len(), 2);
+        assert!(
+            unpinned_decision
+                .candidates
+                .iter()
+                .all(|candidate| candidate.score.is_some())
+        );
+        let pinned_decision = tick
+            .decisions
+            .iter()
+            .find(|decision| decision.task_id == pinned.id)
+            .unwrap();
+        assert_eq!(
+            pinned_decision.selected_adapter.as_deref(),
+            Some("fake-low")
+        );
+        assert_eq!(pinned_decision.selected_account.as_deref(), Some("low"));
+        let unavailable_decision = tick
+            .decisions
+            .iter()
+            .find(|decision| decision.task_id == unavailable.id)
+            .unwrap();
+        assert!(!unavailable_decision.allowed);
+        assert_eq!(unavailable_decision.reason_code, "manual_pin.unavailable");
+        let wake = garnish
+            .scheduler_wakes()
+            .unwrap()
+            .into_iter()
+            .find(|wake| wake.task_id == unavailable.id)
+            .unwrap();
+        assert_eq!(wake.reason_code, "manual_pin.unavailable");
+    }
+
     #[cfg(unix)]
     #[test]
     fn supervised_invocation_acknowledges_durable_cancellation_after_process_exit() {
@@ -2660,6 +3359,7 @@ mod tests {
             adapter: "fake".into(),
             provider: "fake".into(),
             account: "test".into(),
+            route_candidates: vec![],
             max_active_claims: 1,
             max_active_per_adapter: 1,
             max_active_per_account: 1,
@@ -2718,6 +3418,7 @@ mod tests {
             adapter: "fake".into(),
             provider: "fake".into(),
             account: "test".into(),
+            route_candidates: vec![],
             max_active_claims: 1,
             max_active_per_adapter: 1,
             max_active_per_account: 1,

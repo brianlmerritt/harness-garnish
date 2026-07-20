@@ -2,6 +2,56 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+#[test]
+fn quota_refresh_codexbar_uses_bounded_machine_json_contract() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let dir = tempdir().unwrap();
+    let executable = dir.path().join("fake-codexbar");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+printf '%s\n' '{"provider":"codex","version":"0.144.6","source":"oauth","usage":{"primary":{"usedPercent":28,"windowMinutes":300,"resetsAt":"2026-07-20T19:15:00Z"},"secondary":{"usedPercent":59,"windowMinutes":10080,"resetsAt":"2026-07-25T17:00:00Z"},"tertiary":null,"updatedAt":"2026-07-20T18:10:22Z"}}'
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&executable, permissions).unwrap();
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "quota",
+            "refresh-codexbar",
+            "--provider",
+            "codex",
+            "--account",
+            "personal",
+            "--source",
+            "oauth",
+            "--executable",
+            executable.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let surfaces = value.as_array().unwrap();
+    assert_eq!(surfaces.len(), 2);
+    assert_eq!(surfaces[0]["surface"], "five_hour");
+    assert_eq!(surfaces[0]["observed_remaining_percent"], 72.0);
+    assert_eq!(surfaces[0]["confidence"], "provider_reported");
+    assert_eq!(surfaces[0]["collector_contract"], "codexbar-usage-json-v1");
+    assert_eq!(surfaces[0]["payload_sha256"].as_str().unwrap().len(), 64);
+}
+
 #[test]
 fn cli_success_and_failure_are_stable_json() {
     let dir = tempdir().unwrap();
@@ -189,7 +239,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 8);
+    assert_eq!(value["schema_version"], 11);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

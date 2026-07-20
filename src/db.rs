@@ -2,10 +2,11 @@ use crate::{
     domain::{
         AgentCapabilityProbe, BackupRecord, CalendarException, CalendarProfile, CheckpointAction,
         CircuitBreaker, ClaimedRunStart, ControlState, DayKind, EmergencyStopResult,
-        FailureCategory, LocalNotification, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan,
-        RetryState, RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerClaimRejection,
-        SchedulerLeader, SchedulerWake, Task, TaskStatus,
+        FailureCategory, LocalNotification, NewTask, Project, ProjectLink, QuotaReservation,
+        QuotaSurface, RetryPlan, RetryState, RouteDecision, RunCheckpoint, SchedulerClaim,
+        SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
     },
+    quota::QuotaObservation,
     schedule,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,7 +22,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 11;
 
 pub struct Database {
     path: PathBuf,
@@ -226,6 +227,7 @@ impl Database {
                  WHERE claim_id = ?1 AND released_at IS NULL",
                 params![claim_id, now.to_rfc3339()],
             )?;
+            release_quota_reservations_for_claim_tx(&tx, claim_id, now, "emergency_stop")?;
         }
         append_event_tx(
             &tx,
@@ -448,6 +450,15 @@ impl Database {
         }
         if current < 8 {
             tx.execute_batch(MIGRATION_8)?;
+        }
+        if current < 9 {
+            tx.execute_batch(MIGRATION_9)?;
+        }
+        if current < 10 {
+            tx.execute_batch(MIGRATION_10)?;
+        }
+        if current < 11 {
+            tx.execute_batch(MIGRATION_11)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1084,10 +1095,12 @@ impl Database {
         account: &str,
         max_active_per_adapter: usize,
         max_active_per_account: usize,
+        forecast_percent: f64,
     ) -> Result<SchedulerClaim> {
         if max_active_per_adapter == 0 || max_active_per_account == 0 {
             bail!("adapter and account concurrency limits must be greater than zero");
         }
+        validate_percentage(Some(forecast_percent), "forecast")?;
         self.claim_task_for_scheduler_inner(
             instance_id,
             leader_generation,
@@ -1104,6 +1117,7 @@ impl Database {
                 account,
                 max_active_per_adapter,
                 max_active_per_account,
+                forecast_percent,
             )),
         )
     }
@@ -1120,7 +1134,7 @@ impl Database {
         max_active_claims: usize,
         route_decision_id: Option<&str>,
         resources: &[(String, String)],
-        route_limits: Option<(&str, &str, &str, usize, usize)>,
+        route_limits: Option<(&str, &str, &str, usize, usize, f64)>,
     ) -> Result<SchedulerClaim> {
         if max_active_claims == 0 {
             bail!("scheduler concurrency limit must be greater than zero");
@@ -1197,7 +1211,9 @@ impl Database {
             ],
         )?;
         let mut resource_keys = Vec::new();
-        if let Some((adapter, provider, account, adapter_limit, account_limit)) = route_limits {
+        if let Some((adapter, provider, account, adapter_limit, account_limit, forecast_percent)) =
+            route_limits
+        {
             resource_keys.push(acquire_capacity_slot_tx(
                 &tx,
                 &claim_id,
@@ -1216,6 +1232,19 @@ impl Database {
                 now,
                 expires_at,
             )?);
+            if let Some(route_decision_id) = route_decision_id {
+                reserve_quota_tx(
+                    &tx,
+                    &claim_id,
+                    task_id,
+                    route_decision_id,
+                    provider,
+                    account,
+                    forecast_percent,
+                    now,
+                    expires_at,
+                )?;
+            }
         }
         let mut all_resources = vec![("project".to_owned(), project_id.clone())];
         all_resources.extend_from_slice(resources);
@@ -1314,6 +1343,14 @@ impl Database {
                  SELECT id FROM scheduler_claims
                  WHERE instance_id = ?1 AND leader_generation = ?2 AND status = 'active'
              ) AND released_at IS NULL",
+            params![instance_id, leader_generation, expires_at.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE quota_reservations SET expires_at = ?3
+             WHERE claim_id IN (
+                 SELECT id FROM scheduler_claims
+                 WHERE instance_id = ?1 AND leader_generation = ?2 AND status = 'active'
+             ) AND status = 'active'",
             params![instance_id, leader_generation, expires_at.to_rfc3339()],
         )?;
         tx.commit()?;
@@ -1441,6 +1478,12 @@ impl Database {
         if consumed != 1 {
             bail!("scheduler claim was already consumed: {claim_id}");
         }
+        tx.execute(
+            "UPDATE quota_reservations
+             SET status = 'running', run_id = ?2, expires_at = ?3
+             WHERE claim_id = ?1 AND status = 'active'",
+            params![claim_id, run_id, lease_expires_at.to_rfc3339()],
+        )?;
         append_event_tx(
             &tx,
             None,
@@ -1554,11 +1597,12 @@ impl Database {
                 id, project_id, title, goal, rationale, scope_json, non_scope_json,
                 acceptance_json, verification_argv_json, priority, risk_class,
                 estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
-                deadline_at, required_capabilities_json, fake_write_path, fake_write_content,
-                status, version, created_at, updated_at
+                deadline_at, required_capabilities_json, pinned_adapter, pinned_provider,
+                pinned_account, fake_write_path, fake_write_content, status, version,
+                created_at, updated_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, 'draft', 1, ?20, ?20
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, 'draft', 1, ?23, ?23
              )",
             params![
                 id,
@@ -1578,6 +1622,9 @@ impl Database {
                 new.day_affinity.to_string(),
                 new.deadline_at.map(|value| value.to_rfc3339()),
                 to_json(&new.required_capabilities)?,
+                new.pinned_adapter,
+                new.pinned_provider,
+                new.pinned_account,
                 new.fake_write_path,
                 new.fake_write_content,
                 now.to_rfc3339(),
@@ -1643,6 +1690,58 @@ impl Database {
         }
         tx.commit()?;
         self.task(&id)
+    }
+
+    pub fn set_task_route_pin(
+        &mut self,
+        task_id: &str,
+        pin: Option<(&str, &str, &str)>,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Task> {
+        if reason.trim().is_empty() {
+            bail!("changing a task route pin requires a reason");
+        }
+        let task = self.task(task_id)?;
+        if let Some((adapter, provider, account)) = pin
+            && [adapter, provider, account]
+                .iter()
+                .any(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
+        {
+            bail!("manual pin values must be non-empty and contain no whitespace");
+        }
+        let (adapter, provider, account) = pin
+            .map(|(adapter, provider, account)| (Some(adapter), Some(provider), Some(account)))
+            .unwrap_or((None, None, None));
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE tasks SET pinned_adapter = ?2, pinned_provider = ?3,
+                              pinned_account = ?4, version = version + 1, updated_at = ?5
+             WHERE id = ?1",
+            params![task.id, adapter, provider, account, now.to_rfc3339()],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&task.project_id),
+            Some(&task.id),
+            None,
+            if pin.is_some() {
+                "task.route_pinned"
+            } else {
+                "task.route_unpinned"
+            },
+            "user",
+            &serde_json::json!({
+                "adapter": adapter,
+                "provider": provider,
+                "account": account,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        self.task(&task.id)
     }
 
     pub fn add_dependency(&mut self, task_id: &str, depends_on_task_id: &str) -> Result<Task> {
@@ -1822,20 +1921,44 @@ impl Database {
         tx.execute(
             "INSERT INTO quota_surfaces(
                 id, provider, account, surface_key, observed_remaining_percent,
-                reserve_percent, reset_at, source, unknown_reason, observed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                reserve_percent, reset_at, source, unknown_reason, observed_at,
+                valid_until, confidence, collector_contract
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, 'user_reported', 'manual-v1')
              ON CONFLICT(provider, account, surface_key) DO UPDATE SET
                 observed_remaining_percent = excluded.observed_remaining_percent,
                 reserve_percent = excluded.reserve_percent,
                 reset_at = excluded.reset_at,
                 source = excluded.source,
                 unknown_reason = excluded.unknown_reason,
-                observed_at = excluded.observed_at",
+                observed_at = excluded.observed_at,
+                valid_until = NULL,
+                confidence = 'user_reported',
+                collector_contract = 'manual-v1',
+                provider_version = NULL,
+                payload_sha256 = NULL",
             params![
                 id,
                 provider,
                 account,
                 surface,
+                remaining_percent,
+                reserve_percent,
+                reset_at.map(|v| v.to_rfc3339()),
+                source,
+                unknown_reason,
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO quota_observations(
+                id, surface_id, observed_remaining_percent, reserve_percent, reset_at,
+                source, unknown_reason, observed_at, valid_until, confidence,
+                collector_contract, provider_version, payload_sha256
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, 'user_reported',
+                       'manual-v1', NULL, NULL)",
+            params![
+                Ulid::new().to_string(),
+                id,
                 remaining_percent,
                 reserve_percent,
                 reset_at.map(|v| v.to_rfc3339()),
@@ -1861,6 +1984,119 @@ impl Database {
         )?;
         tx.commit()?;
         self.quota_surface(provider, account, surface)
+    }
+
+    pub fn record_quota_observations(
+        &mut self,
+        observations: &[QuotaObservation],
+    ) -> Result<Vec<QuotaSurface>> {
+        if observations.is_empty() {
+            bail!("quota refresh produced no observations");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut identities = Vec::with_capacity(observations.len());
+        for observation in observations {
+            validate_percentage(Some(observation.remaining_percent), "remaining")?;
+            validate_percentage(Some(observation.reserve_percent), "reserve")?;
+            if observation.valid_until <= observation.observed_at {
+                bail!("quota observation validity must end after its observation time");
+            }
+            if observation.confidence != "provider_reported" {
+                bail!("unsupported quota observation confidence");
+            }
+            if observation.payload_sha256.len() != 64
+                || !observation
+                    .payload_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                bail!("quota payload digest must be a 64-character hexadecimal SHA-256");
+            }
+            let surface_id = format!(
+                "{}:{}:{}",
+                observation.provider, observation.account, observation.surface
+            );
+            tx.execute(
+                "INSERT INTO quota_surfaces(
+                    id, provider, account, surface_key, observed_remaining_percent,
+                    reserve_percent, reset_at, source, unknown_reason, observed_at,
+                    valid_until, confidence, collector_contract, provider_version, payload_sha256
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(provider, account, surface_key) DO UPDATE SET
+                    observed_remaining_percent = excluded.observed_remaining_percent,
+                    reserve_percent = excluded.reserve_percent,
+                    reset_at = excluded.reset_at,
+                    source = excluded.source,
+                    unknown_reason = NULL,
+                    observed_at = excluded.observed_at,
+                    valid_until = excluded.valid_until,
+                    confidence = excluded.confidence,
+                    collector_contract = excluded.collector_contract,
+                    provider_version = excluded.provider_version,
+                    payload_sha256 = excluded.payload_sha256",
+                params![
+                    surface_id,
+                    observation.provider,
+                    observation.account,
+                    observation.surface,
+                    observation.remaining_percent,
+                    observation.reserve_percent,
+                    observation.reset_at.map(|value| value.to_rfc3339()),
+                    observation.source,
+                    observation.observed_at.to_rfc3339(),
+                    observation.valid_until.to_rfc3339(),
+                    observation.confidence,
+                    observation.collector_contract,
+                    observation.provider_version,
+                    observation.payload_sha256,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO quota_observations(
+                    id, surface_id, observed_remaining_percent, reserve_percent, reset_at,
+                    source, unknown_reason, observed_at, valid_until, confidence,
+                    collector_contract, provider_version, payload_sha256
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    Ulid::new().to_string(),
+                    surface_id,
+                    observation.remaining_percent,
+                    observation.reserve_percent,
+                    observation.reset_at.map(|value| value.to_rfc3339()),
+                    observation.source,
+                    observation.observed_at.to_rfc3339(),
+                    observation.valid_until.to_rfc3339(),
+                    observation.confidence,
+                    observation.collector_contract,
+                    observation.provider_version,
+                    observation.payload_sha256,
+                ],
+            )?;
+            identities.push((
+                observation.provider.clone(),
+                observation.account.clone(),
+                observation.surface.clone(),
+            ));
+        }
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "quota.refreshed",
+            "quota_provider",
+            &serde_json::json!({
+                "collector_contract": observations[0].collector_contract,
+                "observations": observations,
+            }),
+        )?;
+        tx.commit()?;
+        identities
+            .into_iter()
+            .map(|(provider, account, surface)| self.quota_surface(&provider, &account, &surface))
+            .collect()
     }
 
     pub fn override_quota(
@@ -1939,17 +2175,46 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn list_quota_reservations(&self) -> Result<Vec<QuotaReservation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, surface_id, task_id, claim_id, run_id, reserved_percent,
+                    status, created_at, expires_at, released_at, release_reason
+             FROM quota_reservations ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let released_at: Option<String> = row.get(9)?;
+            Ok(QuotaReservation {
+                id: row.get(0)?,
+                surface_id: row.get(1)?,
+                task_id: row.get(2)?,
+                claim_id: row.get(3)?,
+                run_id: row.get(4)?,
+                reserved_percent: row.get(5)?,
+                status: row.get(6)?,
+                created_at: parse_time(row.get(7)?)?,
+                expires_at: parse_time(row.get(8)?)?,
+                released_at: released_at.map(parse_time).transpose()?,
+                release_reason: row.get(10)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn record_route(&mut self, decision: &RouteDecision) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO route_decisions(
-                id, task_id, selected_adapter, allowed, reason_code, reason,
+                id, task_id, selected_adapter, selected_provider, selected_account,
+                allowed, reason_code, reason,
                 required_headroom_percent, quota_json, schedule_json, policy_hash, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 decision.id,
                 decision.task_id,
                 decision.selected_adapter,
+                decision.selected_provider,
+                decision.selected_account,
                 decision.allowed,
                 decision.reason_code,
                 decision.reason,
@@ -2063,6 +2328,7 @@ impl Database {
              ) AND released_at IS NULL",
             params![run_id, now.to_rfc3339()],
         )?;
+        release_quota_reservations_for_run_tx(&tx, run_id, now, "run_finished")?;
         append_event_tx(
             &tx,
             None,
@@ -2342,6 +2608,11 @@ impl Database {
                 )?;
             }
         }
+        tx.execute(
+            "UPDATE quota_reservations SET expires_at = ?2
+             WHERE run_id = ?1 AND status = 'running'",
+            params![run_id, lease_expires_at.to_rfc3339()],
+        )?;
         append_event_tx(
             &tx,
             None,
@@ -2477,6 +2748,7 @@ impl Database {
                 params![run_id, now.to_rfc3339()],
             )?;
         }
+        release_quota_reservations_for_run_tx(&tx, run_id, now, "process_ended")?;
         append_event_tx(
             &tx,
             None,
@@ -2739,6 +3011,7 @@ impl Database {
                  ) AND released_at IS NULL",
                 params![run_id, now.to_rfc3339()],
             )?;
+            release_quota_reservations_for_run_tx(&tx, run_id, now, "run_orphaned")?;
             append_event_tx(
                 &tx,
                 None,
@@ -2903,6 +3176,162 @@ fn acquire_capacity_slot_tx(
     Err(rejection.into())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reserve_quota_tx(
+    tx: &Transaction<'_>,
+    claim_id: &str,
+    task_id: &str,
+    route_decision_id: &str,
+    provider: &str,
+    account: &str,
+    forecast_percent: f64,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<()> {
+    let route: (bool, Option<String>, Option<String>) = tx.query_row(
+        "SELECT allowed, selected_provider, selected_account
+         FROM route_decisions WHERE id = ?1 AND task_id = ?2",
+        params![route_decision_id, task_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if !route.0 || route.1.as_deref() != Some(provider) || route.2.as_deref() != Some(account) {
+        bail!("scheduler claim route no longer authorizes account {provider}:{account}");
+    }
+    tx.execute(
+        "UPDATE quota_reservations
+         SET status = 'expired', released_at = ?1, release_reason = 'reservation_expired'
+         WHERE status IN ('active', 'running') AND expires_at <= ?1",
+        [now.to_rfc3339()],
+    )?;
+    let mut stmt = tx.prepare(
+        "SELECT q.id, q.surface_key,
+                COALESCE(o.effective_remaining_percent, q.observed_remaining_percent),
+                q.reserve_percent, q.valid_until, o.id IS NOT NULL
+         FROM quota_surfaces q
+         LEFT JOIN quota_overrides o ON o.id = (
+            SELECT id FROM quota_overrides x
+            WHERE x.surface_id = q.id AND (x.expires_at IS NULL OR x.expires_at > ?3)
+            ORDER BY x.created_at DESC LIMIT 1
+         )
+         WHERE q.provider = ?1 AND q.account = ?2
+         ORDER BY q.surface_key",
+    )?;
+    let surfaces = stmt
+        .query_map(params![provider, account, now.to_rfc3339()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, bool>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    if surfaces.is_empty() {
+        return Err(SchedulerClaimRejection::QuotaUnavailable {
+            provider: provider.into(),
+            account: account.into(),
+        }
+        .into());
+    }
+    for (surface_id, surface, remaining, reserve, valid_until, overridden) in surfaces {
+        if !overridden
+            && valid_until
+                .map(parse_time)
+                .transpose()?
+                .is_some_and(|valid_until| valid_until <= now)
+        {
+            return Err(SchedulerClaimRejection::QuotaStale { surface }.into());
+        }
+        let Some(remaining) = remaining else {
+            return Err(SchedulerClaimRejection::QuotaUnavailable {
+                provider: provider.into(),
+                account: account.into(),
+            }
+            .into());
+        };
+        let active_reserved: f64 = tx.query_row(
+            "SELECT COALESCE(SUM(reserved_percent), 0.0)
+             FROM quota_reservations
+             WHERE surface_id = ?1 AND status IN ('active', 'running') AND expires_at > ?2",
+            params![surface_id, now.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        let required = reserve + active_reserved + forecast_percent;
+        if remaining < required {
+            return Err(SchedulerClaimRejection::QuotaCapacity {
+                surface,
+                remaining,
+                required,
+            }
+            .into());
+        }
+        tx.execute(
+            "INSERT INTO quota_reservations(
+                id, surface_id, task_id, claim_id, reserved_percent, status,
+                created_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+            params![
+                Ulid::new().to_string(),
+                surface_id,
+                task_id,
+                claim_id,
+                forecast_percent,
+                now.to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+    }
+    append_event_tx(
+        tx,
+        None,
+        Some(task_id),
+        None,
+        "quota.reserved",
+        "scheduler",
+        &serde_json::json!({
+            "claim_id": claim_id,
+            "provider": provider,
+            "account": account,
+            "forecast_percent": forecast_percent,
+            "expires_at": expires_at,
+        }),
+    )?;
+    Ok(())
+}
+
+fn release_quota_reservations_for_claim_tx(
+    tx: &Transaction<'_>,
+    claim_id: &str,
+    now: DateTime<Utc>,
+    reason: &str,
+) -> Result<usize> {
+    tx.execute(
+        "UPDATE quota_reservations
+         SET status = 'released', released_at = ?2, release_reason = ?3
+         WHERE claim_id = ?1 AND status IN ('active', 'running')",
+        params![claim_id, now.to_rfc3339(), reason],
+    )
+    .map_err(Into::into)
+}
+
+fn release_quota_reservations_for_run_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now: DateTime<Utc>,
+    reason: &str,
+) -> Result<usize> {
+    tx.execute(
+        "UPDATE quota_reservations
+         SET status = 'released', released_at = ?2, release_reason = ?3
+         WHERE run_id = ?1 AND status IN ('active', 'running')",
+        params![run_id, now.to_rfc3339(), reason],
+    )
+    .map_err(Into::into)
+}
+
 fn expire_scheduler_claims_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<Vec<String>> {
     let mut stmt = tx.prepare(
         "SELECT id, task_id FROM scheduler_claims
@@ -2945,6 +3374,7 @@ fn expire_scheduler_claims_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Resul
              WHERE claim_id = ?1 AND released_at IS NULL",
             params![claim_id, now.to_rfc3339()],
         )?;
+        release_quota_reservations_for_claim_tx(tx, claim_id, now, "claim_expired")?;
         append_event_tx(
             tx,
             None,
@@ -3004,6 +3434,7 @@ fn release_scheduler_claims_for_instance_tx(
              WHERE claim_id = ?1 AND released_at IS NULL",
             params![claim_id, now.to_rfc3339()],
         )?;
+        release_quota_reservations_for_claim_tx(tx, claim_id, now, "scheduler_stopped")?;
     }
     Ok(claims.into_iter().map(|(_, task_id)| task_id).collect())
 }
@@ -3064,21 +3495,23 @@ const TASK_SELECT: &str = "SELECT
     id, project_id, title, goal, rationale, scope_json, non_scope_json,
     acceptance_json, verification_argv_json, priority, risk_class,
     estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
-    deadline_at, required_capabilities_json, fake_write_path, fake_write_content,
-    status, version, created_at, updated_at
+    deadline_at, required_capabilities_json, pinned_adapter, pinned_provider,
+    pinned_account, fake_write_path, fake_write_content, status, version,
+    created_at, updated_at
     FROM tasks";
 const TASK_SELECT_BY_ID: &str = "SELECT
     id, project_id, title, goal, rationale, scope_json, non_scope_json,
     acceptance_json, verification_argv_json, priority, risk_class,
     estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
-    deadline_at, required_capabilities_json, fake_write_path, fake_write_content,
-    status, version, created_at, updated_at
+    deadline_at, required_capabilities_json, pinned_adapter, pinned_provider,
+    pinned_account, fake_write_path, fake_write_content, status, version,
+    created_at, updated_at
     FROM tasks WHERE id = ?1";
 
 fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let affinity: String = row.get(14)?;
     let deadline_at: Option<String> = row.get(15)?;
-    let status: String = row.get(19)?;
+    let status: String = row.get(22)?;
     Ok(Task {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -3103,8 +3536,11 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         })?,
         deadline_at: deadline_at.map(parse_time).transpose()?,
         required_capabilities: parse_json(row.get(16)?)?,
-        fake_write_path: row.get(17)?,
-        fake_write_content: row.get(18)?,
+        pinned_adapter: row.get(17)?,
+        pinned_provider: row.get(18)?,
+        pinned_account: row.get(19)?,
+        fake_write_path: row.get(20)?,
+        fake_write_content: row.get(21)?,
         status: TaskStatus::from_str(&status).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 status.len(),
@@ -3112,9 +3548,9 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
                 Box::new(err),
             )
         })?,
-        version: row.get(20)?,
-        created_at: parse_time(row.get(21)?)?,
-        updated_at: parse_time(row.get(22)?)?,
+        version: row.get(23)?,
+        created_at: parse_time(row.get(24)?)?,
+        updated_at: parse_time(row.get(25)?)?,
     })
 }
 
@@ -3144,7 +3580,9 @@ fn nonnegative_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u6
 const QUOTA_SELECT: &str = "SELECT
     q.id, q.provider, q.account, q.surface_key, q.observed_remaining_percent,
     COALESCE(o.effective_remaining_percent, q.observed_remaining_percent),
-    q.reserve_percent, q.reset_at, q.source, q.unknown_reason, q.observed_at, o.reason
+    q.reserve_percent, q.reset_at, q.source, q.unknown_reason, q.observed_at,
+    q.valid_until, q.confidence, q.collector_contract, q.provider_version,
+    q.payload_sha256, o.reason
  FROM quota_surfaces q
  LEFT JOIN quota_overrides o ON o.id = (
     SELECT id FROM quota_overrides x
@@ -3156,7 +3594,9 @@ const QUOTA_SELECT: &str = "SELECT
 const QUOTA_SELECT_ALL: &str = "SELECT
     q.id, q.provider, q.account, q.surface_key, q.observed_remaining_percent,
     COALESCE(o.effective_remaining_percent, q.observed_remaining_percent),
-    q.reserve_percent, q.reset_at, q.source, q.unknown_reason, q.observed_at, o.reason
+    q.reserve_percent, q.reset_at, q.source, q.unknown_reason, q.observed_at,
+    q.valid_until, q.confidence, q.collector_contract, q.provider_version,
+    q.payload_sha256, o.reason
  FROM quota_surfaces q
  LEFT JOIN quota_overrides o ON o.id = (
     SELECT id FROM quota_overrides x
@@ -3166,6 +3606,7 @@ const QUOTA_SELECT_ALL: &str = "SELECT
 
 fn map_quota(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaSurface> {
     let reset_at: Option<String> = row.get(7)?;
+    let valid_until: Option<String> = row.get(11)?;
     Ok(QuotaSurface {
         id: row.get(0)?,
         provider: row.get(1)?,
@@ -3178,7 +3619,12 @@ fn map_quota(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaSurface> {
         source: row.get(8)?,
         unknown_reason: row.get(9)?,
         observed_at: parse_time(row.get(10)?)?,
-        override_reason: row.get(11)?,
+        valid_until: valid_until.map(parse_time).transpose()?,
+        confidence: row.get(12)?,
+        collector_contract: row.get(13)?,
+        provider_version: row.get(14)?,
+        payload_sha256: row.get(15)?,
+        override_reason: row.get(16)?,
     })
 }
 
@@ -3850,6 +4296,68 @@ CREATE INDEX idx_agent_capability_probes_latest
     ON agent_capability_probes(adapter, probed_at DESC, id DESC);
 "#;
 
+const MIGRATION_9: &str = r#"
+ALTER TABLE tasks ADD COLUMN pinned_adapter TEXT;
+ALTER TABLE tasks ADD COLUMN pinned_provider TEXT;
+ALTER TABLE tasks ADD COLUMN pinned_account TEXT;
+ALTER TABLE route_decisions ADD COLUMN selected_provider TEXT;
+ALTER TABLE route_decisions ADD COLUMN selected_account TEXT;
+
+CREATE INDEX idx_tasks_route_pin
+    ON tasks(pinned_adapter, pinned_provider, pinned_account)
+    WHERE pinned_adapter IS NOT NULL;
+"#;
+
+const MIGRATION_10: &str = r#"
+ALTER TABLE quota_surfaces ADD COLUMN valid_until TEXT;
+ALTER TABLE quota_surfaces ADD COLUMN confidence TEXT NOT NULL DEFAULT 'user_reported';
+ALTER TABLE quota_surfaces ADD COLUMN collector_contract TEXT;
+ALTER TABLE quota_surfaces ADD COLUMN provider_version TEXT;
+ALTER TABLE quota_surfaces ADD COLUMN payload_sha256 TEXT;
+
+CREATE TABLE quota_observations (
+    id TEXT PRIMARY KEY,
+    surface_id TEXT NOT NULL REFERENCES quota_surfaces(id),
+    observed_remaining_percent REAL,
+    reserve_percent REAL NOT NULL,
+    reset_at TEXT,
+    source TEXT NOT NULL,
+    unknown_reason TEXT,
+    observed_at TEXT NOT NULL,
+    valid_until TEXT,
+    confidence TEXT NOT NULL,
+    collector_contract TEXT,
+    provider_version TEXT,
+    payload_sha256 TEXT
+);
+
+CREATE INDEX idx_quota_observations_surface
+    ON quota_observations(surface_id, observed_at DESC, id DESC);
+"#;
+
+const MIGRATION_11: &str = r#"
+CREATE TABLE quota_reservations (
+    id TEXT PRIMARY KEY,
+    surface_id TEXT NOT NULL REFERENCES quota_surfaces(id),
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    claim_id TEXT NOT NULL REFERENCES scheduler_claims(id),
+    run_id TEXT REFERENCES runs(id),
+    reserved_percent REAL NOT NULL CHECK(reserved_percent >= 0 AND reserved_percent <= 100),
+    status TEXT NOT NULL CHECK(status IN ('active', 'running', 'released', 'expired')),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    release_reason TEXT,
+    UNIQUE(surface_id, claim_id)
+);
+
+CREATE INDEX idx_quota_reservations_active
+    ON quota_reservations(surface_id, expires_at)
+    WHERE status IN ('active', 'running');
+CREATE INDEX idx_quota_reservations_claim ON quota_reservations(claim_id);
+CREATE INDEX idx_quota_reservations_run ON quota_reservations(run_id) WHERE run_id IS NOT NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3884,6 +4392,9 @@ mod tests {
             day_affinity: crate::domain::DayAffinity::Both,
             deadline_at: None,
             required_capabilities: vec![],
+            pinned_adapter: None,
+            pinned_provider: None,
+            pinned_account: None,
             fake_write_path: None,
             fake_write_content: None,
         }
@@ -3978,6 +4489,53 @@ mod tests {
     }
 
     #[test]
+    fn provider_quota_refresh_is_atomic_append_only_and_materializes_latest() {
+        let (_dir, mut db) = database();
+        let observed_at = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let first = QuotaObservation {
+            provider: "codex".into(),
+            account: "personal".into(),
+            surface: "five_hour".into(),
+            remaining_percent: 72.0,
+            reserve_percent: 20.0,
+            reset_at: Some(observed_at + chrono::Duration::hours(3)),
+            source: "codexbar:oauth".into(),
+            confidence: "provider_reported".into(),
+            observed_at,
+            valid_until: observed_at + chrono::Duration::minutes(5),
+            collector_contract: "codexbar-usage-json-v1".into(),
+            provider_version: Some("0.144.6".into()),
+            payload_sha256: "a".repeat(64),
+        };
+        db.record_quota_observations(std::slice::from_ref(&first))
+            .unwrap();
+        let second = QuotaObservation {
+            remaining_percent: 61.0,
+            observed_at: observed_at + chrono::Duration::minutes(1),
+            valid_until: observed_at + chrono::Duration::minutes(6),
+            payload_sha256: "b".repeat(64),
+            ..first
+        };
+        let latest = db
+            .record_quota_observations(std::slice::from_ref(&second))
+            .unwrap();
+        assert_eq!(latest[0].observed_remaining_percent, Some(61.0));
+        assert_eq!(latest[0].valid_until, Some(second.valid_until));
+        assert_eq!(latest[0].confidence, "provider_reported");
+        assert_eq!(
+            latest[0].payload_sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM quota_observations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
     fn approval_is_bound_and_single_use() {
         let (dir, mut db) = database();
         let root = dir.path().join("project");
@@ -4002,6 +4560,9 @@ mod tests {
                 day_affinity: crate::domain::DayAffinity::Both,
                 deadline_at: None,
                 required_capabilities: vec![],
+                pinned_adapter: None,
+                pinned_provider: None,
+                pinned_account: None,
                 fake_write_path: None,
                 fake_write_content: None,
             })
@@ -4074,6 +4635,8 @@ mod tests {
             id: Ulid::new().to_string(),
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
+            selected_provider: Some("fake".into()),
+            selected_account: Some("test".into()),
             allowed: true,
             reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
@@ -4148,7 +4711,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 11);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -4389,6 +4952,7 @@ mod tests {
                 "primary",
                 1,
                 1,
+                0.0,
             )
             .unwrap();
         let adapter_error = db
@@ -4407,6 +4971,7 @@ mod tests {
                 "secondary",
                 1,
                 1,
+                0.0,
             )
             .unwrap_err();
         assert_eq!(
@@ -4437,6 +5002,7 @@ mod tests {
                 "primary",
                 1,
                 1,
+                0.0,
             )
             .unwrap_err();
         assert_eq!(
@@ -4487,6 +5053,7 @@ mod tests {
                 "primary",
                 1,
                 1,
+                0.0,
             )
             .is_ok()
         );
@@ -4521,6 +5088,8 @@ mod tests {
             id: Ulid::new().to_string(),
             task_id: first.id.clone(),
             selected_adapter: Some("fake".into()),
+            selected_provider: Some("fake".into()),
+            selected_account: Some("test".into()),
             allowed: true,
             reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
@@ -4639,6 +5208,8 @@ mod tests {
             id: Ulid::new().to_string(),
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
+            selected_provider: Some("fake".into()),
+            selected_account: Some("test".into()),
             allowed: true,
             reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
@@ -4763,6 +5334,8 @@ mod tests {
                 id: Ulid::new().to_string(),
                 task_id: tasks[index].id.clone(),
                 selected_adapter: Some("fake".into()),
+                selected_provider: Some("fake".into()),
+                selected_account: Some("test".into()),
                 allowed: true,
                 reason_code: "fixture.allowed".into(),
                 reason: "fixture".into(),
@@ -5030,6 +5603,8 @@ mod tests {
             id: Ulid::new().to_string(),
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
+            selected_provider: Some("fake".into()),
+            selected_account: Some("test".into()),
             allowed: true,
             reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
@@ -5137,6 +5712,8 @@ mod tests {
             id: Ulid::new().to_string(),
             task_id: running.id.clone(),
             selected_adapter: Some("fake".into()),
+            selected_provider: Some("fake".into()),
+            selected_account: Some("test".into()),
             allowed: true,
             reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
@@ -5272,6 +5849,142 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_claims_cannot_overreserve_quota_and_recovery_releases_once() {
+        let (dir, mut db) = database();
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        db.set_quota_observation(
+            "fake",
+            "shared",
+            "five_hour",
+            Some(50.0),
+            20.0,
+            None,
+            "fixture",
+            None,
+        )
+        .unwrap();
+        let quota = db.list_quota().unwrap();
+        let mut tasks = Vec::new();
+        let mut decisions = Vec::new();
+        for index in 0..2 {
+            let root = dir.path().join(format!("quota-project-{index}"));
+            fs::create_dir(&root).unwrap();
+            let project = db
+                .add_project(
+                    &format!("quota-project-{index}"),
+                    &format!("Quota project {index}"),
+                    &root,
+                )
+                .unwrap();
+            let task = db
+                .add_task(&new_task(
+                    &project.id,
+                    &format!("quota-task-{index}"),
+                    vec![],
+                ))
+                .unwrap();
+            let decision = RouteDecision {
+                id: Ulid::new().to_string(),
+                task_id: task.id.clone(),
+                selected_adapter: Some("fake".into()),
+                selected_provider: Some("fake".into()),
+                selected_account: Some("shared".into()),
+                allowed: true,
+                reason_code: "route.allowed".into(),
+                reason: "fixture".into(),
+                required_headroom_percent: 40.0,
+                quota: quota.clone(),
+                candidates: vec![],
+                next_wake_at: None,
+                schedule: None,
+                policy_hash: "fixture".into(),
+                created_at: now,
+            };
+            db.record_route(&decision).unwrap();
+            tasks.push(task);
+            decisions.push(decision.id);
+        }
+        db.register_scheduler_instance("quota-scheduler", "host", 1, now)
+            .unwrap();
+        let leader = db
+            .acquire_scheduler_leader("quota-scheduler", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let database_path = db.path().to_path_buf();
+        drop(db);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for (task, decision) in tasks.into_iter().zip(decisions) {
+            let barrier = barrier.clone();
+            let path = database_path.clone();
+            let generation = leader.generation;
+            handles.push(thread::spawn(move || {
+                let mut db = Database::open(path).unwrap();
+                barrier.wait();
+                db.claim_task_for_scheduler_with_route_limits(
+                    "quota-scheduler",
+                    generation,
+                    &task.id,
+                    task.version,
+                    now,
+                    std::time::Duration::from_secs(30),
+                    2,
+                    Some(&decision),
+                    &[],
+                    "fake",
+                    "fake",
+                    "shared",
+                    2,
+                    2,
+                    20.0,
+                )
+            }));
+        }
+        barrier.wait();
+        let outcomes = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        let rejection = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .unwrap();
+        assert_eq!(
+            rejection
+                .downcast_ref::<SchedulerClaimRejection>()
+                .unwrap()
+                .reason_code(),
+            "quota.reservation_conflict"
+        );
+
+        let mut reopened = Database::open(database_path).unwrap();
+        let reservations = reopened.list_quota_reservations().unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].status, "active");
+        let recovery_at = now + chrono::Duration::seconds(31);
+        assert_eq!(
+            reopened
+                .recover_expired_scheduler_claims(recovery_at)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            reopened
+                .recover_expired_scheduler_claims(recovery_at)
+                .unwrap()
+                .is_empty()
+        );
+        let reservations = reopened.list_quota_reservations().unwrap();
+        assert_eq!(reservations[0].status, "released");
+        assert_eq!(
+            reservations[0].release_reason.as_deref(),
+            Some("claim_expired")
+        );
+    }
+
+    #[test]
     fn online_backup_is_private_integrity_checked_and_content_addressed() {
         let (dir, mut db) = database();
         let root = dir.path().join("project");
@@ -5280,7 +5993,7 @@ mod tests {
         let destination = dir.path().join("backups/state.db");
         let backup = db.backup_to(&destination, Utc::now()).unwrap();
         assert_eq!(backup.integrity, "ok");
-        assert_eq!(backup.schema_version, 8);
+        assert_eq!(backup.schema_version, 11);
         assert_eq!(backup.sha256.len(), 64);
         assert_eq!(backup.size_bytes, fs::metadata(&destination).unwrap().len());
         assert!(db.backup_to(&destination, Utc::now()).is_err());

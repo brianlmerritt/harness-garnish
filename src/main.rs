@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use harness_garnish::{
     Garnish,
     adapters::AgentKind,
-    domain::{DayAffinity, DayKind, NewTask, SchedulerDaemonConfig},
+    domain::{DayAffinity, DayKind, NewTask, RouteTarget, SchedulerDaemonConfig},
 };
 use serde::Serialize;
 use serde_json::json;
@@ -129,6 +129,22 @@ enum TaskCommand {
         #[arg(long)]
         depends_on: String,
     },
+    Pin {
+        id: String,
+        #[arg(long)]
+        adapter: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Unpin {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
     Complete {
         id: String,
     },
@@ -196,7 +212,37 @@ struct TaskRoute {
 enum QuotaCommand {
     Set(QuotaSet),
     Override(QuotaOverride),
+    #[command(
+        name = "refresh-codexbar",
+        about = "Fetch CodexBar JSON; may access provider authentication and the network"
+    )]
+    RefreshCodexbar(QuotaRefreshCodexbar),
+    Reservations,
     Status,
+}
+
+#[derive(Args)]
+struct QuotaRefreshCodexbar {
+    #[arg(long, help = "Concrete CodexBar provider ID (not all or both)")]
+    provider: String,
+    #[arg(long, default_value = "default", help = "Garnish account identity")]
+    account: String,
+    #[arg(
+        long,
+        help = "Optional CodexBar account selector; omit for its current/default account"
+    )]
+    collector_account: Option<String>,
+    #[arg(long, default_value = "auto", help = "auto, web, cli, oauth, or api")]
+    source: String,
+    #[arg(long, default_value_t = 20.0)]
+    reserve_percent: f64,
+    #[arg(long, default_value_t = 300)]
+    valid_seconds: u64,
+    #[arg(
+        long,
+        help = "Explicit CodexBar executable path; otherwise PATH is searched"
+    )]
+    executable: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -277,6 +323,12 @@ enum SchedulerCommand {
         provider: String,
         #[arg(long, default_value = "default")]
         account: String,
+        #[arg(
+            long = "candidate",
+            value_name = "ADAPTER:PROVIDER:ACCOUNT",
+            help = "Repeatable route candidate; when present these replace the legacy adapter/provider/account target"
+        )]
+        candidates: Vec<String>,
         #[arg(long, default_value_t = 1)]
         max_active: usize,
         #[arg(long, default_value_t = 1)]
@@ -377,6 +429,12 @@ struct SchedulerDaemonArgs {
     provider: String,
     #[arg(long, default_value = "default")]
     account: String,
+    #[arg(
+        long = "candidate",
+        value_name = "ADAPTER:PROVIDER:ACCOUNT",
+        help = "Repeatable route candidate; when present these replace the legacy adapter/provider/account target"
+    )]
+    candidates: Vec<String>,
     #[arg(long, default_value_t = 1)]
     max_active: usize,
     #[arg(long, default_value_t = 1)]
@@ -569,6 +627,9 @@ fn run() -> Result<()> {
                     day_affinity: DayAffinity::from_str(&args.day_affinity)?,
                     deadline_at: parse_optional_time(args.deadline_at.as_deref())?,
                     required_capabilities: args.required_capabilities,
+                    pinned_adapter: None,
+                    pinned_provider: None,
+                    pinned_account: None,
                     fake_write_path: args.fake_write_path,
                     fake_write_content: args.fake_write_content,
                 })?;
@@ -578,6 +639,18 @@ fn run() -> Result<()> {
             TaskCommand::Show { id } => print_json(&garnish.task(&id)?),
             TaskCommand::Dependency { id, depends_on } => {
                 print_json(&garnish.add_dependency(&id, &depends_on)?)
+            }
+            TaskCommand::Pin {
+                id,
+                adapter,
+                provider,
+                account,
+                reason,
+            } => print_json(
+                &garnish.set_task_route_pin(&id, &adapter, &provider, &account, &reason)?,
+            ),
+            TaskCommand::Unpin { id, reason } => {
+                print_json(&garnish.clear_task_route_pin(&id, &reason)?)
             }
             TaskCommand::Complete { id } => print_json(&json!({
                 "task_id": id,
@@ -616,6 +689,16 @@ fn run() -> Result<()> {
                 &args.reason,
                 parse_optional_time(args.expires_at.as_deref())?,
             )?),
+            QuotaCommand::RefreshCodexbar(args) => print_json(&garnish.refresh_quota_codexbar(
+                args.executable.as_deref(),
+                &args.provider,
+                &args.account,
+                args.collector_account.as_deref(),
+                &args.source,
+                args.reserve_percent,
+                StdDuration::from_secs(args.valid_seconds),
+            )?),
+            QuotaCommand::Reservations => print_json(&garnish.quota_reservations()?),
             QuotaCommand::Status => print_json(&garnish.quota()?),
         },
         Command::Schedule { command } => match command {
@@ -656,12 +739,14 @@ fn run() -> Result<()> {
             SchedulerCommand::Daemon(args) => {
                 SCHEDULER_SHUTDOWN.store(false, Ordering::SeqCst);
                 install_scheduler_signal_handlers()?;
+                let route_candidates = parse_route_targets(&args.candidates)?;
                 let config = SchedulerDaemonConfig {
                     instance_id: args.instance,
                     hostname: args.hostname,
                     adapter: args.adapter,
                     provider: args.provider,
                     account: args.account,
+                    route_candidates,
                     max_active_claims: args.max_active,
                     max_active_per_adapter: args.max_active_per_adapter,
                     max_active_per_account: args.max_active_per_account,
@@ -707,6 +792,7 @@ fn run() -> Result<()> {
                 adapter,
                 provider,
                 account,
+                candidates,
                 max_active,
                 max_active_per_adapter,
                 max_active_per_account,
@@ -714,12 +800,18 @@ fn run() -> Result<()> {
                 at,
             } => {
                 let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
-                print_json(&garnish.scheduler_tick_with_limits_at(
+                let mut route_targets = parse_route_targets(&candidates)?;
+                if route_targets.is_empty() {
+                    route_targets.push(RouteTarget {
+                        adapter,
+                        provider,
+                        account,
+                    });
+                }
+                print_json(&garnish.scheduler_tick_candidates_with_limits_at(
                     &instance,
                     generation,
-                    &adapter,
-                    &provider,
-                    &account,
+                    &route_targets,
                     at,
                     max_active,
                     max_active_per_adapter,
@@ -846,6 +938,35 @@ fn parse_optional_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
         .transpose()
 }
 
+fn parse_route_targets(values: &[String]) -> Result<Vec<RouteTarget>> {
+    values
+        .iter()
+        .map(|value| {
+            let mut parts = value.split(':');
+            let adapter = parts.next().unwrap_or_default();
+            let provider = parts.next().unwrap_or_default();
+            let account = parts.next().unwrap_or_default();
+            if adapter.is_empty()
+                || provider.is_empty()
+                || account.is_empty()
+                || parts.next().is_some()
+                || [adapter, provider, account]
+                    .iter()
+                    .any(|part| part.chars().any(char::is_whitespace))
+            {
+                bail!(
+                    "invalid route candidate {value:?}; expected ADAPTER:PROVIDER:ACCOUNT without whitespace"
+                );
+            }
+            Ok(RouteTarget {
+                adapter: adapter.into(),
+                provider: provider.into(),
+                account: account.into(),
+            })
+        })
+        .collect()
+}
+
 fn print_json(value: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
@@ -878,4 +999,27 @@ fn install_scheduler_signal_handlers() -> Result<()> {
 #[cfg(not(unix))]
 fn install_scheduler_signal_handlers() -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_candidate_parser_is_exact_and_rejects_malformed_or_extra_fields() {
+        let parsed =
+            parse_route_targets(&["codex:openai:primary".into(), "claude:anthropic:max".into()])
+                .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].adapter, "codex");
+        assert_eq!(parsed[1].account, "max");
+        for invalid in [
+            "codex:openai",
+            "codex:openai:primary:extra",
+            "codex:open ai:primary",
+            "::",
+        ] {
+            assert!(parse_route_targets(&[invalid.into()]).is_err());
+        }
+    }
 }

@@ -81,9 +81,24 @@ impl Projector {
             }
             content.push_str(&format!("## {status}\n\n"));
             for task in matching {
+                let route_pin = match (
+                    task.pinned_adapter.as_deref(),
+                    task.pinned_provider.as_deref(),
+                    task.pinned_account.as_deref(),
+                ) {
+                    (Some(adapter), Some(provider), Some(account)) => {
+                        format!(", pinned {adapter}:{provider}:{account}")
+                    }
+                    _ => String::new(),
+                };
                 content.push_str(&format!(
-                    "- `{}` — {} (priority {}, days {}, checkpoint {}s)\n",
-                    task.id, task.title, task.priority, task.day_affinity, task.checkpoint_seconds
+                    "- `{}` — {} (priority {}, days {}, checkpoint {}s{})\n",
+                    task.id,
+                    task.title,
+                    task.priority,
+                    task.day_affinity,
+                    task.checkpoint_seconds,
+                    route_pin,
                 ));
             }
             content.push('\n');

@@ -245,6 +245,9 @@ pub struct Task {
     pub day_affinity: DayAffinity,
     pub deadline_at: Option<DateTime<Utc>>,
     pub required_capabilities: Vec<String>,
+    pub pinned_adapter: Option<String>,
+    pub pinned_provider: Option<String>,
+    pub pinned_account: Option<String>,
     pub fake_write_path: Option<String>,
     pub fake_write_content: Option<String>,
     pub status: TaskStatus,
@@ -272,6 +275,9 @@ pub struct NewTask {
     pub day_affinity: DayAffinity,
     pub deadline_at: Option<DateTime<Utc>>,
     pub required_capabilities: Vec<String>,
+    pub pinned_adapter: Option<String>,
+    pub pinned_provider: Option<String>,
+    pub pinned_account: Option<String>,
     pub fake_write_path: Option<String>,
     pub fake_write_content: Option<String>,
 }
@@ -316,6 +322,27 @@ impl NewTask {
                 "required capabilities must be non-empty names without whitespace".into(),
             ));
         }
+        let pin_values = [
+            self.pinned_adapter.as_deref(),
+            self.pinned_provider.as_deref(),
+            self.pinned_account.as_deref(),
+        ];
+        if pin_values.iter().filter(|value| value.is_some()).count() != 0
+            && pin_values.iter().filter(|value| value.is_some()).count() != pin_values.len()
+        {
+            return Err(DomainError::InvalidTask(
+                "manual pin requires adapter, provider, and account together".into(),
+            ));
+        }
+        if pin_values
+            .into_iter()
+            .flatten()
+            .any(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
+        {
+            return Err(DomainError::InvalidTask(
+                "manual pin values must be non-empty and contain no whitespace".into(),
+            ));
+        }
         match (&self.fake_write_path, &self.fake_write_content) {
             (Some(path), Some(_)) if !path.trim().is_empty() => {}
             (None, None) => {}
@@ -342,7 +369,27 @@ pub struct QuotaSurface {
     pub source: String,
     pub unknown_reason: Option<String>,
     pub observed_at: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
+    pub confidence: String,
+    pub collector_contract: Option<String>,
+    pub provider_version: Option<String>,
+    pub payload_sha256: Option<String>,
     pub override_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaReservation {
+    pub id: String,
+    pub surface_id: String,
+    pub task_id: String,
+    pub claim_id: String,
+    pub run_id: Option<String>,
+    pub reserved_percent: f64,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+    pub release_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,6 +397,8 @@ pub struct RouteDecision {
     pub id: String,
     pub task_id: String,
     pub selected_adapter: Option<String>,
+    pub selected_provider: Option<String>,
+    pub selected_account: Option<String>,
     pub allowed: bool,
     pub reason_code: String,
     pub reason: String,
@@ -368,9 +417,19 @@ pub struct RouteCandidate {
     pub provider: String,
     pub account: String,
     pub allowed: bool,
+    pub reason_code: String,
     pub filter_reason: String,
     pub forecast_percent: f64,
     pub minimum_effective_remaining_percent: Option<f64>,
+    pub score: Option<f64>,
+    pub score_components: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteTarget {
+    pub adapter: String,
+    pub provider: String,
+    pub account: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +647,7 @@ pub struct SchedulerDaemonConfig {
     pub adapter: String,
     pub provider: String,
     pub account: String,
+    pub route_candidates: Vec<RouteTarget>,
     pub max_active_claims: usize,
     pub max_active_per_adapter: usize,
     pub max_active_per_account: usize,
@@ -656,6 +716,18 @@ pub enum SchedulerClaimRejection {
     AccountCapacity { limit: usize },
     #[error("scheduler resource lock is unavailable: {kind}:{key}")]
     ResourceLocked { kind: String, key: String },
+    #[error("quota evidence is unavailable for {provider}:{account}")]
+    QuotaUnavailable { provider: String, account: String },
+    #[error("quota evidence is stale for surface {surface}")]
+    QuotaStale { surface: String },
+    #[error(
+        "quota reservation would overcommit {surface}: {remaining:.1}% remaining, {required:.1}% required"
+    )]
+    QuotaCapacity {
+        surface: String,
+        remaining: f64,
+        required: f64,
+    },
 }
 
 impl SchedulerClaimRejection {
@@ -665,6 +737,9 @@ impl SchedulerClaimRejection {
             Self::AdapterCapacity { .. } => "scheduler.adapter_capacity",
             Self::AccountCapacity { .. } => "scheduler.account_capacity",
             Self::ResourceLocked { .. } => "scheduler.resource_locked",
+            Self::QuotaUnavailable { .. } => "quota.unavailable",
+            Self::QuotaStale { .. } => "quota.stale",
+            Self::QuotaCapacity { .. } => "quota.reservation_conflict",
         }
     }
 }

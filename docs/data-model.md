@@ -71,6 +71,7 @@ Required fields:
 - Git: worktree, branch, base/head commit, repository/submodule revision manifest;
 - supervision: `lease_id`, `retry_budget`, `retries_used`, `cancellation_id`;
 - routing: latest snapshot/reservation and rationale reference;
+- manual routing: an optional all-or-none pinned adapter/provider/account identity; pin and unpin changes require a reason and append an event;
 - integration: artifact refs and integration policy revision;
 - lifecycle: `status`, timestamps, `version`.
 
@@ -106,7 +107,7 @@ The Phase 2 scheduler represents per-adapter and per-account concurrency as numb
 
 ### `route_decisions`, `scheduler_claims`, and `scheduler_wakes`
 
-`route_decisions` persist the selected adapter, allow/deny result, a stable machine `reason_code`, bounded human rationale, quota/schedule evidence, policy hash, and evaluation time. Human wording is never parsed to recover the machine reason.
+`route_decisions` persist the selected adapter/provider/account, allow/deny result, a stable machine `reason_code`, bounded human rationale, every candidate's hard-filter and score components, quota/schedule evidence, policy hash, and evaluation time. Human wording is never parsed to recover the machine reason.
 
 `scheduler_claims` bind a ready task version, fenced scheduler generation, route decision, lease interval, and optional consumed run/action key. Claim creation atomically transitions `ready -> leased` and acquires all resource locks.
 
@@ -142,6 +143,8 @@ Examples include `five_hour_percent`, `weekly_percent`, `monthly_requests`, `mon
 
 Unknown is represented by `unknown_reason`, never by `remaining_percent=100` or zero. Provider-reported values and local forecasts use distinct `source` classifications.
 
+The current schema-11 implementation materializes the latest observation in `quota_surfaces` and appends every source result to `quota_observations`. It records `valid_until`, confidence, collector contract, provider version, and a raw-payload SHA-256 digest. Account-bearing raw CodexBar JSON is not stored. An expired observation is `quota.stale`, distinct from unknown or insufficient quota; a live append-only user override remains visibly separate.
+
 ### `quota_overrides`
 
 `id`, `surface_id`, `project_id` nullable, `effective_remaining_percent`, `effective_remaining_value`, `effective_reset_at`, `reserve_percent`, `paid_overage_enabled`, `reason`, `actor`, `created_at`, `expires_at`, `supersedes_id`.
@@ -153,6 +156,8 @@ Overrides are append-only, scopeable globally or to a project, and may change mi
 `id`, `run_id`, `surface_id`, `snapshot_id`, `reserved_value_low/high`, `reserve_floor`, `expires_at`, `released_at`, `actual_value`, `decision`.
 
 Reservations are forecasts and prevent the local scheduler from overcommitting; they do not reserve provider-side quota.
+
+Schema 11 creates one percentage reservation per relevant surface in the same immediate transaction as the scheduler claim and capacity locks. Claim heartbeat, claim-to-run conversion, runtime checkpoints, completion, failure, cancellation, graceful scheduler stop, emergency stop, and orphan recovery renew or release the reservation with an explicit status/reason. Concurrent claims sum active reservations before admission.
 
 ### `api_budgets` and `api_spend`
 
