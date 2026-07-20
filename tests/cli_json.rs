@@ -189,6 +189,21 @@ fn api_budget_configuration_is_explicit_and_stable_json() {
     let plans: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(plans.as_array().unwrap().len(), 1);
     assert_eq!(plans[0]["max_input_tokens"], 10_000);
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "api",
+            "attempts",
+            "--project",
+            "fixture",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let attempts: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(attempts.as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -618,7 +633,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 18);
+    assert_eq!(value["schema_version"], 19);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

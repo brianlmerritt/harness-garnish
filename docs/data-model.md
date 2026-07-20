@@ -167,7 +167,7 @@ Reservations are forecasts and prevent the local scheduler from overcommitting; 
 
 Schema 11 creates one percentage reservation per relevant surface in the same immediate transaction as the scheduler claim and capacity locks. Claim heartbeat, claim-to-run conversion, runtime checkpoints, completion, failure, cancellation, graceful scheduler stop, emergency stop, and orphan recovery renew or release the reservation with an explicit status/reason. Concurrent claims sum active reservations before admission.
 
-### `api_budgets`, `api_request_plans`, `api_model_prices`, and `api_spend`
+### `api_budgets`, `api_request_plans`, `api_dispatch_attempts`, `api_model_prices`, and `api_spend`
 
 Schema 16 materializes the network-free API accounting control plane and durable pricing evidence.
 
@@ -184,6 +184,10 @@ Reservation admission runs in an immediate transaction and includes committed sp
 Schema 17 adds the scheduler binding. An exact paid request must be explicitly pinned, is hashed without persisting its prompt, and has its worst-case monetary reservation calculated from the effective price record. The scheduler claim, capacity locks, and reservation commit together or all roll back. Claim heartbeat and claim-to-run conversion renew the bound reservation; stop, expiry, emergency stop, pre-dispatch completion/failure, and orphan recovery release it once. A bound reservation cannot be manually released or dispatched before its claim becomes a run.
 
 Schema 18 adds durable per-task request plans and retry-aware reservation totals. A paid scheduler route must match the latest enabled plan and current task version. Before the claim commits, Garnish multiplies per-attempt currency and token maxima by `1 + max_retries` and reserves the same number of request attempts. Actual retry dispatch is not yet implemented; this schema guarantees budget headroom if that execution loop is added.
+
+`api_dispatch_attempts`: `id`, `reservation_id`, monotonic attempt number, status, bounded failure kind, retryable flag, HTTP status, optional provider request-ID hash, start time, and completion time. Bodies, raw request IDs, prompts, responses, and credentials are excluded.
+
+Schema 19 adds the durable fake-transport retry state machine. Starting the first attempt atomically claims dispatch; another attempt can start only after a recorded retryable failure and while reserved attempts remain. Retryable provider failures, terminal failures, success, and uncertain transport/response outcomes are single-use transitions. Successful settlement and its attempt outcome commit together. A crash or uncertain send remains non-replayable, while request-budget accounting permanently counts every started attempt and reserves only the unstarted remainder.
 
 `api_model_prices`: `id`, provider/account/model/currency identity, integer-micro rates per million uncached-input/cache-read/cache-creation/output tokens, `effective_from/to`, `source`, `reason`, `created_at`, `supersedes_id`.
 

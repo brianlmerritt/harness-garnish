@@ -148,6 +148,18 @@ impl ApiTransportResponse {
     pub fn status_code(&self) -> u16 {
         self.status_code
     }
+
+    pub fn is_success(&self) -> bool {
+        (200..=299).contains(&self.status_code)
+    }
+
+    pub fn request_id_sha256(&self) -> String {
+        hex::encode(Sha256::digest(self.request_id.as_bytes()))
+    }
+
+    pub fn failure_classification(&self, provider: &str) -> ApiFailureClassification {
+        classify_api_failure(provider, self.status_code, &self.body)
+    }
 }
 
 impl fmt::Debug for ApiTransportResponse {

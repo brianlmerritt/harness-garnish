@@ -272,6 +272,10 @@ enum ApiCommand {
         #[arg(long)]
         project: Option<String>,
     },
+    Attempts {
+        #[arg(long)]
+        project: Option<String>,
+    },
     Spend {
         #[arg(long)]
         project: Option<String>,
@@ -963,6 +967,9 @@ fn run() -> Result<()> {
             }
             ApiCommand::Reservations { project } => {
                 print_json(&garnish.api_reservations(project.as_deref())?)
+            }
+            ApiCommand::Attempts { project } => {
+                print_json(&garnish.api_dispatch_attempts(project.as_deref())?)
             }
             ApiCommand::Spend { project } => print_json(&garnish.api_spend(project.as_deref())?),
             ApiCommand::PriceSet(args) => {

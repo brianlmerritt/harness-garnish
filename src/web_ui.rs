@@ -1,9 +1,9 @@
 use crate::{
     Garnish,
     domain::{
-        AgentCapabilityStatus, ApiBudget, ApiBudgetReservation, ApiModelPrice, ApiRequestPlan,
-        ApiSpend, ApprovalRequest, LocalNotification, Project, QuotaCollectionAttempt,
-        QuotaSurface, SchedulerWake, Task, TaskStatus,
+        AgentCapabilityStatus, ApiBudget, ApiBudgetReservation, ApiDispatchAttempt, ApiModelPrice,
+        ApiRequestPlan, ApiSpend, ApprovalRequest, LocalNotification, Project,
+        QuotaCollectionAttempt, QuotaSurface, SchedulerWake, Task, TaskStatus,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -50,6 +50,7 @@ pub struct OperatorSnapshot {
     pub api_budgets: Vec<ApiBudget>,
     pub api_request_plans: Vec<ApiRequestPlan>,
     pub api_reservations: Vec<ApiBudgetReservation>,
+    pub api_dispatch_attempts: Vec<ApiDispatchAttempt>,
     pub api_spend: Vec<ApiSpend>,
     pub api_prices: Vec<ApiModelPrice>,
     pub approvals: Vec<ApprovalRequest>,
@@ -73,6 +74,7 @@ pub fn operator_snapshot(garnish: &Garnish) -> Result<OperatorSnapshot> {
         api_budgets: garnish.api_budgets(None)?,
         api_request_plans: garnish.api_request_plans(None)?,
         api_reservations: garnish.api_reservations(None)?,
+        api_dispatch_attempts: garnish.api_dispatch_attempts(None)?,
         api_spend: garnish.api_spend(None)?,
         api_prices: garnish.api_model_prices()?,
         approvals: garnish.approvals(100)?,
@@ -733,6 +735,15 @@ fn render_api_budgets(snapshot: &OperatorSnapshot) -> String {
                         .any(|task| task.id == plan.task_id && task.project_id == budget.project_id)
             })
             .count();
+        let attempted = snapshot
+            .api_dispatch_attempts
+            .iter()
+            .filter(|attempt| {
+                snapshot.api_reservations.iter().any(|reservation| {
+                    reservation.id == attempt.reservation_id && reservation.budget_id == budget.id
+                })
+            })
+            .count();
         let spent = snapshot
             .api_spend
             .iter()
@@ -771,7 +782,7 @@ fn render_api_budgets(snapshot: &OperatorSnapshot) -> String {
         );
         let _ = write!(
             html,
-            "<article class=\"quota-row\"><div><strong>{} · {}</strong><small>{} · {}</small></div><div><strong>{planned} plans · {reserved} attempts reserved · {} settled</strong><small>{} cost micros · {} tokens used</small></div><span class=\"badge {class}\">{status}</span></article>",
+            "<article class=\"quota-row\"><div><strong>{} · {}</strong><small>{} · {}</small></div><div><strong>{planned} plans · {reserved} reserved · {attempted} attempted · {} settled</strong><small>{} cost micros · {} tokens used</small></div><span class=\"badge {class}\">{status}</span></article>",
             title_case(&budget.provider),
             escape_html(&budget.account),
             escape_html(project),

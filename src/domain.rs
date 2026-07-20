@@ -492,6 +492,20 @@ pub struct ApiBudgetReservation {
     pub run_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiDispatchAttempt {
+    pub id: String,
+    pub reservation_id: String,
+    pub attempt_number: u32,
+    pub status: String,
+    pub failure_kind: Option<String>,
+    pub retryable: Option<bool>,
+    pub response_status: Option<u16>,
+    pub provider_request_id_hash: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiReservationRequest {
     pub project_id: String,

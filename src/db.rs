@@ -1,13 +1,14 @@
 use crate::{
     domain::{
         AgentCapabilityProbe, ApiBudget, ApiBudgetReservation, ApiClaimReservationRequest,
-        ApiModelPrice, ApiRequestPlan, ApiReservationRequest, ApiSettlement, ApiSpend,
-        ApprovalRequest, BackupRecord, CalendarException, CalendarProfile, CheckpointAction,
-        CircuitBreaker, ClaimedRunStart, ControlState, DayKind, EmergencyStopResult,
-        FailureCategory, LocalNotification, NewApiBudget, NewApiModelPrice, NewApiRequestPlan,
-        NewTask, Project, ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface,
-        QuotaUsageSample, RetryPlan, RetryState, RouteDecision, RunCheckpoint, RunRecord,
-        SchedulerClaim, SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
+        ApiDispatchAttempt, ApiModelPrice, ApiRequestPlan, ApiReservationRequest, ApiSettlement,
+        ApiSpend, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
+        CheckpointAction, CircuitBreaker, ClaimedRunStart, ControlState, DayKind,
+        EmergencyStopResult, FailureCategory, LocalNotification, NewApiBudget, NewApiModelPrice,
+        NewApiRequestPlan, NewTask, Project, ProjectLink, QuotaCollectionAttempt, QuotaReservation,
+        QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteDecision, RunCheckpoint,
+        RunRecord, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task,
+        TaskStatus,
     },
     quota::QuotaObservation,
     schedule,
@@ -25,7 +26,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 
 pub struct Database {
     path: PathBuf,
@@ -493,6 +494,9 @@ impl Database {
         }
         if current < 18 {
             tx.execute_batch(MIGRATION_18)?;
+        }
+        if current < 19 {
+            tx.execute_batch(MIGRATION_19)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -2944,18 +2948,35 @@ impl Database {
                 Some(budget.period_end),
             ));
         }
-        let (spent_currency, spent_tokens, spent_requests): (i64, i64, i64) = self.conn.query_row(
+        let (spent_currency, spent_tokens): (i64, i64) = self.conn.query_row(
             "SELECT COALESCE(SUM(cost_micros), 0),
-                        COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
+                        COALESCE(SUM(input_tokens + output_tokens), 0)
                  FROM api_spend WHERE budget_id = ?1",
             [&budget.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let spent_requests: i64 = self.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM api_dispatch_attempts a
+                 JOIN api_budget_reservations r ON r.id = a.reservation_id
+                 WHERE r.budget_id = ?1)
+                +
+                (SELECT COUNT(*) FROM api_spend s
+                 WHERE s.budget_id = ?1 AND NOT EXISTS(
+                    SELECT 1 FROM api_dispatch_attempts a
+                    WHERE a.reservation_id = s.reservation_id
+                 ))",
+            [&budget.id],
+            |row| row.get(0),
         )?;
         let (reserved_currency, reserved_tokens, reserved_requests): (i64, i64, i64) =
             self.conn.query_row(
                 "SELECT COALESCE(SUM(reserved_currency_micros), 0),
                         COALESCE(SUM(reserved_input_tokens + reserved_output_tokens), 0),
-                        COALESCE(SUM(reserved_requests), 0)
+                        COALESCE(SUM(reserved_requests - (
+                            SELECT COUNT(*) FROM api_dispatch_attempts a
+                            WHERE a.reservation_id = api_budget_reservations.id
+                        )), 0)
                  FROM api_budget_reservations
                  WHERE budget_id = ?1
                    AND ((status = 'active' AND expires_at > ?2) OR status = 'dispatched')",
@@ -3082,6 +3103,238 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(reservation)
+    }
+
+    pub fn begin_api_dispatch_attempt(
+        &mut self,
+        reservation_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ApiDispatchAttempt> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reservation = api_reservation_by_id_tx(&tx, reservation_id)?;
+        if reservation.expires_at <= now {
+            bail!("api.reservation_inactive: dispatch reservation has expired");
+        }
+        match reservation.status.as_str() {
+            "active" => {
+                if reservation.claim_id.is_some() && reservation.run_id.is_none() {
+                    bail!(
+                        "api.claim_not_consumed: scheduler-bound request cannot dispatch before its run starts"
+                    );
+                }
+            }
+            "dispatched" => {}
+            _ => bail!("api.dispatch_attempt_denied: reservation is not dispatchable"),
+        }
+        let previous = tx
+            .query_row(
+                &format!(
+                    "{API_DISPATCH_ATTEMPT_SELECT} WHERE reservation_id = ?1
+                     ORDER BY attempt_number DESC LIMIT 1"
+                ),
+                [reservation_id],
+                map_api_dispatch_attempt,
+            )
+            .optional()?;
+        if previous
+            .as_ref()
+            .is_some_and(|attempt| attempt.status != "retryable_failure")
+        {
+            bail!("api.retry_denied: the previous attempt is not safely retryable");
+        }
+        let attempt_number = previous
+            .as_ref()
+            .map_or(1, |attempt| attempt.attempt_number.saturating_add(1));
+        if attempt_number > reservation.reserved_requests {
+            bail!("api.retry_exhausted: no reserved request attempt remains");
+        }
+        if reservation.status == "active" {
+            let changed = tx.execute(
+                "UPDATE api_budget_reservations
+                 SET status = 'dispatched', dispatch_claimed_at = ?2
+                 WHERE id = ?1 AND status = 'active'",
+                params![reservation_id, now.to_rfc3339()],
+            )?;
+            if changed != 1 {
+                bail!("api.dispatch_claim_failed: reservation changed before dispatch");
+            }
+            append_event_tx(
+                &tx,
+                Some(&reservation.project_id),
+                Some(&reservation.task_id),
+                None,
+                "api.dispatch_claimed",
+                "control_plane",
+                &serde_json::json!({"reservation_id": reservation_id}),
+            )?;
+        }
+        let attempt = ApiDispatchAttempt {
+            id: Ulid::new().to_string(),
+            reservation_id: reservation_id.into(),
+            attempt_number,
+            status: "started".into(),
+            failure_kind: None,
+            retryable: None,
+            response_status: None,
+            provider_request_id_hash: None,
+            started_at: now,
+            completed_at: None,
+        };
+        tx.execute(
+            "INSERT INTO api_dispatch_attempts(
+                id, reservation_id, attempt_number, status, failure_kind, retryable,
+                response_status, provider_request_id_hash, started_at, completed_at
+             ) VALUES (?1, ?2, ?3, 'started', NULL, NULL, NULL, NULL, ?4, NULL)",
+            params![
+                attempt.id,
+                attempt.reservation_id,
+                attempt.attempt_number,
+                attempt.started_at.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&reservation.project_id),
+            Some(&reservation.task_id),
+            None,
+            "api.dispatch_attempt_started",
+            "api_provider",
+            &serde_json::json!({
+                "reservation_id": reservation_id,
+                "attempt_id": attempt.id,
+                "attempt_number": attempt.attempt_number,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(attempt)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_api_dispatch_attempt_failure(
+        &mut self,
+        attempt_id: &str,
+        status: &str,
+        failure_kind: &str,
+        retryable: bool,
+        response_status: Option<u16>,
+        provider_request_id_hash: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<ApiDispatchAttempt> {
+        if !matches!(
+            status,
+            "retryable_failure" | "terminal_failure" | "uncertain"
+        ) {
+            bail!("api.attempt_status_invalid: failure attempt status is invalid");
+        }
+        if (status == "retryable_failure") != retryable {
+            bail!("api.attempt_retry_invalid: retry flag differs from attempt status");
+        }
+        if failure_kind.trim().is_empty() || failure_kind.chars().count() > 100 {
+            bail!("api.attempt_failure_invalid: failure kind must contain 1..=100 characters");
+        }
+        if let Some(hash) = provider_request_id_hash {
+            validate_sha256(hash, "provider request ID hash")?;
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (reservation_id, project_id, task_id): (String, String, String) = tx
+            .query_row(
+                "SELECT a.reservation_id, r.project_id, r.task_id
+                 FROM api_dispatch_attempts a
+                 JOIN api_budget_reservations r ON r.id = a.reservation_id
+                 WHERE a.id = ?1 AND a.status = 'started'",
+                [attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("api.attempt_replay: attempt is not awaiting an outcome"))?;
+        let changed = tx.execute(
+            "UPDATE api_dispatch_attempts
+             SET status = ?2, failure_kind = ?3, retryable = ?4, response_status = ?5,
+                 provider_request_id_hash = ?6, completed_at = ?7
+             WHERE id = ?1 AND status = 'started'",
+            params![
+                attempt_id,
+                status,
+                failure_kind,
+                retryable,
+                response_status.map(i64::from),
+                provider_request_id_hash,
+                now.to_rfc3339(),
+            ],
+        )?;
+        if changed != 1 {
+            bail!("api.attempt_replay: attempt outcome was already recorded");
+        }
+        append_event_tx(
+            &tx,
+            Some(&project_id),
+            Some(&task_id),
+            None,
+            "api.dispatch_attempt_failed",
+            "api_provider",
+            &serde_json::json!({
+                "reservation_id": reservation_id,
+                "attempt_id": attempt_id,
+                "status": status,
+                "failure_kind": failure_kind,
+                "retryable": retryable,
+                "response_status": response_status,
+                "provider_request_id_hash": provider_request_id_hash,
+            }),
+        )?;
+        let attempt = tx.query_row(
+            &format!("{API_DISPATCH_ATTEMPT_SELECT} WHERE id = ?1"),
+            [attempt_id],
+            map_api_dispatch_attempt,
+        )?;
+        tx.commit()?;
+        Ok(attempt)
+    }
+
+    pub fn list_api_dispatch_attempts(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<ApiDispatchAttempt>> {
+        let sql = if project_id.is_some() {
+            format!(
+                "{API_DISPATCH_ATTEMPT_SELECT} WHERE reservation_id IN (
+                    SELECT id FROM api_budget_reservations WHERE project_id = ?1
+                 ) ORDER BY started_at DESC, id DESC"
+            )
+        } else {
+            format!("{API_DISPATCH_ATTEMPT_SELECT} ORDER BY started_at DESC, id DESC")
+        };
+        let mut statement = self.conn.prepare(&sql)?;
+        if let Some(project_id) = project_id {
+            Ok(statement
+                .query_map([project_id], map_api_dispatch_attempt)?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        } else {
+            Ok(statement
+                .query_map([], map_api_dispatch_attempt)?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+    }
+
+    pub fn latest_api_dispatch_attempt(
+        &self,
+        reservation_id: &str,
+    ) -> Result<Option<ApiDispatchAttempt>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "{API_DISPATCH_ATTEMPT_SELECT} WHERE reservation_id = ?1
+                     ORDER BY attempt_number DESC LIMIT 1"
+                ),
+                [reservation_id],
+                map_api_dispatch_attempt,
+            )
+            .optional()?)
     }
 
     pub fn release_api_reservation(
@@ -3235,6 +3488,23 @@ impl Database {
     }
 
     pub fn settle_api_reservation(&mut self, settlement: &ApiSettlement) -> Result<ApiSpend> {
+        self.settle_api_reservation_inner(settlement, None)
+    }
+
+    pub fn settle_api_dispatch_attempt(
+        &mut self,
+        attempt_id: &str,
+        response_status: u16,
+        settlement: &ApiSettlement,
+    ) -> Result<ApiSpend> {
+        self.settle_api_reservation_inner(settlement, Some((attempt_id, response_status)))
+    }
+
+    fn settle_api_reservation_inner(
+        &mut self,
+        settlement: &ApiSettlement,
+        attempt: Option<(&str, u16)>,
+    ) -> Result<ApiSpend> {
         validate_sha256(
             &settlement.provider_request_id_hash,
             "provider request ID hash",
@@ -3251,6 +3521,30 @@ impl Database {
         let reservation = api_reservation_by_id_tx(&tx, &settlement.reservation_id)?;
         if reservation.status != "dispatched" {
             bail!("api.settlement_replay: reservation is not awaiting settlement");
+        }
+        if let Some((attempt_id, _)) = attempt {
+            let valid: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM api_dispatch_attempts
+                    WHERE id = ?1 AND reservation_id = ?2 AND status = 'started'
+                 )",
+                params![attempt_id, settlement.reservation_id],
+                |row| row.get(0),
+            )?;
+            if !valid {
+                bail!("api.attempt_replay: attempt is not awaiting settlement");
+            }
+        } else {
+            let has_attempts: bool = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM api_dispatch_attempts WHERE reservation_id = ?1
+                 )",
+                [&settlement.reservation_id],
+                |row| row.get(0),
+            )?;
+            if has_attempts {
+                bail!("api.attempt_binding_required: settlement must bind its dispatch attempt");
+            }
         }
         if settlement.input_tokens > reservation.per_attempt_input_tokens
             || settlement.output_tokens > reservation.per_attempt_output_tokens
@@ -3393,6 +3687,24 @@ impl Database {
                 settlement.observed_at.to_rfc3339()
             ],
         )?;
+        if let Some((attempt_id, response_status)) = attempt {
+            let changed = tx.execute(
+                "UPDATE api_dispatch_attempts
+                 SET status = 'succeeded', retryable = 0, response_status = ?2,
+                     provider_request_id_hash = ?3, completed_at = ?4
+                 WHERE id = ?1 AND reservation_id = ?5 AND status = 'started'",
+                params![
+                    attempt_id,
+                    i64::from(response_status),
+                    settlement.provider_request_id_hash,
+                    settlement.observed_at.to_rfc3339(),
+                    settlement.reservation_id,
+                ],
+            )?;
+            if changed != 1 {
+                bail!("api.attempt_replay: attempt changed before settlement");
+            }
+        }
         append_event_tx(
             &tx,
             Some(&reservation.project_id),
@@ -5408,6 +5720,11 @@ const API_REQUEST_PLAN_SELECT: &str = "SELECT
     request_digest, reason, created_at, supersedes_id
  FROM api_request_plans";
 
+const API_DISPATCH_ATTEMPT_SELECT: &str = "SELECT
+    id, reservation_id, attempt_number, status, failure_kind, retryable,
+    response_status, provider_request_id_hash, started_at, completed_at
+ FROM api_dispatch_attempts";
+
 const API_MODEL_PRICE_SELECT: &str = "SELECT
     id, provider, account, model, currency, input_micros_per_million,
     cached_input_micros_per_million, cache_creation_input_micros_per_million,
@@ -5533,6 +5850,22 @@ fn map_api_request_plan(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiRequestP
     })
 }
 
+fn map_api_dispatch_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiDispatchAttempt> {
+    let completed_at: Option<String> = row.get(9)?;
+    Ok(ApiDispatchAttempt {
+        id: row.get(0)?,
+        reservation_id: row.get(1)?,
+        attempt_number: row.get(2)?,
+        status: row.get(3)?,
+        failure_kind: row.get(4)?,
+        retryable: row.get(5)?,
+        response_status: row.get(6)?,
+        provider_request_id_hash: row.get(7)?,
+        started_at: parse_time(row.get(8)?)?,
+        completed_at: completed_at.map(parse_time).transpose()?,
+    })
+}
+
 fn reserve_api_budget_tx(
     tx: &Transaction<'_>,
     request: &ApiReservationRequest,
@@ -5585,17 +5918,34 @@ fn reserve_api_budget_tx(
     if active_count >= i64::from(budget.max_concurrent_requests) {
         bail!("api.concurrency_limit: project API concurrency ceiling reached");
     }
-    let (spent_currency, spent_tokens, spent_requests): (i64, i64, i64) = tx.query_row(
+    let (spent_currency, spent_tokens): (i64, i64) = tx.query_row(
         "SELECT COALESCE(SUM(cost_micros), 0),
-                COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
+                COALESCE(SUM(input_tokens + output_tokens), 0)
          FROM api_spend WHERE budget_id = ?1",
         [&budget.id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let spent_requests: i64 = tx.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM api_dispatch_attempts a
+             JOIN api_budget_reservations r ON r.id = a.reservation_id
+             WHERE r.budget_id = ?1)
+            +
+            (SELECT COUNT(*) FROM api_spend s
+             WHERE s.budget_id = ?1 AND NOT EXISTS(
+                SELECT 1 FROM api_dispatch_attempts a
+                WHERE a.reservation_id = s.reservation_id
+             ))",
+        [&budget.id],
+        |row| row.get(0),
     )?;
     let (reserved_currency, reserved_tokens, reserved_requests): (i64, i64, i64) = tx.query_row(
         "SELECT COALESCE(SUM(reserved_currency_micros), 0),
                     COALESCE(SUM(reserved_input_tokens + reserved_output_tokens), 0),
-                    COALESCE(SUM(reserved_requests), 0)
+                    COALESCE(SUM(reserved_requests - (
+                        SELECT COUNT(*) FROM api_dispatch_attempts a
+                        WHERE a.reservation_id = api_budget_reservations.id
+                    )), 0)
              FROM api_budget_reservations
              WHERE budget_id = ?1 AND status IN ('active', 'dispatched')",
         [&budget.id],
@@ -6806,6 +7156,31 @@ SET per_attempt_input_tokens = reserved_input_tokens,
     per_attempt_output_tokens = reserved_output_tokens;
 "#;
 
+const MIGRATION_19: &str = r#"
+CREATE TABLE api_dispatch_attempts (
+    id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL REFERENCES api_budget_reservations(id),
+    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+    status TEXT NOT NULL CHECK(status IN (
+        'started', 'retryable_failure', 'terminal_failure', 'succeeded', 'uncertain'
+    )),
+    failure_kind TEXT CHECK(failure_kind IS NULL OR length(failure_kind) BETWEEN 1 AND 100),
+    retryable INTEGER CHECK(retryable IS NULL OR retryable IN (0, 1)),
+    response_status INTEGER CHECK(
+        response_status IS NULL OR response_status BETWEEN 100 AND 599
+    ),
+    provider_request_id_hash TEXT CHECK(
+        provider_request_id_hash IS NULL OR length(provider_request_id_hash) = 64
+    ),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(reservation_id, attempt_number)
+);
+
+CREATE INDEX idx_api_dispatch_attempts_reservation
+    ON api_dispatch_attempts(reservation_id, attempt_number);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7302,7 +7677,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 18);
+        assert_eq!(migrated.schema_version(), 19);
         assert!(migrated.list_latest_api_budgets(None).unwrap().is_empty());
         assert!(migrated.list_api_reservations(None).unwrap().is_empty());
         assert!(migrated.list_api_spend(None).unwrap().is_empty());
@@ -7344,7 +7719,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 18);
+        assert_eq!(migrated.schema_version(), 19);
         assert!(migrated.list_api_model_prices().unwrap().is_empty());
         let column_count: i64 = migrated
             .conn
@@ -7398,7 +7773,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 18);
+        assert_eq!(migrated.schema_version(), 19);
         let column_count: i64 = migrated
             .conn
             .query_row(
@@ -7461,7 +7836,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 18);
+        assert_eq!(migrated.schema_version(), 19);
         let plan_table: bool = migrated
             .conn
             .query_row(
@@ -7492,6 +7867,45 @@ mod tests {
                     .is_some_and(|name| name.contains("v17") && name.ends_with("backup.db"))
             })
             .expect("schema-17 backup");
+        let integrity: String = Connection::open(backup)
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn schema_eighteen_migration_adds_durable_dispatch_attempts_with_backup() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("state.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE api_budget_reservations(id TEXT PRIMARY KEY);")
+            .unwrap();
+        connection.pragma_update(None, "user_version", 18).unwrap();
+        drop(connection);
+
+        let migrated = Database::open(&database_path).unwrap();
+        assert_eq!(migrated.schema_version(), 19);
+        let attempt_table: bool = migrated
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'api_dispatch_attempts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(attempt_table);
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("v18") && name.ends_with("backup.db"))
+            })
+            .expect("schema-18 backup");
         let integrity: String = Connection::open(backup)
             .unwrap()
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))

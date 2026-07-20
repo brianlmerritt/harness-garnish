@@ -4,7 +4,7 @@ use crate::{
         run_invocation_with_tick, safe_write,
     },
     api_providers::{
-        ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest,
+        ApiFailureKind, ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest,
         api_request_conservative_content_token_bound, api_request_conservative_input_token_bound,
         api_request_content_digest, api_request_digest, parse_api_transport_response,
         prepare_api_request,
@@ -12,16 +12,16 @@ use crate::{
     db::Database,
     domain::{
         AgentCapabilityProbe, AgentCapabilityStatus, ApiBudget, ApiBudgetReservation,
-        ApiClaimReservationRequest, ApiModelPrice, ApiRequestPlan, ApiReservationRequest,
-        ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
-        CheckpointAction, CircuitBreaker, ControlState, DayKind, EmergencyStopResult,
-        FailureCategory, LocalNotification, NewApiBudget, NewApiModelPrice, NewApiRequestPlan,
-        NewTask, Project, ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface,
-        QuotaUsageSample, RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget,
-        RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation, SchedulerApiClaim,
-        SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary,
-        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
-        UsageForecast,
+        ApiClaimReservationRequest, ApiDispatchAttempt, ApiModelPrice, ApiRequestPlan,
+        ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord,
+        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ControlState,
+        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewApiBudget,
+        NewApiModelPrice, NewApiRequestPlan, NewTask, Project, ProjectLink, QuotaCollectionAttempt,
+        QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteCandidate,
+        RouteDecision, RouteTarget, RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation,
+        SchedulerApiClaim, SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig,
+        SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake,
+        Task, TaskStatus, UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -38,7 +38,6 @@ use crate::{
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
@@ -75,6 +74,7 @@ pub struct SupervisedInvocationResult {
 pub struct ApiExecutionResult {
     pub response: ApiProviderResponse,
     pub spend: ApiSpend,
+    pub attempts: Vec<ApiDispatchAttempt>,
 }
 
 impl Garnish {
@@ -101,7 +101,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 18,
+            schema_version: 19,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -532,6 +532,13 @@ impl Garnish {
         self.db.list_api_reservations(project_id.as_deref())
     }
 
+    pub fn api_dispatch_attempts(&self, project: Option<&str>) -> Result<Vec<ApiDispatchAttempt>> {
+        let project_id = project
+            .map(|value| self.db.project(value).map(|project| project.id))
+            .transpose()?;
+        self.db.list_api_dispatch_attempts(project_id.as_deref())
+    }
+
     pub fn api_spend(&self, project: Option<&str>) -> Result<Vec<ApiSpend>> {
         let project_id = project
             .map(|value| self.db.project(value).map(|project| project.id))
@@ -648,8 +655,18 @@ impl Garnish {
         if !self.policy.api_allowed(&reservation.provider) {
             bail!("api.policy_disabled: effective policy disables this API provider");
         }
-        if reservation.status != "active" || reservation.expires_at <= now {
-            bail!("api.reservation_inactive: request requires a live undispatched reservation");
+        let retry_resume = if reservation.status == "dispatched" {
+            self.db
+                .latest_api_dispatch_attempt(reservation_id)?
+                .is_some_and(|attempt| {
+                    attempt.status == "retryable_failure"
+                        && attempt.attempt_number < reservation.reserved_requests
+                })
+        } else {
+            false
+        };
+        if (reservation.status != "active" && !retry_resume) || reservation.expires_at <= now {
+            bail!("api.reservation_inactive: request requires a live dispatchable reservation");
         }
         if reservation.claim_id.is_some() && reservation.run_id.is_none() {
             bail!(
@@ -704,39 +721,132 @@ impl Garnish {
                 )
             })
             .transpose()?;
-        let reservation = self.claim_api_dispatch(reservation_id, now)?;
-        let transport_response = transport.send(&prepared)?;
-        let response = parse_api_transport_response(&reservation.provider, &transport_response)?;
-        if response.provider != reservation.provider || response.model != reservation.model {
-            bail!("api.response_identity_mismatch: provider response differs from reservation");
-        }
-        let (cost_micros, pricing_evidence_id) = match pricing_evidence {
-            Some(price) => {
-                let cost = crate::api_pricing::calculate_api_cost_micros(
-                    &price,
-                    response.input_tokens,
-                    response.cached_input_tokens,
-                    response.cache_creation_input_tokens,
-                    response.output_tokens,
+        loop {
+            let attempt = self.db.begin_api_dispatch_attempt(reservation_id, now)?;
+            let transport_response = match transport.send(&prepared) {
+                Ok(response) => response,
+                Err(_) => {
+                    self.db.complete_api_dispatch_attempt_failure(
+                        &attempt.id,
+                        "uncertain",
+                        "transport",
+                        false,
+                        None,
+                        None,
+                        now,
+                    )?;
+                    bail!(
+                        "api.transport_uncertain: transport failed after dispatch; automatic replay is denied"
+                    );
+                }
+            };
+            let request_id_hash = transport_response.request_id_sha256();
+            if !transport_response.is_success() {
+                let classification =
+                    transport_response.failure_classification(&active_reservation.provider);
+                let can_retry = classification.retryable
+                    && attempt.attempt_number < active_reservation.reserved_requests;
+                self.db.complete_api_dispatch_attempt_failure(
+                    &attempt.id,
+                    if can_retry {
+                        "retryable_failure"
+                    } else {
+                        "terminal_failure"
+                    },
+                    api_failure_kind_key(classification.kind),
+                    can_retry,
+                    Some(transport_response.status_code()),
+                    Some(&request_id_hash),
+                    now,
                 )?;
-                (cost, Some(price.id))
+                if can_retry {
+                    continue;
+                }
+                if classification.retryable {
+                    bail!("api.retry_exhausted: all reserved request attempts failed");
+                }
+                bail!(
+                    "api.provider_failure: kind={} retryable=false",
+                    api_failure_kind_key(classification.kind)
+                );
             }
-            None => (0, None),
-        };
-        let spend = self.db.settle_api_reservation(&ApiSettlement {
-            reservation_id: reservation.id,
-            provider_request_id_hash: hex::encode(Sha256::digest(response.request_id.as_bytes())),
-            input_tokens: response.input_tokens,
-            cached_input_tokens: response.cached_input_tokens,
-            cache_creation_input_tokens: response.cache_creation_input_tokens,
-            output_tokens: response.output_tokens,
-            cost_micros,
-            currency: budget.currency,
-            pricing_evidence_id,
-            source: "provider_reported".into(),
-            observed_at: now,
-        })?;
-        Ok(ApiExecutionResult { response, spend })
+            let response = match parse_api_transport_response(
+                &active_reservation.provider,
+                &transport_response,
+            ) {
+                Ok(response) => response,
+                Err(_) => {
+                    self.db.complete_api_dispatch_attempt_failure(
+                        &attempt.id,
+                        "uncertain",
+                        "response_invalid",
+                        false,
+                        Some(transport_response.status_code()),
+                        Some(&request_id_hash),
+                        now,
+                    )?;
+                    bail!(
+                        "api.response_uncertain: successful transport response was not authoritative; automatic replay is denied"
+                    );
+                }
+            };
+            if response.provider != active_reservation.provider
+                || response.model != active_reservation.model
+            {
+                self.db.complete_api_dispatch_attempt_failure(
+                    &attempt.id,
+                    "uncertain",
+                    "response_identity_mismatch",
+                    false,
+                    Some(transport_response.status_code()),
+                    Some(&request_id_hash),
+                    now,
+                )?;
+                bail!("api.response_identity_mismatch: provider response differs from reservation");
+            }
+            let (cost_micros, pricing_evidence_id) = match pricing_evidence.as_ref() {
+                Some(price) => {
+                    let cost = crate::api_pricing::calculate_api_cost_micros(
+                        price,
+                        response.input_tokens,
+                        response.cached_input_tokens,
+                        response.cache_creation_input_tokens,
+                        response.output_tokens,
+                    )?;
+                    (cost, Some(price.id.clone()))
+                }
+                None => (0, None),
+            };
+            let spend = self.db.settle_api_dispatch_attempt(
+                &attempt.id,
+                transport_response.status_code(),
+                &ApiSettlement {
+                    reservation_id: active_reservation.id.clone(),
+                    provider_request_id_hash: request_id_hash,
+                    input_tokens: response.input_tokens,
+                    cached_input_tokens: response.cached_input_tokens,
+                    cache_creation_input_tokens: response.cache_creation_input_tokens,
+                    output_tokens: response.output_tokens,
+                    cost_micros,
+                    currency: budget.currency.clone(),
+                    pricing_evidence_id,
+                    source: "provider_reported".into(),
+                    observed_at: now,
+                },
+            )?;
+            let mut attempts = self
+                .db
+                .list_api_dispatch_attempts(None)?
+                .into_iter()
+                .filter(|entry| entry.reservation_id == reservation_id)
+                .collect::<Vec<_>>();
+            attempts.sort_by_key(|entry| entry.attempt_number);
+            return Ok(ApiExecutionResult {
+                response,
+                spend,
+                attempts,
+            });
+        }
     }
 
     pub fn release_api_reservation(
@@ -3126,6 +3236,19 @@ fn api_error_reason_code(message: &str) -> &str {
     }
 }
 
+fn api_failure_kind_key(kind: ApiFailureKind) -> &'static str {
+    match kind {
+        ApiFailureKind::Authentication => "authentication",
+        ApiFailureKind::Permission => "permission",
+        ApiFailureKind::RateLimited => "rate_limited",
+        ApiFailureKind::UsageExhausted => "usage_exhausted",
+        ApiFailureKind::InvalidRequest => "invalid_request",
+        ApiFailureKind::Transient => "transient",
+        ApiFailureKind::Provider => "provider",
+        ApiFailureKind::Unknown => "unknown",
+    }
+}
+
 fn worst_case_api_cost_micros(
     price: &ApiModelPrice,
     input_tokens: u64,
@@ -3707,6 +3830,8 @@ mod tests {
 
         struct FakeTransport {
             sends: usize,
+            terminal: bool,
+            transport_error: bool,
         }
         impl ApiTransport for FakeTransport {
             fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse> {
@@ -3717,6 +3842,35 @@ mod tests {
                     let body: serde_json::Value = serde_json::from_slice(body).unwrap();
                     assert_eq!(body["model"], "gpt-fixture");
                 });
+                if self.transport_error {
+                    bail!("transport-secret-canary");
+                }
+                if self.terminal {
+                    return ApiTransportResponse::new(
+                        401,
+                        "provider-request-auth-failure".into(),
+                        br#"{"error":{"type":"authentication_error","code":"invalid_api_key"}}"#
+                            .to_vec(),
+                        false,
+                    );
+                }
+                if self.sends == 1 {
+                    return ApiTransportResponse::new(
+                        429,
+                        "provider-request-retry-1".into(),
+                        br#"{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}"#
+                            .to_vec(),
+                        false,
+                    );
+                }
+                if self.sends == 2 {
+                    return ApiTransportResponse::new(
+                        503,
+                        "provider-request-retry-2".into(),
+                        br#"{"error":{"type":"server_error","code":"unavailable"}}"#.to_vec(),
+                        false,
+                    );
+                }
                 ApiTransportResponse::new(
                     200,
                     "provider-request-fixture".into(),
@@ -3752,7 +3906,7 @@ mod tests {
         let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
         garnish.policy.openai_api_enabled = true;
         let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
-        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        let initial_task = garnish.add_task(&task(project.id.clone())).unwrap();
         let budget = garnish
             .configure_api_budget(&NewApiBudget {
                 project_id: project.id.clone(),
@@ -3768,10 +3922,10 @@ mod tests {
                 period_end: now + Duration::days(1),
                 allowed_models: vec!["gpt-fixture".into()],
                 allowed_tools: vec![],
-                allowed_roles: vec!["planner".into()],
+                allowed_roles: vec!["planner".into(), "implementer".into()],
                 max_output_tokens: 18,
-                max_retries: 0,
-                max_concurrent_requests: 1,
+                max_retries: 2,
+                max_concurrent_requests: 3,
                 reason: "fake lifecycle".into(),
             })
             .unwrap();
@@ -3803,8 +3957,8 @@ mod tests {
         let digest = api_request_digest(&budget, &spec, now).unwrap();
         let reservation = garnish
             .reserve_api_budget(&ApiReservationRequest {
-                project_id: project.id,
-                task_id: task.id,
+                project_id: project.id.clone(),
+                task_id: initial_task.id.clone(),
                 provider: "openai".into(),
                 account: "default".into(),
                 model: "gpt-fixture".into(),
@@ -3813,16 +3967,32 @@ mod tests {
                 reserved_currency_micros: 100,
                 reserved_input_tokens: 8,
                 reserved_output_tokens: 18,
-                reserved_attempts: 1,
+                reserved_attempts: 3,
                 now,
                 expires_at: now + Duration::minutes(5),
             })
             .unwrap();
-        let mut transport = FakeTransport { sends: 0 };
+        let mut transport = FakeTransport {
+            sends: 0,
+            terminal: false,
+            transport_error: false,
+        };
         let result = garnish
             .execute_reserved_api_request(&reservation.id, &spec, &mut transport, now)
             .unwrap();
-        assert_eq!(transport.sends, 1);
+        assert_eq!(transport.sends, 3);
+        assert_eq!(result.attempts.len(), 3);
+        assert_eq!(result.attempts[0].status, "retryable_failure");
+        assert_eq!(result.attempts[1].status, "retryable_failure");
+        assert_eq!(result.attempts[2].status, "succeeded");
+        assert_eq!(
+            result.attempts[0].failure_kind.as_deref(),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            result.attempts[1].failure_kind.as_deref(),
+            Some("transient")
+        );
         assert_eq!(result.spend.cost_micros, 26);
         assert_eq!(result.spend.cached_input_tokens, 2);
         assert_eq!(result.spend.cache_creation_input_tokens, 1);
@@ -3839,20 +4009,165 @@ mod tests {
                 .execute_reserved_api_request(&reservation.id, &spec, &mut transport, now)
                 .is_err()
         );
-        assert_eq!(transport.sends, 1);
+        assert_eq!(transport.sends, 3);
+
+        let terminal_task = garnish.add_task(&task(project.id.clone())).unwrap();
+        let terminal_spec = ApiRequestSpec {
+            input: "different bounded terminal prompt".into(),
+            ..spec.clone()
+        };
+        let terminal_digest = api_request_digest(&budget, &terminal_spec, now).unwrap();
+        let terminal_reservation = garnish
+            .reserve_api_budget(&ApiReservationRequest {
+                project_id: project.id,
+                task_id: terminal_task.id,
+                provider: "openai".into(),
+                account: "default".into(),
+                model: "gpt-fixture".into(),
+                role: "planner".into(),
+                request_digest: terminal_digest,
+                reserved_currency_micros: 100,
+                reserved_input_tokens: 8,
+                reserved_output_tokens: 18,
+                reserved_attempts: 3,
+                now,
+                expires_at: now + Duration::minutes(5),
+            })
+            .unwrap();
+        let mut terminal_transport = FakeTransport {
+            sends: 0,
+            terminal: true,
+            transport_error: false,
+        };
+        let terminal_error = garnish
+            .execute_reserved_api_request(
+                &terminal_reservation.id,
+                &terminal_spec,
+                &mut terminal_transport,
+                now,
+            )
+            .unwrap_err();
+        assert!(terminal_error.to_string().contains("authentication"));
+        assert_eq!(terminal_transport.sends, 1);
+        let terminal_attempts = garnish
+            .api_dispatch_attempts(Some("fixture"))
+            .unwrap()
+            .into_iter()
+            .filter(|attempt| attempt.reservation_id == terminal_reservation.id)
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_attempts.len(), 1);
+        assert_eq!(terminal_attempts[0].status, "terminal_failure");
+        assert_eq!(
+            terminal_attempts[0].failure_kind.as_deref(),
+            Some("authentication")
+        );
+
+        let uncertain_task = garnish
+            .add_task(&task(terminal_reservation.project_id.clone()))
+            .unwrap();
+        let uncertain_spec = ApiRequestSpec {
+            input: "different bounded uncertain prompt".into(),
+            ..spec.clone()
+        };
+        let uncertain_digest = api_request_digest(&budget, &uncertain_spec, now).unwrap();
+        let uncertain_reservation = garnish
+            .reserve_api_budget(&ApiReservationRequest {
+                project_id: terminal_reservation.project_id.clone(),
+                task_id: uncertain_task.id,
+                provider: "openai".into(),
+                account: "default".into(),
+                model: "gpt-fixture".into(),
+                role: "planner".into(),
+                request_digest: uncertain_digest,
+                reserved_currency_micros: 100,
+                reserved_input_tokens: 8,
+                reserved_output_tokens: 18,
+                reserved_attempts: 3,
+                now,
+                expires_at: now + Duration::minutes(5),
+            })
+            .unwrap();
+        let mut uncertain_transport = FakeTransport {
+            sends: 0,
+            terminal: false,
+            transport_error: true,
+        };
+        let uncertain_error = garnish
+            .execute_reserved_api_request(
+                &uncertain_reservation.id,
+                &uncertain_spec,
+                &mut uncertain_transport,
+                now,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(uncertain_error.contains("api.transport_uncertain"));
+        assert!(!uncertain_error.contains("transport-secret-canary"));
+        assert_eq!(uncertain_transport.sends, 1);
+        let uncertain_attempts = garnish
+            .api_dispatch_attempts(Some("fixture"))
+            .unwrap()
+            .into_iter()
+            .filter(|attempt| attempt.reservation_id == uncertain_reservation.id)
+            .collect::<Vec<_>>();
+        assert_eq!(uncertain_attempts.len(), 1);
+        assert_eq!(uncertain_attempts[0].status, "uncertain");
+        assert_eq!(
+            uncertain_attempts[0].failure_kind.as_deref(),
+            Some("transport")
+        );
+        let capacity = garnish
+            .db
+            .api_route_capacity(&terminal_reservation.project_id, "openai", "default", now)
+            .unwrap();
+        assert!(capacity.allowed);
+        assert_eq!(capacity.remaining_percent, Some(10.0));
+
+        let data_dir = garnish.data_dir().to_path_buf();
+        drop(garnish);
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        garnish.policy.openai_api_enabled = true;
+        let mut replay_transport = FakeTransport {
+            sends: 0,
+            terminal: false,
+            transport_error: false,
+        };
+        assert!(
+            garnish
+                .execute_reserved_api_request(
+                    &uncertain_reservation.id,
+                    &uncertain_spec,
+                    &mut replay_transport,
+                    now,
+                )
+                .is_err()
+        );
+        assert_eq!(replay_transport.sends, 0);
         let backup_path = dir.path().join("state-backup.db");
         let backup = garnish.create_backup(Some(&backup_path)).unwrap();
-        let state = fs::read(garnish.data_dir().join("state.db")).unwrap();
-        let backup_state = fs::read(backup.path).unwrap();
+        let mut state_artifacts = fs::read_dir(garnish.data_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .map(|entry| fs::read(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        state_artifacts.push(fs::read(backup.path).unwrap());
         for canary in [
             "fixture-secret-never-persist",
             "sensitive instructions",
             "sensitive prompt",
             "sensitive output",
             "provider-request-fixture",
+            "provider-request-retry-1",
+            "provider-request-retry-2",
+            "provider-request-auth-failure",
+            "transport-secret-canary",
         ] {
-            assert!(!String::from_utf8_lossy(&state).contains(canary));
-            assert!(!String::from_utf8_lossy(&backup_state).contains(canary));
+            assert!(
+                state_artifacts
+                    .iter()
+                    .all(|artifact| !String::from_utf8_lossy(artifact).contains(canary))
+            );
         }
     }
 
