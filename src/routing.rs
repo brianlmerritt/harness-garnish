@@ -40,6 +40,7 @@ pub struct RoutingCandidateInput {
     pub capabilities: Vec<String>,
     pub remaining_percent: Option<f64>,
     pub reserve_percent: f64,
+    pub forecast_percent: f64,
     pub historical_success_percent: Option<f64>,
     pub continuity: bool,
     pub preference: f64,
@@ -48,7 +49,6 @@ pub struct RoutingCandidateInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRequest {
     pub required_capabilities: Vec<String>,
-    pub forecast_percent: f64,
     pub pin: Option<CandidateIdentity>,
 }
 
@@ -138,7 +138,7 @@ fn evaluate_candidate(
     request: &RoutingRequest,
     candidate: &RoutingCandidateInput,
 ) -> CandidateEvaluation {
-    let required_headroom = candidate.reserve_percent + request.forecast_percent;
+    let required_headroom = candidate.reserve_percent + candidate.forecast_percent;
     let denied = |reason_code: &str, reason: String| CandidateEvaluation {
         identity: candidate.identity.clone(),
         allowed: false,
@@ -242,7 +242,6 @@ fn evaluate_candidate(
 }
 
 fn validate_request(request: &RoutingRequest) -> Result<()> {
-    validate_percent("forecast percent", request.forecast_percent)?;
     if request
         .required_capabilities
         .iter()
@@ -261,6 +260,7 @@ fn validate_candidate(candidate: &RoutingCandidateInput) -> Result<()> {
         bail!("candidate adapter, provider, and account are required");
     }
     validate_percent("reserve percent", candidate.reserve_percent)?;
+    validate_percent("forecast percent", candidate.forecast_percent)?;
     if let Some(remaining) = candidate.remaining_percent {
         validate_percent("remaining percent", remaining)?;
     }
@@ -304,6 +304,7 @@ mod tests {
             capabilities: vec!["agent.headless".into()],
             remaining_percent,
             reserve_percent: 20.0,
+            forecast_percent: 10.0,
             historical_success_percent: Some(80.0),
             continuity: false,
             preference: 0.0,
@@ -313,7 +314,6 @@ mod tests {
     fn request() -> RoutingRequest {
         RoutingRequest {
             required_capabilities: vec!["agent.headless".into()],
-            forecast_percent: 10.0,
             pin: None,
         }
     }
@@ -407,8 +407,8 @@ mod tests {
         let mut invalid = candidate("codex", "primary", Some(90.0));
         invalid.preference = f64::NAN;
         assert!(select_candidate(&request(), &[invalid]).is_err());
-        let mut invalid_request = request();
-        invalid_request.forecast_percent = 101.0;
-        assert!(select_candidate(&invalid_request, &[]).is_err());
+        let mut invalid_forecast = candidate("codex", "primary", Some(90.0));
+        invalid_forecast.forecast_percent = 101.0;
+        assert!(select_candidate(&request(), &[invalid_forecast]).is_err());
     }
 }

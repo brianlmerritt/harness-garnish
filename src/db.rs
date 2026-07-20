@@ -3,9 +3,9 @@ use crate::{
         AgentCapabilityProbe, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
         CheckpointAction, CircuitBreaker, ClaimedRunStart, ControlState, DayKind,
         EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project, ProjectLink,
-        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, RetryPlan, RetryState,
-        RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader,
-        SchedulerWake, Task, TaskStatus,
+        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan,
+        RetryState, RouteDecision, RunCheckpoint, RunRecord, SchedulerClaim,
+        SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
     },
     quota::QuotaObservation,
     schedule,
@@ -23,7 +23,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 14;
 
 pub struct Database {
     path: PathBuf,
@@ -463,6 +463,12 @@ impl Database {
         }
         if current < 12 {
             tx.execute_batch(MIGRATION_12)?;
+        }
+        if current < 13 {
+            tx.execute_batch(MIGRATION_13)?;
+        }
+        if current < 14 {
+            tx.execute_batch(MIGRATION_14)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -2289,6 +2295,142 @@ impl Database {
             .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_quota_usage_sample(
+        &mut self,
+        evidence_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        surface: &str,
+        estimated_seconds: u64,
+        consumed_percent: f64,
+        source: &str,
+        confidence: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<QuotaUsageSample> {
+        for (label, value) in [
+            ("evidence ID", evidence_id),
+            ("adapter", adapter),
+            ("provider", provider),
+            ("account", account),
+            ("surface", surface),
+            ("source", source),
+        ] {
+            if value.trim().is_empty() || value.chars().count() > 200 {
+                bail!("{label} must contain 1..=200 characters");
+            }
+        }
+        if estimated_seconds == 0 || estimated_seconds > i64::MAX as u64 {
+            bail!("estimated seconds must be in 1..={}", i64::MAX);
+        }
+        validate_percentage(Some(consumed_percent), "consumed")?;
+        if consumed_percent == 0.0 {
+            bail!("consumed percentage must be greater than zero");
+        }
+        if !matches!(
+            confidence,
+            "provider_reported" | "collector_measured" | "user_reported"
+        ) {
+            bail!(
+                "usage confidence must be provider_reported, collector_measured, or user_reported"
+            );
+        }
+        let sample = QuotaUsageSample {
+            id: Ulid::new().to_string(),
+            evidence_id: evidence_id.into(),
+            adapter: adapter.into(),
+            provider: provider.into(),
+            account: account.into(),
+            surface: surface.into(),
+            estimated_seconds,
+            consumed_percent,
+            source: source.into(),
+            confidence: confidence.into(),
+            observed_at,
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO quota_usage_samples(
+                id, evidence_id, adapter, provider, account, surface_key,
+                estimated_seconds, consumed_percent, source, confidence, observed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                sample.id,
+                sample.evidence_id,
+                sample.adapter,
+                sample.provider,
+                sample.account,
+                sample.surface,
+                i64::try_from(sample.estimated_seconds)?,
+                sample.consumed_percent,
+                sample.source,
+                sample.confidence,
+                sample.observed_at.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "quota.usage_sample_recorded",
+            "usage_collector",
+            &sample,
+        )?;
+        tx.commit()?;
+        Ok(sample)
+    }
+
+    pub fn list_quota_usage_samples(&self, limit: usize) -> Result<Vec<QuotaUsageSample>> {
+        let limit = limit.clamp(1, 500);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, evidence_id, adapter, provider, account, surface_key,
+                    estimated_seconds, consumed_percent, source, confidence, observed_at
+             FROM quota_usage_samples
+             ORDER BY observed_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([i64::try_from(limit)?], map_quota_usage_sample)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn historical_usage_predictions(
+        &self,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        estimated_seconds: u64,
+        limit: usize,
+    ) -> Result<Vec<f64>> {
+        if estimated_seconds == 0 || estimated_seconds > i64::MAX as u64 {
+            bail!("estimated seconds must be in 1..={}", i64::MAX);
+        }
+        let limit = limit.clamp(1, 500);
+        let mut stmt = self.conn.prepare(
+            "SELECT MAX(consumed_percent * (?4 * 1.0 / estimated_seconds)) AS prediction,
+                    MAX(observed_at) AS latest
+             FROM quota_usage_samples
+             WHERE adapter = ?1 AND provider = ?2 AND account = ?3
+             GROUP BY evidence_id
+             ORDER BY latest DESC, evidence_id DESC LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                adapter,
+                provider,
+                account,
+                i64::try_from(estimated_seconds)?,
+                i64::try_from(limit)?,
+            ],
+            |row| row.get(0),
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn record_route(&mut self, decision: &RouteDecision) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -2385,6 +2527,161 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_verifier_run(
+        &mut self,
+        run_id: &str,
+        implementer_run_id: &str,
+        task_id: &str,
+        adapter: &str,
+        route_decision_id: &str,
+        worktree: &str,
+        base_commit: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (parent_task, parent_role, parent_status): (String, String, String) = tx.query_row(
+            "SELECT task_id, role, status FROM runs WHERE id = ?1",
+            [implementer_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if parent_task != task_id || parent_role != "implementer" || parent_status != "running" {
+            bail!("verifier run requires its matching active implementer run");
+        }
+        let (route_task, route_adapter, route_allowed): (String, Option<String>, bool) = tx
+            .query_row(
+                "SELECT task_id, selected_adapter, allowed FROM route_decisions WHERE id = ?1",
+                [route_decision_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if route_task != task_id || !route_allowed || route_adapter.as_deref() != Some(adapter) {
+            bail!("verifier route does not authorize the selected adapter");
+        }
+        tx.execute(
+            "INSERT INTO runs(
+                id, task_id, adapter, route_decision_id, worktree_path, branch,
+                base_commit, status, started_at, heartbeat_at, checkpoint_due_at,
+                role, parent_run_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, '(detached verifier)', ?6, 'running',
+                       ?7, ?7, ?7, 'verifier', ?8)",
+            params![
+                run_id,
+                task_id,
+                adapter,
+                route_decision_id,
+                worktree,
+                base_commit,
+                now.to_rfc3339(),
+                implementer_run_id,
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            Some(task_id),
+            Some(run_id),
+            "verification.started",
+            "verifier",
+            &serde_json::json!({
+                "implementer_run_id": implementer_run_id,
+                "adapter": adapter,
+                "route_decision_id": route_decision_id,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_verifier_run(
+        &mut self,
+        verifier_run_id: &str,
+        implementer_run_id: &str,
+        passed: bool,
+        exit_code: i32,
+        evidence_path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (task_id, parent_run_id, role, status): (String, Option<String>, String, String) = tx
+            .query_row(
+            "SELECT task_id, parent_run_id, role, status FROM runs WHERE id = ?1",
+            [verifier_run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        if parent_run_id.as_deref() != Some(implementer_run_id)
+            || role != "verifier"
+            || status != "running"
+        {
+            bail!("verifier run is not the active child of the implementer run");
+        }
+        let result = if passed { "passed" } else { "failed" };
+        tx.execute(
+            "UPDATE runs SET status = ?2, exit_code = ?3, heartbeat_at = ?4, ended_at = ?4
+             WHERE id = ?1",
+            params![verifier_run_id, result, exit_code, now.to_rfc3339()],
+        )?;
+        tx.execute(
+            "INSERT INTO verifications(
+                id, implementer_run_id, verifier_run_id, result, exit_code,
+                evidence_path, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                Ulid::new().to_string(),
+                implementer_run_id,
+                verifier_run_id,
+                result,
+                exit_code,
+                evidence_path,
+                now.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            Some(&task_id),
+            Some(verifier_run_id),
+            "verification.finished",
+            "verifier",
+            &serde_json::json!({
+                "implementer_run_id": implementer_run_id,
+                "result": result,
+                "exit_code": exit_code,
+                "evidence_path": evidence_path,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn run_records_for_task(&self, task_id: &str) -> Result<Vec<RunRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, role, adapter, parent_run_id, route_decision_id,
+                    worktree_path, status, started_at, ended_at
+             FROM runs WHERE task_id = ?1 ORDER BY started_at, id",
+        )?;
+        let rows = stmt.query_map([task_id], |row| {
+            let ended_at: Option<String> = row.get(9)?;
+            Ok(RunRecord {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                role: row.get(2)?,
+                adapter: row.get(3)?,
+                parent_run_id: row.get(4)?,
+                route_decision_id: row.get(5)?,
+                worktree_path: row.get(6)?,
+                status: row.get(7)?,
+                started_at: parse_time(row.get(8)?)?,
+                ended_at: ended_at.map(parse_time).transpose()?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn finish_run(
@@ -2565,6 +2862,15 @@ impl Database {
             )
             .optional()?
             .ok_or_else(|| anyhow!("active run lease not found: {run_id}"))
+    }
+
+    pub fn run_adapter(&self, run_id: &str) -> Result<String> {
+        self.conn
+            .query_row("SELECT adapter FROM runs WHERE id = ?1", [run_id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| anyhow!("run not found: {run_id}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3072,7 +3378,7 @@ impl Database {
              FROM leases l
              JOIN tasks t ON t.id = l.task_id
              WHERE l.released_at IS NULL AND l.expires_at < ?1
-               AND t.status IN ('leased', 'planning', 'awaiting_approval', 'running')",
+               AND t.status IN ('leased', 'planning', 'awaiting_approval', 'running', 'verifying')",
         )?;
         let rows = stmt.query_map([now.to_rfc3339()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -3080,12 +3386,25 @@ impl Database {
         let expired = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
         for (task_id, run_id) in &expired {
+            let verifier_run_ids = {
+                let mut verifier_stmt = tx.prepare(
+                    "SELECT id FROM runs
+                     WHERE parent_run_id = ?1 AND role = 'verifier' AND status = 'running'",
+                )?;
+                let rows = verifier_stmt.query_map([run_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
             tx.execute(
                 "UPDATE tasks SET status = 'paused', version = version + 1, updated_at = ?2 WHERE id = ?1",
                 params![task_id, now.to_rfc3339()],
             )?;
             tx.execute(
                 "UPDATE runs SET status = 'orphaned', ended_at = ?2 WHERE id = ?1",
+                params![run_id, now.to_rfc3339()],
+            )?;
+            tx.execute(
+                "UPDATE runs SET status = 'orphaned', ended_at = ?2
+                 WHERE parent_run_id = ?1 AND role = 'verifier' AND status = 'running'",
                 params![run_id, now.to_rfc3339()],
             )?;
             tx.execute(
@@ -3109,6 +3428,17 @@ impl Database {
                 "recovery",
                 &serde_json::json!({"recovered_to": "paused"}),
             )?;
+            for verifier_run_id in verifier_run_ids {
+                append_event_tx(
+                    &tx,
+                    None,
+                    Some(task_id),
+                    Some(&verifier_run_id),
+                    "verification.orphaned",
+                    "recovery",
+                    &serde_json::json!({"implementer_run_id": run_id}),
+                )?;
+            }
         }
         tx.commit()?;
         Ok(expired.into_iter().map(|(task, _)| task).collect())
@@ -3769,6 +4099,22 @@ fn map_quota(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaSurface> {
         provider_version: row.get(14)?,
         payload_sha256: row.get(15)?,
         override_reason: row.get(16)?,
+    })
+}
+
+fn map_quota_usage_sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<QuotaUsageSample> {
+    Ok(QuotaUsageSample {
+        id: row.get(0)?,
+        evidence_id: row.get(1)?,
+        adapter: row.get(2)?,
+        provider: row.get(3)?,
+        account: row.get(4)?,
+        surface: row.get(5)?,
+        estimated_seconds: nonnegative_u64(row, 6)?,
+        consumed_percent: row.get(7)?,
+        source: row.get(8)?,
+        confidence: row.get(9)?,
+        observed_at: parse_time(row.get(10)?)?,
     })
 }
 
@@ -4517,6 +4863,49 @@ CREATE INDEX idx_quota_collection_attempts_latest
     ON quota_collection_attempts(provider, account, attempted_at DESC, id DESC);
 "#;
 
+const MIGRATION_13: &str = r#"
+CREATE TABLE quota_usage_samples (
+    id TEXT PRIMARY KEY,
+    evidence_id TEXT NOT NULL CHECK(length(evidence_id) BETWEEN 1 AND 200),
+    adapter TEXT NOT NULL CHECK(length(adapter) BETWEEN 1 AND 200),
+    provider TEXT NOT NULL CHECK(length(provider) BETWEEN 1 AND 200),
+    account TEXT NOT NULL CHECK(length(account) BETWEEN 1 AND 200),
+    surface_key TEXT NOT NULL CHECK(length(surface_key) BETWEEN 1 AND 200),
+    estimated_seconds INTEGER NOT NULL CHECK(estimated_seconds > 0),
+    consumed_percent REAL NOT NULL CHECK(consumed_percent > 0 AND consumed_percent <= 100),
+    source TEXT NOT NULL CHECK(length(source) BETWEEN 1 AND 200),
+    confidence TEXT NOT NULL CHECK(confidence IN (
+        'provider_reported', 'collector_measured', 'user_reported'
+    )),
+    observed_at TEXT NOT NULL,
+    UNIQUE(evidence_id, adapter, provider, account, surface_key)
+);
+
+CREATE INDEX idx_quota_usage_samples_forecast
+    ON quota_usage_samples(adapter, provider, account, observed_at DESC, evidence_id);
+"#;
+
+const MIGRATION_14: &str = r#"
+ALTER TABLE runs
+    ADD COLUMN role TEXT NOT NULL DEFAULT 'implementer'
+    CHECK(role IN ('implementer', 'verifier'));
+ALTER TABLE runs
+    ADD COLUMN parent_run_id TEXT REFERENCES runs(id);
+
+CREATE TABLE verifications (
+    id TEXT PRIMARY KEY,
+    implementer_run_id TEXT NOT NULL REFERENCES runs(id),
+    verifier_run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+    result TEXT NOT NULL CHECK(result IN ('passed', 'failed')),
+    exit_code INTEGER NOT NULL,
+    evidence_path TEXT NOT NULL CHECK(length(evidence_path) BETWEEN 1 AND 4096),
+    created_at TEXT NOT NULL,
+    CHECK(implementer_run_id != verifier_run_id)
+);
+
+CREATE INDEX idx_runs_task_role ON runs(task_id, role, started_at);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4882,7 +5271,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -4904,6 +5293,104 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(backup_version, 1);
+    }
+
+    #[test]
+    fn schema_twelve_migration_adds_usage_history_and_preserves_collector_attempts() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("state.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (
+                    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, adapter TEXT NOT NULL,
+                    route_decision_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+                    branch TEXT NOT NULL, base_commit TEXT NOT NULL, head_commit TEXT,
+                    status TEXT NOT NULL, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL,
+                    checkpoint_due_at TEXT NOT NULL, ended_at TEXT, exit_code INTEGER
+                );",
+            )
+            .unwrap();
+        connection.execute_batch(MIGRATION_12).unwrap();
+        connection.pragma_update(None, "user_version", 12).unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_collection_attempts(
+                    id, provider, account, collector_contract, status, detail, attempted_at
+                 ) VALUES ('attempt-1', 'codex', 'default', 'fixture-v1', 'succeeded',
+                           'fixture', '2026-07-20T12:00:00Z')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = Database::open(&database_path).unwrap();
+        assert_eq!(migrated.schema_version(), 14);
+        assert_eq!(migrated.list_quota_collection_attempts().unwrap().len(), 1);
+        assert!(migrated.list_quota_usage_samples(10).unwrap().is_empty());
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("v12") && name.ends_with("backup.db"))
+            })
+            .expect("schema-12 backup");
+        let backup_connection = Connection::open(backup).unwrap();
+        let integrity: String = backup_connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn schema_thirteen_migration_adds_independent_verifier_records_with_backup() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("state.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (
+                    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, adapter TEXT NOT NULL,
+                    route_decision_id TEXT NOT NULL, worktree_path TEXT NOT NULL,
+                    branch TEXT NOT NULL, base_commit TEXT NOT NULL, head_commit TEXT,
+                    status TEXT NOT NULL, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL,
+                    checkpoint_due_at TEXT NOT NULL, ended_at TEXT, exit_code INTEGER
+                );",
+            )
+            .unwrap();
+        connection.execute_batch(MIGRATION_13).unwrap();
+        connection.pragma_update(None, "user_version", 13).unwrap();
+        drop(connection);
+
+        let migrated = Database::open(&database_path).unwrap();
+        assert_eq!(migrated.schema_version(), 14);
+        assert!(migrated.run_records_for_task("missing").unwrap().is_empty());
+        let column_count: i64 = migrated
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('runs')
+                 WHERE name IN ('role', 'parent_run_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 2);
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("v13") && name.ends_with("backup.db"))
+            })
+            .expect("schema-13 backup");
+        let backup_connection = Connection::open(backup).unwrap();
+        let integrity: String = backup_connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
     }
 
     #[test]
@@ -6164,7 +6651,7 @@ mod tests {
         let destination = dir.path().join("backups/state.db");
         let backup = db.backup_to(&destination, Utc::now()).unwrap();
         assert_eq!(backup.integrity, "ok");
-        assert_eq!(backup.schema_version, 12);
+        assert_eq!(backup.schema_version, SCHEMA_VERSION);
         assert_eq!(backup.sha256.len(), 64);
         assert_eq!(backup.size_bytes, fs::metadata(&destination).unwrap().len());
         assert!(db.backup_to(&destination, Utc::now()).is_err());

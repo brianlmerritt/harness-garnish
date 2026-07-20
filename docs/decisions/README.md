@@ -9,5 +9,7 @@
 | [0005](0005-layered-project-policy.md) | Layered, project-specific policy with secure-container autonomy | Accepted |
 | [0006](0006-api-providers-and-updates.md) | Opt-in budgeted APIs and rollback-safe self-update | Accepted |
 | [0007](0007-local-operator-interface.md) | Authenticated loopback operator interface with CLI parity | Accepted |
+| [0008](0008-historical-usage-forecasting.md) | Explicit usage evidence with conservative identity-scoped forecasts | Accepted |
+| [0009](0009-independent-verifier-runs.md) | Separate verifier selection, run identity, clean worktree, and evidence | Accepted |
 
 ADRs describe decisions, not implementation completion. A changed decision is recorded by a new ADR that supersedes the old one.

@@ -404,6 +404,35 @@ pub struct QuotaCollectionAttempt {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaUsageSample {
+    pub id: String,
+    pub evidence_id: String,
+    pub adapter: String,
+    pub provider: String,
+    pub account: String,
+    pub surface: String,
+    pub estimated_seconds: u64,
+    pub consumed_percent: f64,
+    pub source: String,
+    pub confidence: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageForecast {
+    pub adapter: String,
+    pub provider: String,
+    pub account: String,
+    pub estimated_seconds: u64,
+    pub uncertainty_percent: u8,
+    pub forecast_percent: f64,
+    pub source: String,
+    pub sample_count: usize,
+    pub percentile: Option<u8>,
+    pub lookback_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub id: String,
     pub task_id: String,
@@ -445,6 +474,8 @@ pub struct RouteCandidate {
     pub reason_code: String,
     pub filter_reason: String,
     pub forecast_percent: f64,
+    pub forecast_source: String,
+    pub forecast_sample_count: usize,
     pub minimum_effective_remaining_percent: Option<f64>,
     pub score: Option<f64>,
     pub score_components: Option<serde_json::Value>,
@@ -713,6 +744,23 @@ pub struct RunSummary {
     pub verification_path: String,
     pub handoff_path: String,
     pub route_decision_id: String,
+    pub verifier_run_id: String,
+    pub verifier_adapter: String,
+    pub verifier_route_decision_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub id: String,
+    pub task_id: String,
+    pub role: String,
+    pub adapter: String,
+    pub parent_run_id: Option<String>,
+    pub route_decision_id: String,
+    pub worktree_path: String,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error)]

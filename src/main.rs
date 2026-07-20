@@ -239,9 +239,64 @@ enum QuotaCommand {
         about = "Fetch CodexBar JSON; may access provider authentication and the network"
     )]
     RefreshCodexbar(QuotaRefreshCodexbar),
+    #[command(
+        name = "record-usage",
+        about = "Record explicit per-run usage telemetry; never inferred from account deltas"
+    )]
+    RecordUsage(QuotaRecordUsage),
+    Forecast(QuotaForecast),
+    Samples {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     Attempts,
     Reservations,
     Status,
+}
+
+#[derive(Args)]
+struct QuotaRecordUsage {
+    #[arg(
+        long,
+        help = "Stable collector/run evidence identifier used for deduplication"
+    )]
+    evidence_id: String,
+    #[arg(long)]
+    adapter: String,
+    #[arg(long)]
+    provider: String,
+    #[arg(long, default_value = "default")]
+    account: String,
+    #[arg(long)]
+    surface: String,
+    #[arg(long)]
+    estimated_seconds: u64,
+    #[arg(long)]
+    consumed_percent: f64,
+    #[arg(long, help = "Collector or evidence source name")]
+    source: String,
+    #[arg(
+        long,
+        default_value = "collector_measured",
+        help = "provider_reported, collector_measured, or user_reported"
+    )]
+    confidence: String,
+    #[arg(long, help = "Optional RFC3339 evidence time; defaults to now")]
+    observed_at: Option<String>,
+}
+
+#[derive(Args)]
+struct QuotaForecast {
+    #[arg(long)]
+    adapter: String,
+    #[arg(long)]
+    provider: String,
+    #[arg(long, default_value = "default")]
+    account: String,
+    #[arg(long)]
+    estimated_seconds: u64,
+    #[arg(long, default_value_t = 25)]
+    uncertainty_percent: u8,
 }
 
 #[derive(Args)]
@@ -376,6 +431,10 @@ enum SchedulerCommand {
 
 #[derive(Subcommand)]
 enum RuntimeCommand {
+    Runs {
+        #[arg(long)]
+        task: String,
+    },
     Checkpoint {
         #[arg(long)]
         run: String,
@@ -721,6 +780,26 @@ fn run() -> Result<()> {
                 args.reserve_percent,
                 StdDuration::from_secs(args.valid_seconds),
             )?),
+            QuotaCommand::RecordUsage(args) => print_json(&garnish.record_quota_usage_sample(
+                &args.evidence_id,
+                &args.adapter,
+                &args.provider,
+                &args.account,
+                &args.surface,
+                args.estimated_seconds,
+                args.consumed_percent,
+                &args.source,
+                &args.confidence,
+                parse_optional_time(args.observed_at.as_deref())?.unwrap_or_else(Utc::now),
+            )?),
+            QuotaCommand::Forecast(args) => print_json(&garnish.usage_forecast(
+                &args.adapter,
+                &args.provider,
+                &args.account,
+                args.estimated_seconds,
+                args.uncertainty_percent,
+            )?),
+            QuotaCommand::Samples { limit } => print_json(&garnish.quota_usage_samples(limit)?),
             QuotaCommand::Attempts => print_json(&garnish.quota_collection_attempts()?),
             QuotaCommand::Reservations => print_json(&garnish.quota_reservations()?),
             QuotaCommand::Status => print_json(&garnish.quota()?),
@@ -855,6 +934,7 @@ fn run() -> Result<()> {
             SchedulerCommand::Wakes => print_json(&garnish.scheduler_wakes()?),
         },
         Command::Runtime { command } => match command {
+            RuntimeCommand::Runs { task } => print_json(&garnish.run_records(&task)?),
             RuntimeCommand::Checkpoint {
                 run,
                 provider,

@@ -2,6 +2,83 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
 use tempfile::tempdir;
 
+#[test]
+fn quota_usage_evidence_and_forecast_commands_are_stable_json() {
+    let dir = tempdir().unwrap();
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "quota",
+            "record-usage",
+            "--evidence-id",
+            "fixture-run-001",
+            "--adapter",
+            "codex",
+            "--provider",
+            "codex",
+            "--account",
+            "personal",
+            "--surface",
+            "five_hour",
+            "--estimated-seconds",
+            "600",
+            "--consumed-percent",
+            "3.5",
+            "--source",
+            "fixture-adapter",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let sample: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(sample["evidence_id"], "fixture-run-001");
+    assert_eq!(sample["consumed_percent"], 3.5);
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "quota",
+            "forecast",
+            "--adapter",
+            "codex",
+            "--provider",
+            "codex",
+            "--account",
+            "personal",
+            "--estimated-seconds",
+            "600",
+            "--uncertainty-percent",
+            "20",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let forecast: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(forecast["source"], "conservative_fallback");
+    assert_eq!(forecast["sample_count"], 1);
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "quota",
+            "samples",
+            "--limit",
+            "10",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let samples: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(samples.as_array().unwrap().len(), 1);
+}
+
 #[cfg(unix)]
 #[test]
 fn quota_refresh_codexbar_uses_bounded_machine_json_contract() {
@@ -295,7 +372,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 12);
+    assert_eq!(value["schema_version"], 14);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

@@ -102,6 +102,7 @@ Runtime supervision persists lease-fenced checkpoint decisions, cancellation int
 
 ```console
 garnish --data-dir .garnish-state runtime checkpoint --run RUN_ID --provider fake --account test
+garnish --data-dir .garnish-state runtime runs --task TASK_ID
 garnish --data-dir .garnish-state runtime cancel --run RUN_ID --reason "user requested"
 garnish --data-dir .garnish-state runtime retry-state --task TASK_ID
 garnish --data-dir .garnish-state runtime retry-limit --task TASK_ID --limit 3
@@ -129,7 +130,7 @@ garnish --data-dir .garnish-state scheduler tick --instance local-1 --generation
 
 `TASK_ID` is a placeholder for the ID returned by `task add`. Candidate values are real configured identities, not fallback API permissions. A pin cannot bypass capability, health, policy, quota, or concurrency gates.
 
-Schema 12 includes the current CodexBar usage JSON contract, append-only quota observations and collection attempts, five-minute freshness by default, and atomic scheduler reservations. A real refresh may read provider authentication state and access the network, but it does not submit an agent task. It is always an explicit command:
+Schema 14 includes the current CodexBar usage JSON contract, append-only quota observations and collection attempts, five-minute freshness by default, atomic scheduler reservations, durable historical-usage samples, and separately attributable verifier runs. A real refresh may read provider authentication state and access the network, but it does not submit an agent task. It is always an explicit command:
 
 ```console
 brew install --cask codexbar
@@ -141,6 +142,16 @@ garnish --data-dir .garnish-state quota reservations
 ```
 
 After the macOS cask install, open CodexBar and choose **Preferences → Advanced → Install CLI** before running `codexbar --version`. These commands contain no placeholders: `default` is the literal Garnish label for CodexBar's current/default account. To select a named CodexBar account, add `--collector-account ACCOUNT_LABEL`; `ACCOUNT_LABEL` is then a placeholder for the exact label in CodexBar configuration. Unknown, malformed, ambiguous, or stale provider evidence fails closed. Raw quota JSON is not retained; Garnish stores normalized surfaces and a SHA-256 payload digest. For nested provider-CLI collection, Garnish preserves a narrow non-secret runtime allowlist while excluding API keys and OAuth tokens. On Linux, the current official CLI formula is `brew install steipete/tap/codexbar`.
+
+Historical consumption is never guessed from before/after account percentages. Trusted collectors can append deduplicated per-run evidence through `quota record-usage`; `quota samples` exposes it. Five matching evidence groups are required before an exact adapter/provider/account P90 replaces the conservative fallback. This command has no placeholders and only reads local state:
+
+```console
+garnish --data-dir .garnish-state quota forecast --adapter codex --provider codex --account default --estimated-seconds 600 --uncertainty-percent 25
+```
+
+`quota record-usage` is currently a collector/operator ingestion contract, not an instruction to estimate percentages by hand. Its required `--evidence-id` must be a stable real run or collector identifier; `--source` must name the real evidence source. Provider-reported, collector-measured, and explicit user-reported confidence are distinct from untrusted agent output.
+
+Successful fake execution now creates separate implementer and verifier run records. The quota-free `garnish-command-verifier:local:default` is independently selected, receives a clean detached verification worktree and its own evidence directory, and runs only the task's predeclared verification argv. It is a deterministic command verifier, not a claim of semantic agent review. Default policy requires a different verifier adapter; project policy can also require a different provider.
 
 ### Local operator interface
 

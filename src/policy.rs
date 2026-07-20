@@ -12,6 +12,8 @@ pub struct EffectivePolicy {
     pub allow_remote_git: bool,
     pub openai_api_enabled: bool,
     pub anthropic_api_enabled: bool,
+    pub verifier_must_differ_adapter: bool,
+    pub verifier_must_differ_provider: bool,
 }
 
 impl Default for EffectivePolicy {
@@ -26,6 +28,8 @@ impl Default for EffectivePolicy {
             allow_remote_git: false,
             openai_api_enabled: false,
             anthropic_api_enabled: false,
+            verifier_must_differ_adapter: true,
+            verifier_must_differ_provider: false,
         }
     }
 }

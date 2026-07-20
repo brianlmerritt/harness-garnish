@@ -8,10 +8,11 @@ use crate::{
         AgentCapabilityProbe, AgentCapabilityStatus, ApprovalRequest, BackupRecord,
         CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ControlState,
         DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project,
-        ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface, RetryPlan, RetryState,
-        RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint, RunSummary, ScheduleEvaluation,
-        SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary,
-        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
+        ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample,
+        RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint,
+        RunRecord, RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerClaimRejection,
+        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
+        SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -82,7 +83,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 12,
+            schema_version: 14,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -374,6 +375,107 @@ impl Garnish {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn record_quota_usage_sample(
+        &mut self,
+        evidence_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        surface: &str,
+        estimated_seconds: u64,
+        consumed_percent: f64,
+        source: &str,
+        confidence: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<QuotaUsageSample> {
+        self.db.record_quota_usage_sample(
+            evidence_id,
+            adapter,
+            provider,
+            account,
+            surface,
+            estimated_seconds,
+            consumed_percent,
+            source,
+            confidence,
+            observed_at,
+        )
+    }
+
+    pub fn quota_usage_samples(&self, limit: usize) -> Result<Vec<QuotaUsageSample>> {
+        self.db.list_quota_usage_samples(limit)
+    }
+
+    pub fn usage_forecast(
+        &self,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        estimated_seconds: u64,
+        uncertainty_percent: u8,
+    ) -> Result<UsageForecast> {
+        if adapter.trim().is_empty() || provider.trim().is_empty() || account.trim().is_empty() {
+            bail!("forecast adapter, provider, and account are required");
+        }
+        if estimated_seconds == 0 {
+            bail!("forecast estimated seconds must be greater than zero");
+        }
+        const LOOKBACK_LIMIT: usize = 50;
+        const MINIMUM_SAMPLES: usize = 5;
+        const PERCENTILE: usize = 90;
+        let mut predictions = self.db.historical_usage_predictions(
+            adapter,
+            provider,
+            account,
+            estimated_seconds,
+            LOOKBACK_LIMIT,
+        )?;
+        predictions.retain(|value| value.is_finite() && *value > 0.0);
+        predictions.sort_by(f64::total_cmp);
+        let sample_count = predictions.len();
+        let (forecast_percent, source, percentile) = if sample_count >= MINIMUM_SAMPLES {
+            let rank = (PERCENTILE * sample_count).div_ceil(100);
+            let observed = predictions[rank.saturating_sub(1)];
+            let adjusted = observed * (1.0 + f64::from(uncertainty_percent) / 100.0);
+            (adjusted.clamp(1.0, 100.0), "historical_p90", Some(90))
+        } else {
+            (
+                fallback_forecast_percent(estimated_seconds, uncertainty_percent),
+                "conservative_fallback",
+                None,
+            )
+        };
+        Ok(UsageForecast {
+            adapter: adapter.into(),
+            provider: provider.into(),
+            account: account.into(),
+            estimated_seconds,
+            uncertainty_percent,
+            forecast_percent,
+            source: source.into(),
+            sample_count,
+            percentile,
+            lookback_limit: LOOKBACK_LIMIT,
+        })
+    }
+
+    fn usage_forecast_for_task(
+        &self,
+        task: &Task,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+    ) -> Result<UsageForecast> {
+        self.usage_forecast(
+            adapter,
+            provider,
+            account,
+            task.estimated_seconds,
+            task.uncertainty_percent,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn refresh_quota_codexbar(
         &mut self,
         executable: Option<&Path>,
@@ -507,6 +609,10 @@ impl Garnish {
         self.db.request_run_cancellation(run_id, reason, Utc::now())
     }
 
+    pub fn run_records(&self, task_id: &str) -> Result<Vec<RunRecord>> {
+        self.db.run_records_for_task(task_id)
+    }
+
     pub fn checkpoint_run_at(
         &mut self,
         run_id: &str,
@@ -524,7 +630,10 @@ impl Garnish {
             .into_iter()
             .filter(|surface| surface.provider == provider && surface.account == account)
             .collect::<Vec<_>>();
-        let forecast = forecast_percent(&task);
+        let adapter = self.db.run_adapter(run_id)?;
+        let forecast = self
+            .usage_forecast_for_task(&task, &adapter, provider, account)?
+            .forecast_percent;
         let policy_allowed = self.policy.allow_branch_changes
             && matches!(
                 self.policy.authorize(task.risk_class, true),
@@ -758,7 +867,8 @@ impl Garnish {
             .into_iter()
             .filter(|surface| surface.provider == provider && surface.account == account)
             .collect();
-        let forecast = forecast_percent(&task);
+        let usage_forecast = self.usage_forecast_for_task(&task, adapter, provider, account)?;
+        let forecast = usage_forecast.forecast_percent;
         let required_headroom = quota
             .iter()
             .map(|surface| surface.reserve_percent + forecast)
@@ -990,6 +1100,8 @@ impl Garnish {
                 reason_code: reason_code.clone(),
                 filter_reason: reason.clone(),
                 forecast_percent: forecast,
+                forecast_source: usage_forecast.source,
+                forecast_sample_count: usage_forecast.sample_count,
                 minimum_effective_remaining_percent,
                 score: None,
                 score_components: None,
@@ -1378,6 +1490,11 @@ impl Garnish {
                 capabilities,
                 remaining_percent,
                 reserve_percent,
+                forecast_percent: preliminary
+                    .iter()
+                    .find(|(candidate, _)| candidate == target)
+                    .map(|(_, decision)| decision.candidates[0].forecast_percent)
+                    .expect("allowed target has a preliminary decision"),
                 historical_success_percent: None,
                 continuity: false,
                 preference: 0.0,
@@ -1386,7 +1503,6 @@ impl Garnish {
         let selection = select_candidate(
             &RoutingRequest {
                 required_capabilities: task.required_capabilities.clone(),
-                forecast_percent: forecast_percent(&task),
                 pin: task_route_pin(&task)?.map(|pin| CandidateIdentity {
                     adapter: pin.adapter,
                     provider: pin.provider,
@@ -1472,7 +1588,10 @@ impl Garnish {
                         allowed: evaluation.allowed,
                         reason_code: evaluation.reason_code.clone(),
                         filter_reason: evaluation.reason.clone(),
-                        forecast_percent: forecast_percent(&task),
+                        forecast_percent: preliminary_decision.candidates[0].forecast_percent,
+                        forecast_source: preliminary_decision.candidates[0].forecast_source.clone(),
+                        forecast_sample_count: preliminary_decision.candidates[0]
+                            .forecast_sample_count,
                         minimum_effective_remaining_percent: preliminary_decision.candidates[0]
                             .minimum_effective_remaining_percent,
                         score: evaluation.score.as_ref().map(|score| score.total),
@@ -1617,7 +1736,16 @@ impl Garnish {
                 &selected_target.account,
                 max_active_per_adapter,
                 max_active_per_account,
-                forecast_percent(&task),
+                decision
+                    .candidates
+                    .iter()
+                    .find(|candidate| {
+                        candidate.adapter == selected_target.adapter
+                            && candidate.provider == selected_target.provider
+                            && candidate.account == selected_target.account
+                    })
+                    .map(|candidate| candidate.forecast_percent)
+                    .ok_or_else(|| anyhow::anyhow!("selected route has no forecast evidence"))?,
             ) {
                 Ok(claim) => claims.push(claim),
                 Err(error) => {
@@ -1885,6 +2013,33 @@ impl Garnish {
         )?;
 
         let patch = git::patch(Path::new(&worktree.path))?;
+        let implementer_target = RouteTarget {
+            adapter: adapter.to_owned(),
+            provider: route
+                .selected_provider
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("implementer route has no provider"))?,
+            account: route
+                .selected_account
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("implementer route has no account"))?,
+        };
+        let verifier_target = RouteTarget {
+            adapter: "garnish-command-verifier".into(),
+            provider: "local".into(),
+            account: "default".into(),
+        };
+        let verifier_route = build_verifier_route(
+            &self.policy,
+            &task.id,
+            &implementer_target,
+            std::slice::from_ref(&verifier_target),
+            Utc::now(),
+        );
+        self.db.record_route(&verifier_route)?;
+        if !verifier_route.allowed {
+            bail!("no independent verifier passed policy separation");
+        }
         let verifier_destination = self.data_dir.join("verifiers").join(&run_id);
         let verifier = git::create_verification_worktree(
             Path::new(&project.root_path),
@@ -1893,7 +2048,34 @@ impl Garnish {
             &patch,
         )?;
         let verifier_sandbox = FakeSandbox::attest(Path::new(&verifier.path));
+        let verifier_run_id = Ulid::new().to_string();
+        let verifier_evidence = RunEvidence::create(&self.data_dir, &verifier_run_id)?;
         let started = Utc::now();
+        self.db.create_verifier_run(
+            &verifier_run_id,
+            &run_id,
+            &task.id,
+            &verifier_target.adapter,
+            &verifier_route.id,
+            &verifier.path,
+            &worktree.base_commit,
+            started,
+        )?;
+        verifier_evidence.write_manifest(&RunManifest {
+            schema_version: 1,
+            run_id: verifier_run_id.clone(),
+            task_id: task.id.clone(),
+            project_id: project.id.clone(),
+            adapter: verifier_target.adapter.clone(),
+            base_commit: worktree.base_commit.clone(),
+            worktree: verifier.path.clone(),
+            branch: "(detached verifier)".into(),
+            policy_hash: self.policy.hash(),
+            route_decision_id: verifier_route.id.clone(),
+            created_at: started.to_rfc3339(),
+            sandbox: verifier_sandbox.clone(),
+        })?;
+        verifier_evidence.write_route(&verifier_route)?;
         let output = git::run_argv(Path::new(&verifier.path), &task.verification_argv)?;
         let ended = Utc::now();
         let exit_code = output.status.code().unwrap_or(128);
@@ -1907,6 +2089,19 @@ impl Garnish {
             verifier_sandbox,
             verifier.path,
         );
+        verifier_evidence.write_process_output(&output.stdout, &output.stderr)?;
+        verifier_evidence.write_verification(&verification)?;
+        self.db.finish_verifier_run(
+            &verifier_run_id,
+            &run_id,
+            verification.passed,
+            exit_code,
+            verifier_evidence
+                .verification_path
+                .to_string_lossy()
+                .as_ref(),
+            ended,
+        )?;
         evidence.write_process_output(&output.stdout, &output.stderr)?;
         evidence.write_verification(&verification)?;
         evidence.write_patch(&patch)?;
@@ -1923,7 +2118,17 @@ impl Garnish {
             worktree: worktree.path.clone(),
             changed_files: changed_files.clone(),
             commands: vec![verification.clone()],
-            decisions: vec![format!("route {}: {}", route.id, route.reason)],
+            decisions: vec![
+                format!("implementation route {}: {}", route.id, route.reason),
+                format!(
+                    "verifier run {} route {} selected {}:{}:{}",
+                    verifier_run_id,
+                    verifier_route.id,
+                    verifier_target.adapter,
+                    verifier_target.provider,
+                    verifier_target.account
+                ),
+            ],
             assumptions: vec!["fake backend attestation is deterministic test evidence".into()],
             blocker: (!verification.passed).then(|| "verification failed".into()),
             artifacts: vec![
@@ -2001,6 +2206,9 @@ impl Garnish {
             verification_path: evidence.verification_path.to_string_lossy().into_owned(),
             handoff_path: evidence.handoff_json_path.to_string_lossy().into_owned(),
             route_decision_id: route.id,
+            verifier_run_id,
+            verifier_adapter: verifier_target.adapter,
+            verifier_route_decision_id: verifier_route.id,
         })
     }
 
@@ -2106,9 +2314,102 @@ fn secure_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn forecast_percent(task: &Task) -> f64 {
-    let baseline = (task.estimated_seconds as f64 / 2700.0) * 20.0;
-    (baseline * (1.0 + task.uncertainty_percent as f64 / 100.0)).clamp(1.0, 50.0)
+fn build_verifier_route(
+    policy: &EffectivePolicy,
+    task_id: &str,
+    implementer: &RouteTarget,
+    candidates: &[RouteTarget],
+    now: DateTime<Utc>,
+) -> RouteDecision {
+    let mut candidates = candidates.to_vec();
+    candidates.sort_by(|left, right| {
+        (&left.adapter, &left.provider, &left.account).cmp(&(
+            &right.adapter,
+            &right.provider,
+            &right.account,
+        ))
+    });
+    candidates.dedup();
+    let evaluations = candidates
+        .into_iter()
+        .map(|candidate| {
+            let (allowed, reason_code, filter_reason) = if &candidate == implementer {
+                (
+                    false,
+                    "verifier.same_identity",
+                    "verifier identity must differ from the implementer".to_owned(),
+                )
+            } else if policy.verifier_must_differ_adapter
+                && candidate.adapter == implementer.adapter
+            {
+                (
+                    false,
+                    "verifier.same_adapter",
+                    "policy requires a verifier using a different adapter".to_owned(),
+                )
+            } else if policy.verifier_must_differ_provider
+                && candidate.provider == implementer.provider
+            {
+                (
+                    false,
+                    "verifier.same_provider",
+                    "policy requires a verifier using a different provider".to_owned(),
+                )
+            } else {
+                (
+                    true,
+                    "verifier.allowed",
+                    "candidate satisfies independent-verifier separation policy".to_owned(),
+                )
+            };
+            RouteCandidate {
+                adapter: candidate.adapter,
+                provider: candidate.provider,
+                account: candidate.account,
+                allowed,
+                reason_code: reason_code.into(),
+                filter_reason,
+                forecast_percent: 0.0,
+                forecast_source: "quota_free_local_verification".into(),
+                forecast_sample_count: 0,
+                minimum_effective_remaining_percent: None,
+                score: allowed.then_some(0.0),
+                score_components: allowed.then(|| serde_json::json!({"separation": true})),
+            }
+        })
+        .collect::<Vec<_>>();
+    let selected = evaluations.iter().find(|candidate| candidate.allowed);
+    let allowed = selected.is_some();
+    RouteDecision {
+        id: Ulid::new().to_string(),
+        task_id: task_id.into(),
+        selected_adapter: selected.map(|candidate| candidate.adapter.clone()),
+        selected_provider: selected.map(|candidate| candidate.provider.clone()),
+        selected_account: selected.map(|candidate| candidate.account.clone()),
+        allowed,
+        reason_code: if allowed {
+            "verifier.allowed".into()
+        } else {
+            "verifier.unavailable".into()
+        },
+        reason: if allowed {
+            "an independent verifier passed separation policy".into()
+        } else {
+            "no verifier candidate passed separation policy".into()
+        },
+        required_headroom_percent: 0.0,
+        quota: vec![],
+        candidates: evaluations,
+        next_wake_at: None,
+        schedule: None,
+        policy_hash: policy.hash(),
+        created_at: now,
+    }
+}
+
+fn fallback_forecast_percent(estimated_seconds: u64, uncertainty_percent: u8) -> f64 {
+    let baseline = (estimated_seconds as f64 / 2700.0) * 20.0;
+    (baseline * (1.0 + f64::from(uncertainty_percent) / 100.0)).clamp(1.0, 50.0)
 }
 
 fn task_route_pin(task: &Task) -> Result<Option<RouteTarget>> {
@@ -2229,6 +2530,58 @@ mod tests {
         assert!(validate_project_root_for_platform(Path::new("/home/user/project"), true).is_ok());
         assert!(validate_project_root_for_platform(Path::new("/mnt/wsl/project"), true).is_ok());
         assert!(validate_project_root_for_platform(Path::new("/mnt/c/dev/project"), false).is_ok());
+    }
+
+    #[test]
+    fn verifier_selection_is_deterministic_and_enforces_policy_separation() {
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let implementer = RouteTarget {
+            adapter: "codex".into(),
+            provider: "openai".into(),
+            account: "primary".into(),
+        };
+        let candidates = vec![
+            implementer.clone(),
+            RouteTarget {
+                adapter: "codex".into(),
+                provider: "local".into(),
+                account: "review".into(),
+            },
+            RouteTarget {
+                adapter: "claude".into(),
+                provider: "openai".into(),
+                account: "review".into(),
+            },
+            RouteTarget {
+                adapter: "antigravity".into(),
+                provider: "google".into(),
+                account: "review".into(),
+            },
+        ];
+        let default = build_verifier_route(
+            &EffectivePolicy::default(),
+            "task",
+            &implementer,
+            &candidates,
+            now,
+        );
+        assert!(default.allowed);
+        assert_eq!(default.selected_adapter.as_deref(), Some("antigravity"));
+        assert_eq!(default.candidates[0].reason_code, "verifier.allowed");
+        assert_eq!(default.candidates[2].reason_code, "verifier.same_adapter");
+
+        let strict = EffectivePolicy {
+            verifier_must_differ_provider: true,
+            ..EffectivePolicy::default()
+        };
+        let strict = build_verifier_route(&strict, "task", &implementer, &candidates, now);
+        assert_eq!(strict.selected_adapter.as_deref(), Some("antigravity"));
+        let same_provider = strict
+            .candidates
+            .iter()
+            .find(|candidate| candidate.adapter == "claude")
+            .unwrap();
+        assert_eq!(same_provider.reason_code, "verifier.same_provider");
     }
 
     #[test]
@@ -2416,6 +2769,194 @@ mod tests {
     }
 
     #[test]
+    fn historical_usage_forecast_is_durable_deduplicated_and_identity_scoped() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        for index in 1..=4 {
+            garnish
+                .record_quota_usage_sample(
+                    &format!("run-{index}"),
+                    "codex",
+                    "codex",
+                    "personal",
+                    "five_hour",
+                    600,
+                    f64::from(index),
+                    "fixture-adapter",
+                    "collector_measured",
+                    now + Duration::seconds(index.into()),
+                )
+                .unwrap();
+        }
+        let fallback = garnish
+            .usage_forecast("codex", "codex", "personal", 600, 20)
+            .unwrap();
+        assert_eq!(fallback.source, "conservative_fallback");
+        assert_eq!(fallback.sample_count, 4);
+
+        garnish
+            .record_quota_usage_sample(
+                "run-5",
+                "codex",
+                "codex",
+                "personal",
+                "five_hour",
+                600,
+                5.0,
+                "fixture-adapter",
+                "collector_measured",
+                now + Duration::seconds(5),
+            )
+            .unwrap();
+        assert!(
+            garnish
+                .record_quota_usage_sample(
+                    "run-5",
+                    "codex",
+                    "codex",
+                    "personal",
+                    "five_hour",
+                    600,
+                    5.0,
+                    "fixture-adapter",
+                    "collector_measured",
+                    now + Duration::seconds(5),
+                )
+                .is_err()
+        );
+        drop(garnish);
+
+        let garnish = Garnish::open(&data_dir).unwrap();
+        let historical = garnish
+            .usage_forecast("codex", "codex", "personal", 600, 20)
+            .unwrap();
+        assert_eq!(historical.source, "historical_p90");
+        assert_eq!(historical.sample_count, 5);
+        assert_eq!(historical.percentile, Some(90));
+        assert_eq!(historical.forecast_percent, 6.0);
+        let other_account = garnish
+            .usage_forecast("codex", "codex", "work", 600, 20)
+            .unwrap();
+        assert_eq!(other_account.source, "conservative_fallback");
+        assert_eq!(other_account.sample_count, 0);
+        assert_eq!(garnish.quota_usage_samples(100).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn route_records_and_gates_on_the_exact_historical_forecast() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = Utc::now();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        for index in 1..=5 {
+            garnish
+                .record_quota_usage_sample(
+                    &format!("route-run-{index}"),
+                    "fake",
+                    "fake",
+                    "test",
+                    "five_hour",
+                    60,
+                    f64::from(index),
+                    "fixture-adapter",
+                    "collector_measured",
+                    now + Duration::seconds(index.into()),
+                )
+                .unwrap();
+        }
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(25.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let denied = garnish
+            .route_task_at(&task.id, "fake", "fake", "test", now)
+            .unwrap();
+        assert!(!denied.allowed);
+        assert_eq!(denied.reason_code, "quota.insufficient");
+        assert_eq!(denied.candidates[0].forecast_source, "historical_p90");
+        assert_eq!(denied.candidates[0].forecast_sample_count, 5);
+        assert_eq!(denied.candidates[0].forecast_percent, 6.0);
+        assert_eq!(denied.required_headroom_percent, 26.0);
+    }
+
+    #[test]
+    fn recovery_orphans_a_verifier_with_its_expired_implementer_once() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = Utc::now();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        prepare_active_run(&mut garnish, &task, "implementer-recovery", now);
+        garnish
+            .db
+            .transition_task(
+                &task.id,
+                TaskStatus::Running,
+                TaskStatus::Verifying,
+                "fixture",
+            )
+            .unwrap();
+        let route = build_verifier_route(
+            &garnish.policy,
+            &task.id,
+            &RouteTarget {
+                adapter: "fake".into(),
+                provider: "fake".into(),
+                account: "test".into(),
+            },
+            &[RouteTarget {
+                adapter: "garnish-command-verifier".into(),
+                provider: "local".into(),
+                account: "default".into(),
+            }],
+            now,
+        );
+        garnish.db.record_route(&route).unwrap();
+        garnish
+            .db
+            .create_verifier_run(
+                "verifier-recovery",
+                "implementer-recovery",
+                &task.id,
+                "garnish-command-verifier",
+                &route.id,
+                "/fixture/verifier",
+                "0123456789abcdef",
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            garnish.recover_at(now + Duration::minutes(11)).unwrap(),
+            vec![task.id.clone()]
+        );
+        assert!(
+            garnish
+                .recover_at(now + Duration::minutes(12))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Paused);
+        let runs = garnish.db.run_records_for_task(&task.id).unwrap();
+        assert!(runs.iter().all(|run| run.status == "orphaned"));
+    }
+
+    #[test]
     fn vertical_slice_declines_then_runs_after_override() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("source");
@@ -2446,7 +2987,19 @@ mod tests {
             .unwrap();
         let summary = garnish.run_task(&task.id, "fake", "fake", "test").unwrap();
         assert_eq!(summary.status, "review");
+        assert_eq!(summary.verifier_adapter, "garnish-command-verifier");
+        assert_ne!(summary.run_id, summary.verifier_run_id);
         assert!(Path::new(&summary.patch_path).exists());
+        let runs = garnish.db.run_records_for_task(&task.id).unwrap();
+        assert_eq!(runs.len(), 2);
+        let implementer = runs.iter().find(|run| run.role == "implementer").unwrap();
+        let verifier = runs.iter().find(|run| run.role == "verifier").unwrap();
+        assert_eq!(
+            verifier.parent_run_id.as_deref(),
+            Some(implementer.id.as_str())
+        );
+        assert_eq!(verifier.status, "passed");
+        assert_ne!(verifier.worktree_path, implementer.worktree_path);
         assert_eq!(
             git::snapshot(&source)
                 .unwrap()

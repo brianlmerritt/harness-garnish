@@ -93,7 +93,7 @@ Scheduler decisions retain the profile ID/version, timezone, local date, resolve
 
 `id`, `task_id`, `attempt`, `role` (`planner`, `implementer`, `verifier`, `reviewer`), `adapter_id/version`, `agent_profile_id`, `model`, `execution_plane_id/version`, `sandbox_instance_id`, `policy_revision_id`, `route_decision_id`, `base_commit`, `head_commit`, `started_at`, `heartbeat_at`, `checkpoint_due_at`, `ended_at`, `status`, `exit_code`, `failure_category`, `version`.
 
-A run is immutable after terminalisation except for redaction/quarantine metadata and retention state. Planner, implementer, and verifier runs are distinct records.
+A run is immutable after terminalisation except for redaction/quarantine metadata and retention state. Planner, implementer, and verifier runs are distinct records. Schema 14 materializes `role` and `parent_run_id`; each verifier is a distinct child of its active implementer rather than a label applied afterward.
 
 ### `leases` and `resource_locks`
 
@@ -143,7 +143,15 @@ Examples include `five_hour_percent`, `weekly_percent`, `monthly_requests`, `mon
 
 Unknown is represented by `unknown_reason`, never by `remaining_percent=100` or zero. Provider-reported values and local forecasts use distinct `source` classifications.
 
-The current schema-12 implementation materializes the latest observation in `quota_surfaces`, appends every successful source result to `quota_observations`, and records bounded success/failure evidence in `quota_collection_attempts`. It records `valid_until`, confidence, collector contract, provider version, and a raw-payload SHA-256 digest. Account-bearing raw CodexBar JSON is not stored. An expected Codex/Claude five-hour or weekly lane that is absent from a successful payload becomes an explicit unknown observation. An expired observation is `quota.stale`, distinct from unknown or insufficient quota; a live append-only user override remains visibly separate.
+The current schema-14 implementation materializes the latest observation in `quota_surfaces`, appends every successful source result to `quota_observations`, and records bounded success/failure evidence in `quota_collection_attempts`. It records `valid_until`, confidence, collector contract, provider version, and a raw-payload SHA-256 digest. Account-bearing raw CodexBar JSON is not stored. An expected Codex/Claude five-hour or weekly lane that is absent from a successful payload becomes an explicit unknown observation. An expired observation is `quota.stale`, distinct from unknown or insufficient quota; a live append-only user override remains visibly separate.
+
+### `quota_usage_samples`
+
+`id`, `evidence_id`, `adapter`, `provider`, `account`, `surface_key`, `estimated_seconds`, `consumed_percent`, `source`, `confidence`, `observed_at`.
+
+Usage samples are explicit append-only telemetry, not differences inferred from account-level snapshots. `(evidence_id, adapter, provider, account, surface_key)` is unique, so collector replay fails rather than double-counting. Accepted confidence classes are `provider_reported`, `collector_measured`, and `user_reported`; agent-authored text is not accepted as measurement evidence.
+
+Schema 13 forecasts the exact adapter/provider/account from at most 50 recent evidence groups. It scales each observation by estimated duration, takes the greatest surface prediction within a group, and uses uncertainty-adjusted nearest-rank P90 after five groups. Sparse histories use the conservative duration fallback. Route evidence records the forecast source and sample count, and the selected forecast is reserved atomically.
 
 ### `quota_overrides`
 
@@ -200,6 +208,8 @@ Kinds include manifest, stdout/stderr, JSONL events, patch, commit reference, ve
 ### `verifications`
 
 `id`, `run_id`, `verifier_run_id`, `criterion_id`, `command_argv_json`, `working_directory`, `tool_versions_json`, `started_at`, `ended_at`, `exit_code`, `result`, `output_artifact_id`, `waiver_id`.
+
+The schema-14 slice stores the implementer/verifier link, terminal result, exit code, evidence path, and creation time. The verifier has its own route decision, clean worktree, manifest, output, and verification artifact. The initial `garnish-command-verifier:local:default` identity executes only the task's predeclared argv and does not consume subscription or API quota.
 
 ### `handoffs`
 
