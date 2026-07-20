@@ -485,6 +485,8 @@ pub struct ApiBudgetReservation {
     pub dispatch_claimed_at: Option<DateTime<Utc>>,
     pub settled_at: Option<DateTime<Utc>>,
     pub release_reason: Option<String>,
+    pub claim_id: Option<String>,
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -501,6 +503,16 @@ pub struct ApiReservationRequest {
     pub reserved_output_tokens: u64,
     pub now: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiClaimReservationRequest {
+    pub model: String,
+    pub role: String,
+    pub request_digest: String,
+    pub reserved_currency_micros: u64,
+    pub reserved_input_tokens: u64,
+    pub reserved_output_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -669,6 +681,12 @@ pub struct SchedulerClaim {
     pub expires_at: DateTime<Utc>,
     pub resource_keys: Vec<String>,
     pub route_decision_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerApiClaim {
+    pub claim: SchedulerClaim,
+    pub reservation: ApiBudgetReservation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

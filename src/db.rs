@@ -1,13 +1,13 @@
 use crate::{
     domain::{
-        AgentCapabilityProbe, ApiBudget, ApiBudgetReservation, ApiModelPrice,
-        ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord,
-        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ClaimedRunStart,
-        ControlState, DayKind, EmergencyStopResult, FailureCategory, LocalNotification,
-        NewApiBudget, NewApiModelPrice, NewTask, Project, ProjectLink, QuotaCollectionAttempt,
-        QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteDecision,
-        RunCheckpoint, RunRecord, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader,
-        SchedulerWake, Task, TaskStatus,
+        AgentCapabilityProbe, ApiBudget, ApiBudgetReservation, ApiClaimReservationRequest,
+        ApiModelPrice, ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest,
+        BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
+        ClaimedRunStart, ControlState, DayKind, EmergencyStopResult, FailureCategory,
+        LocalNotification, NewApiBudget, NewApiModelPrice, NewTask, Project, ProjectLink,
+        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan,
+        RetryState, RouteDecision, RunCheckpoint, RunRecord, SchedulerClaim,
+        SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
     },
     quota::QuotaObservation,
     schedule,
@@ -25,7 +25,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 pub struct Database {
     path: PathBuf,
@@ -240,6 +240,7 @@ impl Database {
                 params![claim_id, now.to_rfc3339()],
             )?;
             release_quota_reservations_for_claim_tx(&tx, claim_id, now, "emergency_stop")?;
+            release_api_reservation_for_claim_tx(&tx, claim_id, now, "emergency_stop")?;
         }
         append_event_tx(
             &tx,
@@ -486,6 +487,9 @@ impl Database {
         }
         if current < 16 {
             tx.execute_batch(MIGRATION_16)?;
+        }
+        if current < 17 {
+            tx.execute_batch(MIGRATION_17)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1102,7 +1106,9 @@ impl Database {
             route_decision_id,
             resources,
             None,
+            None,
         )
+        .map(|(claim, _)| claim)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1146,7 +1152,56 @@ impl Database {
                 max_active_per_account,
                 forecast_percent,
             )),
+            None,
         )
+        .map(|(claim, _)| claim)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_task_for_scheduler_with_api_reservation(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        task_id: &str,
+        expected_task_version: i64,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+        max_active_claims: usize,
+        route_decision_id: &str,
+        resources: &[(String, String)],
+        provider: &str,
+        account: &str,
+        max_active_per_adapter: usize,
+        max_active_per_account: usize,
+        reservation: &ApiClaimReservationRequest,
+    ) -> Result<(SchedulerClaim, ApiBudgetReservation)> {
+        if max_active_per_adapter == 0 || max_active_per_account == 0 {
+            bail!("adapter and account concurrency limits must be greater than zero");
+        }
+        let (claim, reservation) = self.claim_task_for_scheduler_inner(
+            instance_id,
+            leader_generation,
+            task_id,
+            expected_task_version,
+            now,
+            ttl,
+            max_active_claims,
+            Some(route_decision_id),
+            resources,
+            Some((
+                "api",
+                provider,
+                account,
+                max_active_per_adapter,
+                max_active_per_account,
+                0.0,
+            )),
+            Some(reservation),
+        )?;
+        Ok((
+            claim,
+            reservation.expect("API scheduler claim must create its reservation"),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1162,7 +1217,8 @@ impl Database {
         route_decision_id: Option<&str>,
         resources: &[(String, String)],
         route_limits: Option<(&str, &str, &str, usize, usize, f64)>,
-    ) -> Result<SchedulerClaim> {
+        api_reservation: Option<&ApiClaimReservationRequest>,
+    ) -> Result<(SchedulerClaim, Option<ApiBudgetReservation>)> {
         if max_active_claims == 0 {
             bail!("scheduler concurrency limit must be greater than zero");
         }
@@ -1259,7 +1315,9 @@ impl Database {
                 now,
                 expires_at,
             )?);
-            if let Some(route_decision_id) = route_decision_id {
+            if adapter != "api"
+                && let Some(route_decision_id) = route_decision_id
+            {
                 reserve_quota_tx(
                     &tx,
                     &claim_id,
@@ -1295,6 +1353,54 @@ impl Database {
             })?;
             resource_keys.push(format!("{kind}:{key}"));
         }
+        let bound_api_reservation = if let Some(request) = api_reservation {
+            let route_decision_id = route_decision_id.ok_or_else(|| {
+                anyhow!("api.route_binding_required: API reservation requires a route decision")
+            })?;
+            let (allowed, selected_adapter, selected_provider, selected_account): (
+                bool,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ) = tx.query_row(
+                "SELECT allowed, selected_adapter, selected_provider, selected_account
+                 FROM route_decisions WHERE id = ?1 AND task_id = ?2",
+                params![route_decision_id, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let (_, provider, account, _, _, _) = route_limits.ok_or_else(|| {
+                anyhow!("api.route_binding_required: API reservation requires route capacity")
+            })?;
+            if !allowed
+                || selected_adapter.as_deref() != Some("api")
+                || selected_provider.as_deref() != Some(provider)
+                || selected_account.as_deref() != Some(account)
+            {
+                bail!(
+                    "api.route_binding_mismatch: route decision does not authorize this API identity"
+                );
+            }
+            let reservation_request = ApiReservationRequest {
+                project_id: project_id.clone(),
+                task_id: task_id.into(),
+                provider: provider.into(),
+                account: account.into(),
+                model: request.model.clone(),
+                role: request.role.clone(),
+                request_digest: request.request_digest.clone(),
+                reserved_currency_micros: request.reserved_currency_micros,
+                reserved_input_tokens: request.reserved_input_tokens,
+                reserved_output_tokens: request.reserved_output_tokens,
+                now,
+                expires_at,
+            };
+            validate_api_reservation_request(&reservation_request)?;
+            let reservation = reserve_api_budget_tx(&tx, &reservation_request, Some(&claim_id))?;
+            resource_keys.push(format!("api-reservation:{}", reservation.id));
+            Some(reservation)
+        } else {
+            None
+        };
         transition_task_tx(
             &tx,
             task_id,
@@ -1318,16 +1424,19 @@ impl Database {
             }),
         )?;
         tx.commit()?;
-        Ok(SchedulerClaim {
-            id: claim_id,
-            task_id: task_id.into(),
-            instance_id: instance_id.into(),
-            task_version: expected_task_version,
-            acquired_at: now,
-            expires_at,
-            resource_keys,
-            route_decision_id: route_decision_id.map(str::to_owned),
-        })
+        Ok((
+            SchedulerClaim {
+                id: claim_id,
+                task_id: task_id.into(),
+                instance_id: instance_id.into(),
+                task_version: expected_task_version,
+                acquired_at: now,
+                expires_at,
+                resource_keys,
+                route_decision_id: route_decision_id.map(str::to_owned),
+            },
+            bound_api_reservation,
+        ))
     }
 
     pub fn active_scheduler_claim_count(&self, now: DateTime<Utc>) -> Result<usize> {
@@ -1374,6 +1483,14 @@ impl Database {
         )?;
         tx.execute(
             "UPDATE quota_reservations SET expires_at = ?3
+             WHERE claim_id IN (
+                 SELECT id FROM scheduler_claims
+                 WHERE instance_id = ?1 AND leader_generation = ?2 AND status = 'active'
+             ) AND status = 'active'",
+            params![instance_id, leader_generation, expires_at.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE api_budget_reservations SET expires_at = ?3
              WHERE claim_id IN (
                  SELECT id FROM scheduler_claims
                  WHERE instance_id = ?1 AND leader_generation = ?2 AND status = 'active'
@@ -1508,6 +1625,12 @@ impl Database {
         tx.execute(
             "UPDATE quota_reservations
              SET status = 'running', run_id = ?2, expires_at = ?3
+             WHERE claim_id = ?1 AND status = 'active'",
+            params![claim_id, run_id, lease_expires_at.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE api_budget_reservations
+             SET run_id = ?2, expires_at = ?3
              WHERE claim_id = ?1 AND status = 'active'",
             params![claim_id, run_id, lease_expires_at.to_rfc3339()],
         )?;
@@ -2764,142 +2887,7 @@ impl Database {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        expire_active_api_reservations_tx(&tx, request.now)?;
-        let budget = tx
-            .query_row(
-                &format!(
-                    "{API_BUDGET_SELECT} WHERE project_id = ?1 AND provider = ?2 AND account = ?3
-                     ORDER BY created_at DESC, id DESC LIMIT 1"
-                ),
-                params![request.project_id, request.provider, request.account],
-                map_api_budget,
-            )
-            .optional()?
-            .ok_or_else(|| anyhow!("api.disabled: no project API budget is configured"))?;
-        if !budget.enabled {
-            bail!("api.disabled: the latest project API budget is disabled");
-        }
-        if request.now < budget.period_start || request.now >= budget.period_end {
-            bail!("api.period_inactive: the API budget period is not active");
-        }
-        let task_project: String = tx.query_row(
-            "SELECT project_id FROM tasks WHERE id = ?1",
-            [&request.task_id],
-            |row| row.get(0),
-        )?;
-        if task_project != request.project_id {
-            bail!("api.task_project_mismatch: task does not belong to the budget project");
-        }
-        if !budget.allowed_models.contains(&request.model) {
-            bail!("api.model_denied: model is not in the project allowlist");
-        }
-        if !budget.allowed_roles.contains(&request.role) {
-            bail!("api.role_denied: role is not in the project allowlist");
-        }
-        if request.reserved_output_tokens > budget.max_output_tokens {
-            bail!("api.output_limit: request exceeds the project output-token ceiling");
-        }
-        let active_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM api_budget_reservations
-             WHERE budget_id = ?1 AND status IN ('active', 'dispatched')",
-            [&budget.id],
-            |row| row.get(0),
-        )?;
-        if active_count >= i64::from(budget.max_concurrent_requests) {
-            bail!("api.concurrency_limit: project API concurrency ceiling reached");
-        }
-        let (spent_currency, spent_tokens, spent_requests): (i64, i64, i64) = tx.query_row(
-            "SELECT COALESCE(SUM(cost_micros), 0),
-                    COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
-             FROM api_spend WHERE budget_id = ?1",
-            [&budget.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let (reserved_currency, reserved_tokens, reserved_requests): (i64, i64, i64) = tx
-            .query_row(
-                "SELECT COALESCE(SUM(reserved_currency_micros), 0),
-                        COALESCE(SUM(reserved_input_tokens + reserved_output_tokens), 0), COUNT(*)
-                 FROM api_budget_reservations
-                 WHERE budget_id = ?1 AND status IN ('active', 'dispatched')",
-                [&budget.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-        let requested_currency = sql_u64(request.reserved_currency_micros, "reserved currency")?;
-        let requested_tokens = sql_u64(
-            request
-                .reserved_input_tokens
-                .checked_add(request.reserved_output_tokens)
-                .ok_or_else(|| anyhow!("reserved token total overflow"))?,
-            "reserved tokens",
-        )?;
-        if let Some(limit) = budget.currency_limit_micros {
-            if request.reserved_currency_micros == 0 {
-                bail!(
-                    "api.currency_reservation_required: monetary budget requires a worst-case reservation"
-                );
-            }
-            let required = spent_currency
-                .checked_add(reserved_currency)
-                .and_then(|value| value.checked_add(requested_currency))
-                .ok_or_else(|| anyhow!("API currency accounting overflow"))?;
-            if required > sql_u64(limit, "currency limit")? {
-                bail!(
-                    "api.currency_budget_exhausted: reservation exceeds remaining monetary budget"
-                );
-            }
-        } else if request.reserved_currency_micros != 0 {
-            bail!(
-                "api.currency_unconfigured: currency reservation has no configured monetary ceiling"
-            );
-        }
-        if let Some(limit) = budget.token_limit {
-            let required = spent_tokens
-                .checked_add(reserved_tokens)
-                .and_then(|value| value.checked_add(requested_tokens))
-                .ok_or_else(|| anyhow!("API token accounting overflow"))?;
-            if required > sql_u64(limit, "token limit")? {
-                bail!("api.token_budget_exhausted: reservation exceeds remaining token budget");
-            }
-        }
-        if let Some(limit) = budget.request_limit {
-            let required = spent_requests
-                .checked_add(reserved_requests)
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| anyhow!("API request accounting overflow"))?;
-            if required > sql_u64(limit, "request limit")? {
-                bail!("api.request_budget_exhausted: reservation exceeds remaining request budget");
-            }
-        }
-        let reservation = ApiBudgetReservation {
-            id: Ulid::new().to_string(),
-            budget_id: budget.id,
-            project_id: request.project_id.clone(),
-            task_id: request.task_id.clone(),
-            provider: request.provider.clone(),
-            account: request.account.clone(),
-            model: request.model.clone(),
-            role: request.role.clone(),
-            request_digest: request.request_digest.clone(),
-            reserved_currency_micros: request.reserved_currency_micros,
-            reserved_input_tokens: request.reserved_input_tokens,
-            reserved_output_tokens: request.reserved_output_tokens,
-            status: "active".into(),
-            created_at: request.now,
-            expires_at: request.expires_at,
-            dispatch_claimed_at: None,
-            settled_at: None,
-            release_reason: None,
-        };
-        insert_api_reservation_tx(&tx, &reservation)?;
-        append_event_tx(
-            &tx,
-            Some(&reservation.project_id),
-            Some(&reservation.task_id),
-            None,
-            "api.budget_reserved",
-            "control_plane",
-            &reservation,
-        )?;
+        let reservation = reserve_api_budget_tx(&tx, request, None)?;
         tx.commit()?;
         Ok(reservation)
     }
@@ -2924,7 +2912,8 @@ impl Database {
         let changed = tx.execute(
             "UPDATE api_budget_reservations
              SET status = 'dispatched', dispatch_claimed_at = ?2
-             WHERE id = ?1 AND status = 'active' AND expires_at > ?2",
+             WHERE id = ?1 AND status = 'active' AND expires_at > ?2
+               AND (claim_id IS NULL OR run_id IS NOT NULL)",
             params![reservation_id, now.to_rfc3339()],
         )?;
         if changed != 1 {
@@ -2961,7 +2950,7 @@ impl Database {
         let changed = tx.execute(
             "UPDATE api_budget_reservations
              SET status = 'released', release_reason = ?2, settled_at = ?3
-             WHERE id = ?1 AND status = 'active'",
+             WHERE id = ?1 AND status = 'active' AND claim_id IS NULL",
             params![reservation_id, reason, now.to_rfc3339()],
         )?;
         if changed != 1 {
@@ -3618,6 +3607,7 @@ impl Database {
             params![run_id, now.to_rfc3339()],
         )?;
         release_quota_reservations_for_run_tx(&tx, run_id, now, "run_finished")?;
+        release_api_reservation_for_run_tx(&tx, run_id, now, "run_finished")?;
         append_event_tx(
             &tx,
             None,
@@ -4047,6 +4037,7 @@ impl Database {
             )?;
         }
         release_quota_reservations_for_run_tx(&tx, run_id, now, "process_ended")?;
+        release_api_reservation_for_run_tx(&tx, run_id, now, "process_ended")?;
         append_event_tx(
             &tx,
             None,
@@ -4323,6 +4314,7 @@ impl Database {
                 params![run_id, now.to_rfc3339()],
             )?;
             release_quota_reservations_for_run_tx(&tx, run_id, now, "run_orphaned")?;
+            release_api_reservation_for_run_tx(&tx, run_id, now, "run_orphaned")?;
             append_event_tx(
                 &tx,
                 None,
@@ -4710,6 +4702,62 @@ fn release_quota_reservations_for_run_tx(
     .map_err(Into::into)
 }
 
+fn release_api_reservation_for_claim_tx(
+    tx: &Transaction<'_>,
+    claim_id: &str,
+    now: DateTime<Utc>,
+    reason: &str,
+) -> Result<usize> {
+    release_bound_api_reservation_tx(tx, "claim_id", claim_id, now, reason)
+}
+
+fn release_api_reservation_for_run_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    now: DateTime<Utc>,
+    reason: &str,
+) -> Result<usize> {
+    release_bound_api_reservation_tx(tx, "run_id", run_id, now, reason)
+}
+
+fn release_bound_api_reservation_tx(
+    tx: &Transaction<'_>,
+    identity_column: &str,
+    identity: &str,
+    now: DateTime<Utc>,
+    reason: &str,
+) -> Result<usize> {
+    let sql = match identity_column {
+        "claim_id" => format!("{API_RESERVATION_SELECT} WHERE claim_id = ?1 AND status = 'active'"),
+        "run_id" => format!("{API_RESERVATION_SELECT} WHERE run_id = ?1 AND status = 'active'"),
+        _ => unreachable!("bounded API reservation identity"),
+    };
+    let reservation = tx
+        .query_row(&sql, [identity], map_api_reservation)
+        .optional()?;
+    let Some(reservation) = reservation else {
+        return Ok(0);
+    };
+    let changed = tx.execute(
+        "UPDATE api_budget_reservations
+         SET status = 'released', release_reason = ?2, settled_at = ?3
+         WHERE id = ?1 AND status = 'active'",
+        params![reservation.id, reason, now.to_rfc3339()],
+    )?;
+    if changed == 1 {
+        append_event_tx(
+            tx,
+            Some(&reservation.project_id),
+            Some(&reservation.task_id),
+            reservation.run_id.as_deref(),
+            "api.budget_released",
+            "control_plane",
+            &serde_json::json!({"reservation_id": reservation.id, "reason": reason}),
+        )?;
+    }
+    Ok(changed)
+}
+
 fn expire_scheduler_claims_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<Vec<String>> {
     let mut stmt = tx.prepare(
         "SELECT id, task_id FROM scheduler_claims
@@ -4753,6 +4801,7 @@ fn expire_scheduler_claims_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Resul
             params![claim_id, now.to_rfc3339()],
         )?;
         release_quota_reservations_for_claim_tx(tx, claim_id, now, "claim_expired")?;
+        release_api_reservation_for_claim_tx(tx, claim_id, now, "claim_expired")?;
         append_event_tx(
             tx,
             None,
@@ -4813,6 +4862,7 @@ fn release_scheduler_claims_for_instance_tx(
             params![claim_id, now.to_rfc3339()],
         )?;
         release_quota_reservations_for_claim_tx(tx, claim_id, now, "scheduler_stopped")?;
+        release_api_reservation_for_claim_tx(tx, claim_id, now, "scheduler_stopped")?;
     }
     Ok(claims.into_iter().map(|(_, task_id)| task_id).collect())
 }
@@ -5158,7 +5208,7 @@ const API_RESERVATION_SELECT: &str = "SELECT
     id, budget_id, project_id, task_id, provider, account, model, role,
     request_digest, reserved_currency_micros, reserved_input_tokens,
     reserved_output_tokens, status, created_at, expires_at, dispatch_claimed_at,
-    settled_at, release_reason
+    settled_at, release_reason, claim_id, run_id
  FROM api_budget_reservations";
 
 const API_MODEL_PRICE_SELECT: &str = "SELECT
@@ -5216,6 +5266,8 @@ fn map_api_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiBudgetRes
         dispatch_claimed_at: dispatch_claimed_at.map(parse_time).transpose()?,
         settled_at: settled_at.map(parse_time).transpose()?,
         release_reason: row.get(17)?,
+        claim_id: row.get(18)?,
+        run_id: row.get(19)?,
     })
 }
 
@@ -5259,6 +5311,147 @@ fn map_api_model_price(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiModelPric
     })
 }
 
+fn reserve_api_budget_tx(
+    tx: &Transaction<'_>,
+    request: &ApiReservationRequest,
+    claim_id: Option<&str>,
+) -> Result<ApiBudgetReservation> {
+    expire_active_api_reservations_tx(tx, request.now)?;
+    let budget = tx
+        .query_row(
+            &format!(
+                "{API_BUDGET_SELECT} WHERE project_id = ?1 AND provider = ?2 AND account = ?3
+                 ORDER BY created_at DESC, id DESC LIMIT 1"
+            ),
+            params![request.project_id, request.provider, request.account],
+            map_api_budget,
+        )
+        .optional()?
+        .ok_or_else(|| anyhow!("api.disabled: no project API budget is configured"))?;
+    if !budget.enabled {
+        bail!("api.disabled: the latest project API budget is disabled");
+    }
+    if request.now < budget.period_start || request.now >= budget.period_end {
+        bail!("api.period_inactive: the API budget period is not active");
+    }
+    let task_project: String = tx.query_row(
+        "SELECT project_id FROM tasks WHERE id = ?1",
+        [&request.task_id],
+        |row| row.get(0),
+    )?;
+    if task_project != request.project_id {
+        bail!("api.task_project_mismatch: task does not belong to the budget project");
+    }
+    if !budget.allowed_models.contains(&request.model) {
+        bail!("api.model_denied: model is not in the project allowlist");
+    }
+    if !budget.allowed_roles.contains(&request.role) {
+        bail!("api.role_denied: role is not in the project allowlist");
+    }
+    if request.reserved_output_tokens > budget.max_output_tokens {
+        bail!("api.output_limit: request exceeds the project output-token ceiling");
+    }
+    let active_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM api_budget_reservations
+         WHERE budget_id = ?1 AND status IN ('active', 'dispatched')",
+        [&budget.id],
+        |row| row.get(0),
+    )?;
+    if active_count >= i64::from(budget.max_concurrent_requests) {
+        bail!("api.concurrency_limit: project API concurrency ceiling reached");
+    }
+    let (spent_currency, spent_tokens, spent_requests): (i64, i64, i64) = tx.query_row(
+        "SELECT COALESCE(SUM(cost_micros), 0),
+                COALESCE(SUM(input_tokens + output_tokens), 0), COUNT(*)
+         FROM api_spend WHERE budget_id = ?1",
+        [&budget.id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let (reserved_currency, reserved_tokens, reserved_requests): (i64, i64, i64) = tx.query_row(
+        "SELECT COALESCE(SUM(reserved_currency_micros), 0),
+                    COALESCE(SUM(reserved_input_tokens + reserved_output_tokens), 0), COUNT(*)
+             FROM api_budget_reservations
+             WHERE budget_id = ?1 AND status IN ('active', 'dispatched')",
+        [&budget.id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let requested_currency = sql_u64(request.reserved_currency_micros, "reserved currency")?;
+    let requested_tokens = sql_u64(
+        request
+            .reserved_input_tokens
+            .checked_add(request.reserved_output_tokens)
+            .ok_or_else(|| anyhow!("reserved token total overflow"))?,
+        "reserved tokens",
+    )?;
+    if let Some(limit) = budget.currency_limit_micros {
+        if request.reserved_currency_micros == 0 {
+            bail!(
+                "api.currency_reservation_required: monetary budget requires a worst-case reservation"
+            );
+        }
+        let required = spent_currency
+            .checked_add(reserved_currency)
+            .and_then(|value| value.checked_add(requested_currency))
+            .ok_or_else(|| anyhow!("API currency accounting overflow"))?;
+        if required > sql_u64(limit, "currency limit")? {
+            bail!("api.currency_budget_exhausted: reservation exceeds remaining monetary budget");
+        }
+    } else if request.reserved_currency_micros != 0 {
+        bail!("api.currency_unconfigured: currency reservation has no configured monetary ceiling");
+    }
+    if let Some(limit) = budget.token_limit {
+        let required = spent_tokens
+            .checked_add(reserved_tokens)
+            .and_then(|value| value.checked_add(requested_tokens))
+            .ok_or_else(|| anyhow!("API token accounting overflow"))?;
+        if required > sql_u64(limit, "token limit")? {
+            bail!("api.token_budget_exhausted: reservation exceeds remaining token budget");
+        }
+    }
+    if let Some(limit) = budget.request_limit {
+        let required = spent_requests
+            .checked_add(reserved_requests)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| anyhow!("API request accounting overflow"))?;
+        if required > sql_u64(limit, "request limit")? {
+            bail!("api.request_budget_exhausted: reservation exceeds remaining request budget");
+        }
+    }
+    let reservation = ApiBudgetReservation {
+        id: Ulid::new().to_string(),
+        budget_id: budget.id,
+        project_id: request.project_id.clone(),
+        task_id: request.task_id.clone(),
+        provider: request.provider.clone(),
+        account: request.account.clone(),
+        model: request.model.clone(),
+        role: request.role.clone(),
+        request_digest: request.request_digest.clone(),
+        reserved_currency_micros: request.reserved_currency_micros,
+        reserved_input_tokens: request.reserved_input_tokens,
+        reserved_output_tokens: request.reserved_output_tokens,
+        status: "active".into(),
+        created_at: request.now,
+        expires_at: request.expires_at,
+        dispatch_claimed_at: None,
+        settled_at: None,
+        release_reason: None,
+        claim_id: claim_id.map(str::to_owned),
+        run_id: None,
+    };
+    insert_api_reservation_tx(tx, &reservation)?;
+    append_event_tx(
+        tx,
+        Some(&reservation.project_id),
+        Some(&reservation.task_id),
+        None,
+        "api.budget_reserved",
+        "control_plane",
+        &reservation,
+    )?;
+    Ok(reservation)
+}
+
 fn insert_api_reservation_tx(
     tx: &Transaction<'_>,
     reservation: &ApiBudgetReservation,
@@ -5268,9 +5461,9 @@ fn insert_api_reservation_tx(
             id, budget_id, project_id, task_id, provider, account, model, role,
             request_digest, reserved_currency_micros, reserved_input_tokens,
             reserved_output_tokens, status, created_at, expires_at,
-            dispatch_claimed_at, settled_at, release_reason
+            dispatch_claimed_at, settled_at, release_reason, claim_id, run_id
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                   ?13, ?14, ?15, ?16, ?17, ?18)",
+                   ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             reservation.id,
             reservation.budget_id,
@@ -5292,6 +5485,8 @@ fn insert_api_reservation_tx(
                 .map(|value| value.to_rfc3339()),
             reservation.settled_at.map(|value| value.to_rfc3339()),
             reservation.release_reason,
+            reservation.claim_id,
+            reservation.run_id,
         ],
     )?;
     Ok(())
@@ -6310,6 +6505,18 @@ ALTER TABLE api_spend ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DE
 ALTER TABLE api_spend ADD COLUMN pricing_evidence_id TEXT REFERENCES api_model_prices(id);
 "#;
 
+const MIGRATION_17: &str = r#"
+ALTER TABLE api_budget_reservations
+    ADD COLUMN claim_id TEXT REFERENCES scheduler_claims(id);
+ALTER TABLE api_budget_reservations
+    ADD COLUMN run_id TEXT REFERENCES runs(id);
+
+CREATE UNIQUE INDEX idx_api_reservation_claim
+    ON api_budget_reservations(claim_id) WHERE claim_id IS NOT NULL;
+CREATE INDEX idx_api_reservation_run
+    ON api_budget_reservations(run_id) WHERE run_id IS NOT NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6806,7 +7013,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 16);
+        assert_eq!(migrated.schema_version(), 17);
         assert!(migrated.list_latest_api_budgets(None).unwrap().is_empty());
         assert!(migrated.list_api_reservations(None).unwrap().is_empty());
         assert!(migrated.list_api_spend(None).unwrap().is_empty());
@@ -6848,7 +7055,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 16);
+        assert_eq!(migrated.schema_version(), 17);
         assert!(migrated.list_api_model_prices().unwrap().is_empty());
         let column_count: i64 = migrated
             .conn
@@ -6880,6 +7087,63 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(backup_version, 15);
+    }
+
+    #[test]
+    fn schema_sixteen_migration_binds_api_reservations_to_claims_and_runs_with_backup() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("state.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE scheduler_claims(id TEXT PRIMARY KEY);
+                 CREATE TABLE runs(id TEXT PRIMARY KEY);
+                 CREATE TABLE api_budget_reservations(id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 16).unwrap();
+        drop(connection);
+
+        let migrated = Database::open(&database_path).unwrap();
+        assert_eq!(migrated.schema_version(), 17);
+        let column_count: i64 = migrated
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('api_budget_reservations')
+                 WHERE name IN ('claim_id', 'run_id')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 2);
+        let index_count: i64 = migrated
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index'
+                 AND name IN ('idx_api_reservation_claim', 'idx_api_reservation_run')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 2);
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("v16") && name.ends_with("backup.db"))
+            })
+            .expect("schema-16 backup");
+        let backup_connection = Connection::open(backup).unwrap();
+        let integrity: String = backup_connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let backup_version: i64 = backup_connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, 16);
     }
 
     #[test]

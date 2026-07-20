@@ -4,21 +4,21 @@ use crate::{
         run_invocation_with_tick, safe_write,
     },
     api_providers::{
-        ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest,
+        ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest, api_request_digest,
         parse_api_transport_response, prepare_api_request,
     },
     db::Database,
     domain::{
         AgentCapabilityProbe, AgentCapabilityStatus, ApiBudget, ApiBudgetReservation,
-        ApiModelPrice, ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest,
-        BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
-        ControlState, DayKind, EmergencyStopResult, FailureCategory, LocalNotification,
-        NewApiBudget, NewApiModelPrice, NewTask, Project, ProjectLink, QuotaCollectionAttempt,
-        QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteCandidate,
-        RouteDecision, RouteTarget, RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation,
-        SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary,
-        SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
-        UsageForecast,
+        ApiClaimReservationRequest, ApiModelPrice, ApiReservationRequest, ApiSettlement, ApiSpend,
+        ApprovalRequest, BackupRecord, CalendarException, CalendarProfile, CheckpointAction,
+        CircuitBreaker, ControlState, DayKind, EmergencyStopResult, FailureCategory,
+        LocalNotification, NewApiBudget, NewApiModelPrice, NewTask, Project, ProjectLink,
+        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan,
+        RetryState, RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint, RunRecord,
+        RunSummary, ScheduleEvaluation, SchedulerApiClaim, SchedulerClaim, SchedulerClaimRejection,
+        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
+        SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -436,6 +436,88 @@ impl Garnish {
         self.db.reserve_api_budget(request)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_exact_api_request_at(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        task_id: &str,
+        provider: &str,
+        account: &str,
+        role: &str,
+        spec: &ApiRequestSpec,
+        reserved_input_tokens: u64,
+        now: DateTime<Utc>,
+        claim_ttl: std::time::Duration,
+        max_active_claims: usize,
+        max_active_per_adapter: usize,
+        max_active_per_account: usize,
+    ) -> Result<SchedulerApiClaim> {
+        if spec.provider != provider {
+            bail!("api.provider_mismatch: request provider differs from its exact route");
+        }
+        if reserved_input_tokens == 0 {
+            bail!("api.input_reservation_required: exact API claim requires input-token headroom");
+        }
+        let task = self.db.task(task_id)?;
+        if task.pinned_adapter.as_deref() != Some("api")
+            || task.pinned_provider.as_deref() != Some(provider)
+            || task.pinned_account.as_deref() != Some(account)
+        {
+            bail!("api.explicit_selection_required: task must be pinned to this paid API identity");
+        }
+        let budget = self
+            .db
+            .latest_api_budget(&task.project_id, provider, account)?;
+        if budget.max_retries != 0 {
+            bail!(
+                "api.retry_execution_unavailable: exact scheduler claims currently require zero retries"
+            );
+        }
+        let request_digest = api_request_digest(&budget, spec, now)?;
+        let reserved_currency_micros = match budget.currency.as_deref() {
+            Some(currency) => {
+                let price = self.db.effective_api_model_price(
+                    provider,
+                    account,
+                    &spec.model,
+                    currency,
+                    now,
+                )?;
+                worst_case_api_cost_micros(&price, reserved_input_tokens, spec.max_output_tokens)?
+            }
+            None => 0,
+        };
+        let decision = self.route_task_at(task_id, "api", provider, account, now)?;
+        if !decision.allowed {
+            bail!("{}", decision.reason);
+        }
+        let (claim, reservation) = self.db.claim_task_for_scheduler_with_api_reservation(
+            instance_id,
+            leader_generation,
+            task_id,
+            task.version,
+            now,
+            claim_ttl,
+            max_active_claims,
+            &decision.id,
+            &[],
+            provider,
+            account,
+            max_active_per_adapter,
+            max_active_per_account,
+            &ApiClaimReservationRequest {
+                model: spec.model.clone(),
+                role: role.into(),
+                request_digest,
+                reserved_currency_micros,
+                reserved_input_tokens,
+                reserved_output_tokens: spec.max_output_tokens,
+            },
+        )?;
+        Ok(SchedulerApiClaim { claim, reservation })
+    }
+
     pub fn prepare_reserved_api_request(
         &self,
         reservation_id: &str,
@@ -448,6 +530,11 @@ impl Garnish {
         }
         if reservation.status != "active" || reservation.expires_at <= now {
             bail!("api.reservation_inactive: request requires a live undispatched reservation");
+        }
+        if reservation.claim_id.is_some() && reservation.run_id.is_none() {
+            bail!(
+                "api.claim_not_consumed: scheduler-bound request cannot prepare before its run starts"
+            );
         }
         if spec.provider != reservation.provider || spec.model != reservation.model {
             bail!("api.reservation_mismatch: provider or model differs from the reservation");
@@ -2821,6 +2908,32 @@ fn api_adapter_capabilities() -> Vec<String> {
     vec!["agent.headless".into(), "agent.tool_policy".into()]
 }
 
+fn worst_case_api_cost_micros(
+    price: &ApiModelPrice,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Result<u64> {
+    let maximum_input_rate = price
+        .input_micros_per_million
+        .max(price.cached_input_micros_per_million)
+        .max(price.cache_creation_input_micros_per_million);
+    let (cached_input_tokens, cache_creation_input_tokens) =
+        if maximum_input_rate == price.input_micros_per_million {
+            (0, 0)
+        } else if maximum_input_rate == price.cached_input_micros_per_million {
+            (input_tokens, 0)
+        } else {
+            (0, input_tokens)
+        };
+    crate::api_pricing::calculate_api_cost_micros(
+        price,
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens,
+        output_tokens,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3670,6 +3783,227 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn exact_api_claim_atomically_binds_budget_and_releases_on_scheduler_stop() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let data_dir = dir.path().join("data");
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        enable_fixture_api_route(&mut garnish, &project.id, now);
+        garnish
+            .set_task_route_pin(&task.id, "api", "openai", "paid", "explicit paid API route")
+            .unwrap();
+        garnish
+            .register_scheduler("api-claim", "fixture", 1, now)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("api-claim", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let spec = ApiRequestSpec {
+            provider: "openai".into(),
+            model: "model-fixture".into(),
+            instructions: "bounded fixture instructions".into(),
+            input: "bounded fixture input".into(),
+            max_output_tokens: 50,
+            tools: vec![],
+            stream: false,
+        };
+
+        let denied = garnish
+            .claim_exact_api_request_at(
+                "api-claim",
+                leader.generation,
+                &task.id,
+                "openai",
+                "paid",
+                "implementer",
+                &spec,
+                100_000,
+                now,
+                std::time::Duration::from_secs(60),
+                1,
+                1,
+                1,
+            )
+            .unwrap_err();
+        assert!(denied.to_string().contains("api.token_budget_exhausted"));
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Ready);
+        assert_eq!(garnish.db.active_scheduler_claim_count(now).unwrap(), 0);
+        assert!(
+            garnish
+                .api_reservations(Some("fixture"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let bound = garnish
+            .claim_exact_api_request_at(
+                "api-claim",
+                leader.generation,
+                &task.id,
+                "openai",
+                "paid",
+                "implementer",
+                &spec,
+                100,
+                now,
+                std::time::Duration::from_secs(60),
+                1,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            bound.reservation.claim_id.as_deref(),
+            Some(bound.claim.id.as_str())
+        );
+        assert_eq!(bound.reservation.run_id, None);
+        assert_eq!(bound.reservation.reserved_currency_micros, 250);
+        assert_eq!(
+            bound.reservation.request_digest,
+            api_request_digest(
+                &garnish
+                    .db
+                    .latest_api_budget(&project.id, "openai", "paid")
+                    .unwrap(),
+                &spec,
+                now,
+            )
+            .unwrap()
+        );
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Leased);
+        assert!(
+            garnish
+                .prepare_reserved_api_request(&bound.reservation.id, &spec, now)
+                .unwrap_err()
+                .to_string()
+                .contains("api.claim_not_consumed")
+        );
+        assert!(
+            garnish
+                .release_api_reservation(&bound.reservation.id, "manual bypass", now)
+                .is_err()
+        );
+        drop(garnish);
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let durable = garnish.db.api_reservation(&bound.reservation.id).unwrap();
+        assert_eq!(durable.claim_id.as_deref(), Some(bound.claim.id.as_str()));
+        garnish
+            .db
+            .heartbeat_scheduler_claims(
+                "api-claim",
+                leader.generation,
+                now + Duration::seconds(10),
+                std::time::Duration::from_secs(120),
+            )
+            .unwrap();
+        assert_eq!(
+            garnish
+                .api_reservations(Some("fixture"))
+                .unwrap()
+                .first()
+                .unwrap()
+                .expires_at,
+            now + Duration::seconds(130)
+        );
+
+        assert_eq!(
+            garnish
+                .stop_scheduler("api-claim", now + Duration::seconds(11))
+                .unwrap(),
+            vec![task.id.clone()]
+        );
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Ready);
+        let released = garnish.api_reservations(Some("fixture")).unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].status, "released");
+        assert_eq!(
+            released[0].release_reason.as_deref(),
+            Some("scheduler_stopped")
+        );
+    }
+
+    #[test]
+    fn dispatched_scheduler_bound_api_reservation_is_retained_after_run_failure() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        enable_fixture_api_route(&mut garnish, &project.id, now);
+        garnish
+            .set_task_route_pin(&task.id, "api", "openai", "paid", "explicit paid API route")
+            .unwrap();
+        garnish
+            .register_scheduler("api-run", "fixture", 1, now)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("api-run", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let spec = ApiRequestSpec {
+            provider: "openai".into(),
+            model: "model-fixture".into(),
+            instructions: "bounded fixture instructions".into(),
+            input: "bounded fixture input".into(),
+            max_output_tokens: 50,
+            tools: vec![],
+            stream: false,
+        };
+        let bound = garnish
+            .claim_exact_api_request_at(
+                "api-run",
+                leader.generation,
+                &task.id,
+                "openai",
+                "paid",
+                "implementer",
+                &spec,
+                100,
+                now,
+                std::time::Duration::from_secs(60),
+                1,
+                1,
+                1,
+            )
+            .unwrap();
+        assert!(
+            garnish
+                .claim_api_dispatch(&bound.reservation.id, now + Duration::seconds(1))
+                .is_err()
+        );
+        let run_id = Ulid::new().to_string();
+        garnish
+            .db
+            .begin_claimed_run(
+                &bound.claim.id,
+                "api-run",
+                leader.generation,
+                &run_id,
+                "api",
+                "/fixture/worktree",
+                "fixture-branch",
+                "fixture-base",
+                now + Duration::seconds(1),
+                std::time::Duration::from_secs(120),
+            )
+            .unwrap();
+        let running = garnish.db.api_reservation(&bound.reservation.id).unwrap();
+        assert_eq!(running.run_id.as_deref(), Some(run_id.as_str()));
+        garnish
+            .claim_api_dispatch(&bound.reservation.id, now + Duration::seconds(2))
+            .unwrap();
+        garnish.db.finish_run(&run_id, "failed", None, 1).unwrap();
+        let retained = garnish.db.api_reservation(&bound.reservation.id).unwrap();
+        assert_eq!(retained.status, "dispatched");
+        assert_eq!(retained.release_reason, None);
     }
 
     #[test]

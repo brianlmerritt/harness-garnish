@@ -175,9 +175,11 @@ Schema 16 materializes the network-free API accounting control plane and durable
 
 Budget revisions are append-only. Secret references are locators with one of three strict forms—`env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`—not credential values. Monetary admission uses integer micros and an explicit three-letter currency. At least one currency, token, or request ceiling is mandatory.
 
-`api_budget_reservations`: `id`, `budget_id`, `project_id`, `task_id`, `provider`, `account`, `model`, `role`, `request_digest`, worst-case currency/input-token/output-token reservations, `status`, `created_at`, `expires_at`, `dispatch_claimed_at`, `settled_at`, `release_reason`.
+`api_budget_reservations`: `id`, `budget_id`, `project_id`, `task_id`, `provider`, `account`, `model`, `role`, `request_digest`, worst-case currency/input-token/output-token reservations, `status`, `created_at`, `expires_at`, `dispatch_claimed_at`, `settled_at`, `release_reason`, `claim_id`, `run_id`.
 
 Reservation admission runs in an immediate transaction and includes committed spend plus every active or dispatched reservation. An undispatched reservation can be released or expires once; claiming dispatch is single-use. After dispatch, uncertain provider outcome retains the reservation until authenticated settlement instead of incorrectly returning budget.
+
+Schema 17 adds the scheduler binding. An exact paid request must be explicitly pinned, is hashed without persisting its prompt, and has its worst-case monetary reservation calculated from the effective price record. The scheduler claim, capacity locks, and reservation commit together or all roll back. Claim heartbeat and claim-to-run conversion renew the bound reservation; stop, expiry, emergency stop, pre-dispatch completion/failure, and orphan recovery release it once. A bound reservation cannot be manually released or dispatched before its claim becomes a run.
 
 `api_model_prices`: `id`, provider/account/model/currency identity, integer-micro rates per million uncached-input/cache-read/cache-creation/output tokens, `effective_from/to`, `source`, `reason`, `created_at`, `supersedes_id`.
 

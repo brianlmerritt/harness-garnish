@@ -157,7 +157,7 @@ garnish --data-dir .garnish-state quota forecast --adapter codex --provider code
 
 ### Phase 4 API budget control plane
 
-Schema 16 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas and adds append-only model-price evidence with exact categorized-token costing. It has no real HTTP transport: configuration, fixture execution, and these read commands cannot make a provider request or spend credit.
+Schema 17 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas, adds append-only model-price evidence with exact categorized-token costing, and can atomically bind one exact paid request reservation to a scheduler claim. It has no real HTTP transport: configuration, fixture execution, and these read commands cannot make a provider request or spend credit.
 
 ```console
 cargo run --locked -- --data-dir .garnish-state api budget-status
@@ -171,7 +171,7 @@ These five commands contain no placeholders; the last prints the required pricin
 
 Protected secret resolution is host-side and bounded. On Unix, `file:` targets must be regular files owned by the Garnish user with no group/other permissions (normally mode `0600`); symlinks are rejected. `keychain:` currently requires macOS. WSL2 and native Linux use `env:` or a protected Linux-side file. No API transport is enabled yet, so users should not configure or test a live credential at this stage.
 
-API routing uses the literal adapter key `api` with provider `openai` or `anthropic`; the account is the configured Garnish account label. Paid capacity is checked against the project API budget, never subscription percentages. In a mixed subscription/API candidate set, the API lane cannot act as fallback: it requires an exact task pin. Automated scheduler claims for API routes remain disabled until an exact request digest and budget reservation can be created atomically, so configuring this route cannot send a provider request.
+API routing uses the literal adapter key `api` with provider `openai` or `anthropic`; the account is the configured Garnish account label. Paid capacity is checked against the project API budget, never subscription percentages. In a mixed subscription/API candidate set, the API lane cannot act as fallback: it requires an exact task pin. The control-plane claim primitive now hashes the bounded request, calculates worst-case currency from exact price evidence, and creates its scheduler claim plus API reservation in one immediate transaction. It currently requires a zero-retry budget. The general scheduler daemon still denies API candidates because it has no durable exact-request plan input; configuring a route therefore cannot send a provider request.
 
 Successful fake execution now creates separate implementer and verifier run records. The quota-free `garnish-command-verifier:local:default` is independently selected, receives a clean detached verification worktree and its own evidence directory, and runs only the task's predeclared verification argv. It is a deterministic command verifier, not a claim of semantic agent review. Default policy requires a different verifier adapter; project policy can also require a different provider.
 
