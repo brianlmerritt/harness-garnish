@@ -5,14 +5,15 @@ use crate::{
     },
     db::Database,
     domain::{
-        AgentCapabilityProbe, AgentCapabilityStatus, ApprovalRequest, BackupRecord,
+        AgentCapabilityProbe, AgentCapabilityStatus, ApiBudget, ApiBudgetReservation,
+        ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord,
         CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ControlState,
-        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewTask, Project,
-        ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample,
-        RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint,
-        RunRecord, RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerClaimRejection,
-        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
-        SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
+        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewApiBudget, NewTask,
+        Project, ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface,
+        QuotaUsageSample, RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget,
+        RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation, SchedulerClaim,
+        SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
+        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -83,7 +84,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 14,
+            schema_version: 15,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -372,6 +373,65 @@ impl Garnish {
 
     pub fn quota_collection_attempts(&self) -> Result<Vec<QuotaCollectionAttempt>> {
         self.db.list_quota_collection_attempts()
+    }
+
+    pub fn configure_api_budget(&mut self, config: &NewApiBudget) -> Result<ApiBudget> {
+        let project = self.db.project(&config.project_id)?;
+        let mut config = config.clone();
+        config.project_id = project.id;
+        self.db.configure_api_budget(&config)
+    }
+
+    pub fn api_budgets(&self, project: Option<&str>) -> Result<Vec<ApiBudget>> {
+        let project_id = project
+            .map(|value| self.db.project(value).map(|project| project.id))
+            .transpose()?;
+        self.db.list_latest_api_budgets(project_id.as_deref())
+    }
+
+    pub fn api_reservations(&self, project: Option<&str>) -> Result<Vec<ApiBudgetReservation>> {
+        let project_id = project
+            .map(|value| self.db.project(value).map(|project| project.id))
+            .transpose()?;
+        self.db.list_api_reservations(project_id.as_deref())
+    }
+
+    pub fn api_spend(&self, project: Option<&str>) -> Result<Vec<ApiSpend>> {
+        let project_id = project
+            .map(|value| self.db.project(value).map(|project| project.id))
+            .transpose()?;
+        self.db.list_api_spend(project_id.as_deref())
+    }
+
+    pub fn reserve_api_budget(
+        &mut self,
+        request: &ApiReservationRequest,
+    ) -> Result<ApiBudgetReservation> {
+        if !self.policy.api_allowed(&request.provider) {
+            bail!("api.policy_disabled: effective policy disables this API provider");
+        }
+        self.db.reserve_api_budget(request)
+    }
+
+    pub fn claim_api_dispatch(
+        &mut self,
+        reservation_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ApiBudgetReservation> {
+        self.db.claim_api_dispatch(reservation_id, now)
+    }
+
+    pub fn release_api_reservation(
+        &mut self,
+        reservation_id: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ApiBudgetReservation> {
+        self.db.release_api_reservation(reservation_id, reason, now)
+    }
+
+    pub fn settle_api_reservation(&mut self, settlement: &ApiSettlement) -> Result<ApiSpend> {
+        self.db.settle_api_reservation(settlement)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2217,6 +2277,7 @@ impl Garnish {
     }
 
     pub fn recover_at(&mut self, now: DateTime<Utc>) -> Result<Vec<String>> {
+        self.db.recover_expired_api_reservations(now)?;
         let recovered = self.db.recover_expired_leases(now)?;
         for task_id in &recovered {
             let task = self.db.task(task_id)?;
@@ -2842,6 +2903,132 @@ mod tests {
         assert_eq!(other_account.source, "conservative_fallback");
         assert_eq!(other_account.sample_count, 0);
         assert_eq!(garnish.quota_usage_samples(100).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn api_budget_is_default_deny_and_dispatch_settlement_are_single_use() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = Utc::now();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        let budget = garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id.clone(),
+                provider: "openai".into(),
+                account: "default".into(),
+                enabled: true,
+                secret_reference: "env:OPENAI_API_KEY".into(),
+                currency: Some("USD".into()),
+                currency_limit_micros: Some(1_000),
+                token_limit: Some(100),
+                request_limit: Some(1),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::days(30),
+                allowed_models: vec!["gpt-fixture".into()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["planner".into()],
+                max_output_tokens: 50,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "explicit fixture budget".into(),
+            })
+            .unwrap();
+        assert!(budget.enabled);
+        let request = ApiReservationRequest {
+            project_id: project.id,
+            task_id: task.id,
+            provider: "openai".into(),
+            account: "default".into(),
+            model: "gpt-fixture".into(),
+            role: "planner".into(),
+            request_digest: "a".repeat(64),
+            reserved_currency_micros: 400,
+            reserved_input_tokens: 10,
+            reserved_output_tokens: 20,
+            now,
+            expires_at: now + Duration::minutes(5),
+        };
+        let denied = garnish.reserve_api_budget(&request).unwrap_err();
+        assert!(denied.to_string().contains("api.policy_disabled"));
+
+        garnish.policy.openai_api_enabled = true;
+        let reservation = garnish.reserve_api_budget(&request).unwrap();
+        assert_eq!(reservation.status, "active");
+        assert!(garnish.reserve_api_budget(&request).is_err());
+        let dispatched = garnish
+            .claim_api_dispatch(&reservation.id, now + Duration::seconds(1))
+            .unwrap();
+        assert_eq!(dispatched.status, "dispatched");
+        assert!(
+            garnish
+                .claim_api_dispatch(&reservation.id, now + Duration::seconds(2))
+                .is_err()
+        );
+        assert!(
+            garnish
+                .release_api_reservation(
+                    &reservation.id,
+                    "unsafe after dispatch",
+                    now + Duration::seconds(2),
+                )
+                .is_err()
+        );
+        let settlement = ApiSettlement {
+            reservation_id: reservation.id,
+            provider_request_id_hash: "b".repeat(64),
+            input_tokens: 8,
+            output_tokens: 18,
+            cost_micros: 300,
+            currency: Some("USD".into()),
+            source: "provider_reported".into(),
+            observed_at: now + Duration::seconds(3),
+        };
+        let spend = garnish.settle_api_reservation(&settlement).unwrap();
+        assert_eq!(spend.cost_micros, 300);
+        assert!(garnish.settle_api_reservation(&settlement).is_err());
+        assert_eq!(garnish.api_spend(Some("fixture")).unwrap().len(), 1);
+
+        let mut second = request;
+        second.request_digest = "c".repeat(64);
+        second.now = now + Duration::seconds(4);
+        second.expires_at = now + Duration::minutes(5);
+        let denied = garnish.reserve_api_budget(&second).unwrap_err();
+        assert!(denied.to_string().contains("api.request_budget_exhausted"));
+    }
+
+    #[test]
+    fn invalid_api_budget_cannot_become_enabled() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = Utc::now();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let result = garnish.configure_api_budget(&NewApiBudget {
+            project_id: project.id,
+            provider: "openai".into(),
+            account: "default".into(),
+            enabled: true,
+            secret_reference: "sk-not-a-reference".into(),
+            currency: None,
+            currency_limit_micros: None,
+            token_limit: None,
+            request_limit: None,
+            period_start: now,
+            period_end: now + Duration::days(30),
+            allowed_models: vec!["gpt-fixture".into()],
+            allowed_tools: vec![],
+            allowed_roles: vec!["planner".into()],
+            max_output_tokens: 100,
+            max_retries: 0,
+            max_concurrent_requests: 1,
+            reason: "invalid fixture".into(),
+        });
+        assert!(result.is_err());
+        assert!(garnish.api_budgets(Some("fixture")).unwrap().is_empty());
     }
 
     #[test]

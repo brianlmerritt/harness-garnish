@@ -419,6 +419,118 @@ pub struct QuotaUsageSample {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiBudget {
+    pub id: String,
+    pub project_id: String,
+    pub provider: String,
+    pub account: String,
+    pub enabled: bool,
+    pub secret_reference: String,
+    pub currency: Option<String>,
+    pub currency_limit_micros: Option<u64>,
+    pub token_limit: Option<u64>,
+    pub request_limit: Option<u64>,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub allowed_models: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub allowed_roles: Vec<String>,
+    pub max_output_tokens: u64,
+    pub max_retries: u32,
+    pub max_concurrent_requests: u32,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub supersedes_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewApiBudget {
+    pub project_id: String,
+    pub provider: String,
+    pub account: String,
+    pub enabled: bool,
+    pub secret_reference: String,
+    pub currency: Option<String>,
+    pub currency_limit_micros: Option<u64>,
+    pub token_limit: Option<u64>,
+    pub request_limit: Option<u64>,
+    pub period_start: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
+    pub allowed_models: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub allowed_roles: Vec<String>,
+    pub max_output_tokens: u64,
+    pub max_retries: u32,
+    pub max_concurrent_requests: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiBudgetReservation {
+    pub id: String,
+    pub budget_id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    pub role: String,
+    pub request_digest: String,
+    pub reserved_currency_micros: u64,
+    pub reserved_input_tokens: u64,
+    pub reserved_output_tokens: u64,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub dispatch_claimed_at: Option<DateTime<Utc>>,
+    pub settled_at: Option<DateTime<Utc>>,
+    pub release_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiReservationRequest {
+    pub project_id: String,
+    pub task_id: String,
+    pub provider: String,
+    pub account: String,
+    pub model: String,
+    pub role: String,
+    pub request_digest: String,
+    pub reserved_currency_micros: u64,
+    pub reserved_input_tokens: u64,
+    pub reserved_output_tokens: u64,
+    pub now: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiSettlement {
+    pub reservation_id: String,
+    pub provider_request_id_hash: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
+    pub currency: Option<String>,
+    pub source: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiSpend {
+    pub id: String,
+    pub budget_id: String,
+    pub reservation_id: String,
+    pub provider_request_id_hash: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micros: u64,
+    pub currency: Option<String>,
+    pub source: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageForecast {
     pub adapter: String,
     pub provider: String,

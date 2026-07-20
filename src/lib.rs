@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod api_providers;
 pub mod db;
 pub mod domain;
 pub mod evidence;

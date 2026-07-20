@@ -1,6 +1,101 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
+use std::{fs, process::Command};
 use tempfile::tempdir;
+
+#[test]
+fn api_budget_configuration_is_explicit_and_stable_json() {
+    let dir = tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "project",
+            "add",
+            "--slug",
+            "fixture",
+            "--title",
+            "Fixture",
+            "--path",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "api",
+            "budget-set",
+            "--project",
+            "fixture",
+            "--provider",
+            "openai",
+            "--account",
+            "default",
+            "--secret-reference",
+            "env:OPENAI_API_KEY",
+            "--currency",
+            "USD",
+            "--currency-limit-micros",
+            "1000000",
+            "--token-limit",
+            "100000",
+            "--request-limit",
+            "100",
+            "--period-start",
+            "2026-07-20T00:00:00Z",
+            "--period-end",
+            "2026-08-20T00:00:00Z",
+            "--model",
+            "gpt-fixture",
+            "--role",
+            "planner",
+            "--max-output-tokens",
+            "4096",
+            "--reason",
+            "explicit fixture budget",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let budget: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(budget["provider"], "openai");
+    assert_eq!(budget["currency_limit_micros"], 1_000_000);
+    assert_eq!(budget["allowed_models"][0], "gpt-fixture");
+
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "api",
+            "budget-status",
+            "--project",
+            "fixture",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let budgets: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(budgets.as_array().unwrap().len(), 1);
+    assert_eq!(budgets[0]["enabled"], true);
+}
 
 #[test]
 fn quota_usage_evidence_and_forecast_commands_are_stable_json() {
@@ -372,7 +467,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 14);
+    assert_eq!(value["schema_version"], 15);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

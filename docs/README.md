@@ -19,6 +19,7 @@ These documents contain the design baseline and phased implementation evidence. 
 | [Phase 2 exit report](phase-2-exit-report.md) | Final schema-7 macOS, Linux, and WSL2 acceptance evidence and residual scope |
 | [Phase 3 plan](phase-3-plan.md) | Multi-agent capability evidence, quota providers/reservations, deterministic routing, and independent verification |
 | [Phase 3 exit report](phase-3-exit-report.md) | Final schema-14 macOS, Linux, and WSL2 routing, forecasting, UI, and verifier acceptance evidence |
+| [Phase 4 plan](phase-4-plan.md) | Budgeted OpenAI/Anthropic API agents, controlled remote approvals, and MCP/skill/ACP boundaries |
 | [ADRs](decisions/README.md) | Decisions that constrain implementation |
 
 Every material change to these boundaries requires an ADR amendment or a superseding ADR. Documentation may describe a future capability only when it is clearly labelled as planned.

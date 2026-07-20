@@ -1,8 +1,9 @@
 use crate::{
     Garnish,
     domain::{
-        AgentCapabilityStatus, ApprovalRequest, LocalNotification, Project, QuotaCollectionAttempt,
-        QuotaSurface, SchedulerWake, Task, TaskStatus,
+        AgentCapabilityStatus, ApiBudget, ApiBudgetReservation, ApiSpend, ApprovalRequest,
+        LocalNotification, Project, QuotaCollectionAttempt, QuotaSurface, SchedulerWake, Task,
+        TaskStatus,
     },
 };
 use anyhow::{Context, Result, bail};
@@ -46,6 +47,9 @@ pub struct OperatorSnapshot {
     pub tasks: Vec<Task>,
     pub agents: Vec<AgentCapabilityStatus>,
     pub quotas: Vec<QuotaSurface>,
+    pub api_budgets: Vec<ApiBudget>,
+    pub api_reservations: Vec<ApiBudgetReservation>,
+    pub api_spend: Vec<ApiSpend>,
     pub approvals: Vec<ApprovalRequest>,
     pub notifications: Vec<LocalNotification>,
     pub scheduler_wakes: Vec<SchedulerWake>,
@@ -64,6 +68,9 @@ pub fn operator_snapshot(garnish: &Garnish) -> Result<OperatorSnapshot> {
         tasks: garnish.tasks(None)?,
         agents: garnish.agent_capability_status()?,
         quotas: garnish.quota()?,
+        api_budgets: garnish.api_budgets(None)?,
+        api_reservations: garnish.api_reservations(None)?,
+        api_spend: garnish.api_spend(None)?,
         approvals: garnish.approvals(100)?,
         notifications: garnish.local_notifications(true, 40)?,
         scheduler_wakes,
@@ -671,7 +678,93 @@ fn render_agents(snapshot: &OperatorSnapshot) -> String {
     }
     html.push_str("</section><section class=\"panel section-gap\"><div class=\"panel-head\"><div><p class=\"eyebrow\">Independent limits</p><h2>Quota surfaces</h2></div><span class=\"quiet\">Reserve-aware</span></div>");
     html.push_str(&render_quota_cards(snapshot, usize::MAX));
+    html.push_str("</section><section class=\"panel section-gap\"><div class=\"panel-head\"><div><p class=\"eyebrow\">Paid providers</p><h2>Project API budgets</h2></div><span class=\"quiet\">Default deny · integer accounting</span></div>");
+    html.push_str(&render_api_budgets(snapshot));
     html.push_str("</section>");
+    html
+}
+
+fn render_api_budgets(snapshot: &OperatorSnapshot) -> String {
+    if snapshot.api_budgets.is_empty() {
+        return empty_state(
+            "No API budgets enabled",
+            "OpenAI and Anthropic API access remains denied until a project budget and effective policy explicitly allow it.",
+        );
+    }
+    let project_names = snapshot
+        .projects
+        .iter()
+        .map(|project| (project.id.as_str(), project.title.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut html = String::from("<div class=\"quota-list\">");
+    for budget in &snapshot.api_budgets {
+        let (class, status) = if !budget.enabled {
+            ("neutral", "Disabled")
+        } else if snapshot.evaluated_at < budget.period_start
+            || snapshot.evaluated_at >= budget.period_end
+        {
+            ("warn", "Outside period")
+        } else {
+            ("good", "Enabled")
+        };
+        let reserved = snapshot
+            .api_reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.budget_id == budget.id
+                    && matches!(reservation.status.as_str(), "active" | "dispatched")
+            })
+            .count();
+        let spent = snapshot
+            .api_spend
+            .iter()
+            .filter(|spend| spend.budget_id == budget.id)
+            .fold((0_u64, 0_u64, 0_usize), |totals, spend| {
+                (
+                    totals.0.saturating_add(spend.cost_micros),
+                    totals
+                        .1
+                        .saturating_add(spend.input_tokens)
+                        .saturating_add(spend.output_tokens),
+                    totals.2.saturating_add(1),
+                )
+            });
+        let project = project_names
+            .get(budget.project_id.as_str())
+            .copied()
+            .unwrap_or("Unknown project");
+        let ceilings = format!(
+            "{} · {} · {}",
+            budget.currency_limit_micros.map_or_else(
+                || "no money ceiling".into(),
+                |value| format!(
+                    "{value} {} micros",
+                    budget.currency.as_deref().unwrap_or("?")
+                )
+            ),
+            budget.token_limit.map_or_else(
+                || "no token ceiling".into(),
+                |value| format!("{value} tokens")
+            ),
+            budget.request_limit.map_or_else(
+                || "no request ceiling".into(),
+                |value| format!("{value} requests")
+            ),
+        );
+        let _ = write!(
+            html,
+            "<article class=\"quota-row\"><div><strong>{} · {}</strong><small>{} · {}</small></div><div><strong>{} reservations · {} settled</strong><small>{} cost micros · {} tokens used</small></div><span class=\"badge {class}\">{status}</span></article>",
+            title_case(&budget.provider),
+            escape_html(&budget.account),
+            escape_html(project),
+            escape_html(&ceilings),
+            reserved,
+            spent.2,
+            spent.0,
+            spent.1,
+        );
+    }
+    html.push_str("</div>");
     html
 }
 
@@ -947,7 +1040,7 @@ fn styles() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{DayAffinity, NewTask};
+    use crate::domain::{DayAffinity, NewApiBudget, NewTask};
     use std::{net::TcpStream, sync::mpsc, thread};
     use tempfile::tempdir;
 
@@ -973,7 +1066,7 @@ mod tests {
             .unwrap();
         let task = garnish
             .add_task(&NewTask {
-                project_id: project.id,
+                project_id: project.id.clone(),
                 title: "Inspect <unsafe> output".into(),
                 goal: "Explain why it waits".into(),
                 rationale: "fixture".into(),
@@ -999,6 +1092,28 @@ mod tests {
             .unwrap();
         let now = Utc::now();
         garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id,
+                provider: "openai".into(),
+                account: "default".into(),
+                enabled: true,
+                secret_reference: "env:OPENAI_API_KEY".into(),
+                currency: Some("USD".into()),
+                currency_limit_micros: Some(1_000_000),
+                token_limit: Some(100_000),
+                request_limit: Some(100),
+                period_start: now - chrono::Duration::minutes(1),
+                period_end: now + chrono::Duration::days(30),
+                allowed_models: vec!["gpt-fixture".into()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["planner".into()],
+                max_output_tokens: 1_000,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "UI fixture".into(),
+            })
+            .unwrap();
+        garnish
             .register_scheduler("ui-fixture", "fixture", 1, now)
             .unwrap();
         let leader = garnish
@@ -1023,6 +1138,10 @@ mod tests {
         assert!(html.contains(&short_id(&task.id)));
         assert!(html.contains("quota.unavailable"));
         assert!(!html.contains("<unsafe>"));
+        let html = render_page("/agents", &snapshot, garnish.data_dir(), "127.0.0.1:7467");
+        assert!(html.contains("Project API budgets"));
+        assert!(html.contains("Fixture &lt;Project&gt;"));
+        assert!(html.contains("1000000 USD micros"));
     }
 
     #[test]

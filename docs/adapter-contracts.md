@@ -203,6 +203,10 @@ OpenAI uses the current Responses API or maintained Agents SDK where it preserve
 
 API secrets come from a configured secret provider. No adapter may fall back from a subscription CLI to paid API merely because CLI quota is low.
 
+The Schema 15 fixture parser accepts bounded OpenAI `response` objects and the single authoritative `response.completed` streaming event. It requires completed assistant output plus exact input/output/total usage, accepts additive object fields and non-authoritative future stream events, and rejects unknown authoritative output types, partial status, duplicate completion, malformed tool arguments, inconsistent usage, or a stream without completion.
+
+The Anthropic fixture parser accepts bounded assistant `message` objects and ordered Messages API streams from `message_start` through stopped content blocks, terminal `message_delta` usage, and `message_stop`. It accounts for base, cache-creation, and cache-read input tokens; preserves terminal truncation, pause, refusal, and tool-use states; and fails closed on unknown authoritative content, mismatched deltas, invalid tool input, event reordering, or partial streams. Both parsers require the provider HTTP request ID in memory. Persistence receives only its SHA-256 hash. HTTP authentication, permission, rate limit, paid-usage exhaustion, invalid request, and transient provider failures remain distinct classifications.
+
 ## Verification adapter
 
 Verification commands use argv arrays, a clean sandbox, and the produced commit/patch. The contract returns command, cwd, environment fingerprint, tool versions, start/end, exit status, bounded output artifact, and result. Independent review is a separate role/run and cannot mutate the implementation worktree.

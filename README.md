@@ -8,6 +8,8 @@ Phase 2 is complete. Its schema-7 durable scheduler, supervision/recovery matric
 
 Phase 3 is complete. Its schema-14 multi-agent capability routing, quota observations/reservations/forecasting, authenticated local operator interface, separate verifier runs, and final macOS/Linux/WSL2 results are recorded in [`docs/phase-3-exit-report.md`](docs/phase-3-exit-report.md).
 
+Phase 4 is in progress. Its network-free first slice adds project-scoped API budgets and atomic paid-usage reservations before any real OpenAI or Anthropic request is enabled; see [`docs/phase-4-plan.md`](docs/phase-4-plan.md).
+
 ## Confirmed direction
 
 - `garnish` will be a small Rust control plane with SQLite as canonical state.
@@ -153,6 +155,18 @@ garnish --data-dir .garnish-state quota forecast --adapter codex --provider code
 
 `quota record-usage` is currently a collector/operator ingestion contract, not an instruction to estimate percentages by hand. Its required `--evidence-id` must be a stable real run or collector identifier; `--source` must name the real evidence source. Provider-reported, collector-measured, and explicit user-reported confidence are distinct from untrusted agent output.
 
+### Phase 4 API budget control plane
+
+Schema 15 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas. It has no HTTP transport yet: configuration, fixture parsing, and these read commands cannot make a provider request or spend credit.
+
+```console
+cargo run --locked -- --data-dir .garnish-state api budget-status
+cargo run --locked -- --data-dir .garnish-state api reservations
+cargo run --locked -- --data-dir .garnish-state api spend
+```
+
+These three commands contain no placeholders. A project budget can be configured through `api budget-set`, but configuration alone never enables spending: effective policy is independently default-deny, and no subscription-quota condition can select paid API use. Secret fields accept only a locator shaped as `env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`; they never accept a key value. The authenticated read-only dashboard shows API budgets, outstanding reservations, and settled usage under **Agents & quotas**.
+
 Successful fake execution now creates separate implementer and verifier run records. The quota-free `garnish-command-verifier:local:default` is independently selected, receives a clean detached verification worktree and its own evidence directory, and runs only the task's predeclared verification argv. It is a deterministic command verifier, not a claim of semantic agent review. Default policy requires a different verifier adapter; project policy can also require a different provider.
 
 ### Local operator interface
@@ -223,6 +237,16 @@ Use a current rustup-managed Rust toolchain and keep the checkout in the WSL2 Li
 ```
 
 The bundle consumes no provider quota. It runs the Linux midpoint, verifies default denial of Windows-mounted project roots, requires a healthy rootless Podman or Docker runtime, exercises operational backup/status, and checks private Linux permissions. It passed on Ubuntu 24.04 under WSL2 with rootless Podman on 2026-07-20; the captured evidence and cgroup fallback caveat are in [`docs/phase-2-wsl2-exit.md`](docs/phase-2-wsl2-exit.md).
+
+### Phase 4 portability checkpoint
+
+After updating the checkout on either the Linux VPS or WSL2, run this exact command as the existing non-root development user:
+
+```console
+./scripts/test-phase4-portability
+```
+
+There are no placeholders and no additional packages or container images are required. The script removes OpenAI and Anthropic credential variables from the test environment, then runs formatting, strict lint, and the complete fixture-only suite. It automatically distinguishes native Linux from WSL2 and rejects a WSL checkout under `/mnt/<drive>`.
 
 ## Repository authority
 

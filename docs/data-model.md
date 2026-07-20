@@ -169,11 +169,19 @@ Schema 11 creates one percentage reservation per relevant surface in the same im
 
 ### `api_budgets` and `api_spend`
 
-`api_budgets`: `id`, `project_id`, `provider`, `enabled`, `currency_limit`, `token_limit`, `request_limit`, `period`, `allowed_models_json`, `allowed_tools_json`, `effective_from/to`, `policy_revision_id`.
+Schema 15 materializes the network-free API accounting control plane.
 
-`api_spend`: `id`, `budget_id`, `run_id`, `provider_request_id_hash`, `model`, token categories, provider cost, estimated cost, currency, `observed_at`, `source`.
+`api_budgets`: `id`, `project_id`, `provider`, `account`, `enabled`, `secret_reference`, `currency`, `currency_limit_micros`, `token_limit`, `request_limit`, `period_start/end`, model/tool/role allowlists, `max_output_tokens`, `max_retries`, `max_concurrent_requests`, `reason`, `created_at`, `supersedes_id`.
 
-Budget checks use committed spend plus outstanding reservation. Subscription quota never satisfies an API budget and API funds never imply subscription headroom.
+Budget revisions are append-only. Secret references are locators with one of three strict forms—`env:NAME`, `keychain:SERVICE/ACCOUNT`, or `file:/absolute/path`—not credential values. Monetary admission uses integer micros and an explicit three-letter currency. At least one currency, token, or request ceiling is mandatory.
+
+`api_budget_reservations`: `id`, `budget_id`, `project_id`, `task_id`, `provider`, `account`, `model`, `role`, `request_digest`, worst-case currency/input-token/output-token reservations, `status`, `created_at`, `expires_at`, `dispatch_claimed_at`, `settled_at`, `release_reason`.
+
+Reservation admission runs in an immediate transaction and includes committed spend plus every active or dispatched reservation. An undispatched reservation can be released or expires once; claiming dispatch is single-use. After dispatch, uncertain provider outcome retains the reservation until authenticated settlement instead of incorrectly returning budget.
+
+`api_spend`: `id`, `budget_id`, `reservation_id`, `provider_request_id_hash`, `model`, input/output tokens, `cost_micros`, `currency`, `source`, `observed_at`.
+
+Settlement is single-use, cannot exceed the claimed maximum, and stores only the provider request-ID hash and bounded usage evidence. Prompts, responses, raw request IDs, and credentials are not accounting fields. Subscription quota never satisfies an API budget and API funds never imply subscription headroom.
 
 ## Policy and integration entities
 

@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use harness_garnish::{
     Garnish,
     adapters::AgentKind,
-    domain::{DayAffinity, DayKind, NewTask, RouteTarget, SchedulerDaemonConfig},
+    domain::{DayAffinity, DayKind, NewApiBudget, NewTask, RouteTarget, SchedulerDaemonConfig},
     web_ui::{UiServerConfig, serve_ui},
 };
 use serde::Serialize;
@@ -47,6 +47,10 @@ enum Command {
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
+    },
+    Api {
+        #[command(subcommand)]
+        command: ApiCommand,
     },
     Schedule {
         #[command(subcommand)]
@@ -252,6 +256,66 @@ enum QuotaCommand {
     Attempts,
     Reservations,
     Status,
+}
+
+#[derive(Subcommand)]
+enum ApiCommand {
+    BudgetSet(Box<ApiBudgetSet>),
+    BudgetStatus {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Reservations {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Spend {
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct ApiBudgetSet {
+    #[arg(long)]
+    project: String,
+    #[arg(long)]
+    provider: String,
+    #[arg(long, default_value = "default")]
+    account: String,
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    enabled: bool,
+    #[arg(
+        long,
+        help = "Non-secret env:NAME, keychain:SERVICE/ACCOUNT, or file:/absolute/path reference"
+    )]
+    secret_reference: String,
+    #[arg(long)]
+    currency: Option<String>,
+    #[arg(long)]
+    currency_limit_micros: Option<u64>,
+    #[arg(long)]
+    token_limit: Option<u64>,
+    #[arg(long)]
+    request_limit: Option<u64>,
+    #[arg(long, help = "RFC3339 inclusive period start")]
+    period_start: String,
+    #[arg(long, help = "RFC3339 exclusive period end")]
+    period_end: String,
+    #[arg(long = "model", required = true)]
+    allowed_models: Vec<String>,
+    #[arg(long = "tool")]
+    allowed_tools: Vec<String>,
+    #[arg(long = "role", required = true)]
+    allowed_roles: Vec<String>,
+    #[arg(long)]
+    max_output_tokens: u64,
+    #[arg(long, default_value_t = 0)]
+    max_retries: u32,
+    #[arg(long, default_value_t = 1)]
+    max_concurrent_requests: u32,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args)]
@@ -804,6 +868,37 @@ fn run() -> Result<()> {
             QuotaCommand::Reservations => print_json(&garnish.quota_reservations()?),
             QuotaCommand::Status => print_json(&garnish.quota()?),
         },
+        Command::Api { command } => match command {
+            ApiCommand::BudgetSet(args) => {
+                print_json(&garnish.configure_api_budget(&NewApiBudget {
+                    project_id: args.project,
+                    provider: args.provider,
+                    account: args.account,
+                    enabled: args.enabled,
+                    secret_reference: args.secret_reference,
+                    currency: args.currency,
+                    currency_limit_micros: args.currency_limit_micros,
+                    token_limit: args.token_limit,
+                    request_limit: args.request_limit,
+                    period_start: parse_required_time(&args.period_start)?,
+                    period_end: parse_required_time(&args.period_end)?,
+                    allowed_models: args.allowed_models,
+                    allowed_tools: args.allowed_tools,
+                    allowed_roles: args.allowed_roles,
+                    max_output_tokens: args.max_output_tokens,
+                    max_retries: args.max_retries,
+                    max_concurrent_requests: args.max_concurrent_requests,
+                    reason: args.reason,
+                })?)
+            }
+            ApiCommand::BudgetStatus { project } => {
+                print_json(&garnish.api_budgets(project.as_deref())?)
+            }
+            ApiCommand::Reservations { project } => {
+                print_json(&garnish.api_reservations(project.as_deref())?)
+            }
+            ApiCommand::Spend { project } => print_json(&garnish.api_spend(project.as_deref())?),
+        },
         Command::Schedule { command } => match command {
             ScheduleCommand::Configure {
                 slug,
@@ -1062,6 +1157,10 @@ fn parse_optional_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
             DateTime::from_str(value).with_context(|| format!("invalid RFC3339 timestamp: {value}"))
         })
         .transpose()
+}
+
+fn parse_required_time(value: &str) -> Result<DateTime<Utc>> {
+    DateTime::from_str(value).with_context(|| format!("invalid RFC3339 timestamp: {value}"))
 }
 
 fn parse_route_targets(values: &[String]) -> Result<Vec<RouteTarget>> {
