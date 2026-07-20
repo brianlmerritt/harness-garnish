@@ -66,6 +66,8 @@ fn task(
         uncertainty_percent: 20,
         checkpoint_seconds: 60,
         day_affinity: harness_garnish::domain::DayAffinity::Both,
+        deadline_at: None,
+        required_capabilities: vec![],
         fake_write_path: Some(write_path.into()),
         fake_write_content: Some("done\n".into()),
     }
@@ -121,11 +123,11 @@ fn mvp_vertical_slice_produces_reviewable_machine_evidence() {
             ))
             .unwrap();
         assert_eq!(dependent.status, TaskStatus::Draft);
-        assert!(
-            garnish
-                .route_task(&dependent.id, "fake-secondary", "fake", "test")
-                .is_err()
-        );
+        let dependency_wait = garnish
+            .route_task(&dependent.id, "fake-secondary", "fake", "test")
+            .unwrap();
+        assert!(!dependency_wait.allowed);
+        assert_eq!(dependency_wait.reason_code, "dependency.incomplete");
 
         for surface in ["five_hour", "weekly", "monthly"] {
             garnish
@@ -186,6 +188,7 @@ fn mvp_vertical_slice_produces_reviewable_machine_evidence() {
         .route_task(&dependent_id, "fake-secondary", "fake", "test")
         .unwrap();
     assert!(!declined.allowed);
+    assert_eq!(declined.reason_code, "quota.insufficient");
     assert!(declined.reason.contains("quota_headroom"));
     assert_eq!(declined.next_wake_at, Some(reset));
     assert_eq!(declined.quota.len(), 3);

@@ -3,8 +3,8 @@ use crate::{
         BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
         ClaimedRunStart, ControlState, DayKind, EmergencyStopResult, FailureCategory,
         LocalNotification, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan, RetryState,
-        RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerLeader, SchedulerWake, Task,
-        TaskStatus,
+        RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader,
+        SchedulerWake, Task, TaskStatus,
     },
     schedule,
 };
@@ -21,7 +21,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 pub struct Database {
     path: PathBuf,
@@ -443,6 +443,9 @@ impl Database {
         if current < 6 {
             tx.execute_batch(MIGRATION_6)?;
         }
+        if current < 7 {
+            tx.execute_batch(MIGRATION_7)?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -493,14 +496,18 @@ impl Database {
             slug: slug.to_owned(),
             title: title.to_owned(),
             root_path,
+            scheduler_paused: false,
+            scheduler_pause_reason: None,
             created_at: now,
         })
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, slug, title, root_path, created_at FROM projects ORDER BY slug")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, slug, title, root_path, scheduler_paused,
+                        scheduler_pause_reason, created_at
+                 FROM projects ORDER BY slug",
+        )?;
         let rows = stmt.query_map([], map_project)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
@@ -509,13 +516,57 @@ impl Database {
     pub fn project(&self, id_or_slug: &str) -> Result<Project> {
         self.conn
             .query_row(
-                "SELECT id, slug, title, root_path, created_at
+                "SELECT id, slug, title, root_path, scheduler_paused,
+                        scheduler_pause_reason, created_at
                  FROM projects WHERE id = ?1 OR slug = ?1",
                 [id_or_slug],
                 map_project,
             )
             .optional()?
             .ok_or_else(|| anyhow!("project not found: {id_or_slug}"))
+    }
+
+    pub fn set_project_scheduler_pause(
+        &mut self,
+        id_or_slug: &str,
+        paused: bool,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Project> {
+        if reason.trim().is_empty() {
+            bail!("changing project scheduler pause requires a reason");
+        }
+        let project = self.project(id_or_slug)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE projects
+             SET scheduler_paused = ?2, scheduler_pause_reason = ?3,
+                 updated_at = ?4, version = version + 1
+             WHERE id = ?1",
+            params![
+                project.id,
+                paused,
+                paused.then_some(reason),
+                now.to_rfc3339()
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&project.id),
+            None,
+            None,
+            if paused {
+                "project.scheduler_paused"
+            } else {
+                "project.scheduler_resumed"
+            },
+            "user",
+            &serde_json::json!({"reason": reason}),
+        )?;
+        tx.commit()?;
+        self.project(&project.id)
     }
 
     pub fn link_projects(
@@ -958,6 +1009,75 @@ impl Database {
         route_decision_id: Option<&str>,
         resources: &[(String, String)],
     ) -> Result<SchedulerClaim> {
+        self.claim_task_for_scheduler_inner(
+            instance_id,
+            leader_generation,
+            task_id,
+            expected_task_version,
+            now,
+            ttl,
+            max_active_claims,
+            route_decision_id,
+            resources,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_task_for_scheduler_with_route_limits(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        task_id: &str,
+        expected_task_version: i64,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+        max_active_claims: usize,
+        route_decision_id: Option<&str>,
+        resources: &[(String, String)],
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        max_active_per_adapter: usize,
+        max_active_per_account: usize,
+    ) -> Result<SchedulerClaim> {
+        if max_active_per_adapter == 0 || max_active_per_account == 0 {
+            bail!("adapter and account concurrency limits must be greater than zero");
+        }
+        self.claim_task_for_scheduler_inner(
+            instance_id,
+            leader_generation,
+            task_id,
+            expected_task_version,
+            now,
+            ttl,
+            max_active_claims,
+            route_decision_id,
+            resources,
+            Some((
+                adapter,
+                provider,
+                account,
+                max_active_per_adapter,
+                max_active_per_account,
+            )),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn claim_task_for_scheduler_inner(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        task_id: &str,
+        expected_task_version: i64,
+        now: DateTime<Utc>,
+        ttl: std::time::Duration,
+        max_active_claims: usize,
+        route_decision_id: Option<&str>,
+        resources: &[(String, String)],
+        route_limits: Option<(&str, &str, &str, usize, usize)>,
+    ) -> Result<SchedulerClaim> {
         if max_active_claims == 0 {
             bail!("scheduler concurrency limit must be greater than zero");
         }
@@ -985,7 +1105,10 @@ impl Database {
             |row| row.get(0),
         )?;
         if active >= i64::try_from(max_active_claims)? {
-            bail!("scheduler concurrency limit reached ({max_active_claims})");
+            return Err(SchedulerClaimRejection::GlobalCapacity {
+                limit: max_active_claims,
+            }
+            .into());
         }
         let (status, version, project_id): (String, i64, String) = tx
             .query_row(
@@ -1030,6 +1153,26 @@ impl Database {
             ],
         )?;
         let mut resource_keys = Vec::new();
+        if let Some((adapter, provider, account, adapter_limit, account_limit)) = route_limits {
+            resource_keys.push(acquire_capacity_slot_tx(
+                &tx,
+                &claim_id,
+                "adapter-slot",
+                adapter,
+                adapter_limit,
+                now,
+                expires_at,
+            )?);
+            resource_keys.push(acquire_capacity_slot_tx(
+                &tx,
+                &claim_id,
+                "account-slot",
+                &format!("{provider}:{account}"),
+                account_limit,
+                now,
+                expires_at,
+            )?);
+        }
         let mut all_resources = vec![("project".to_owned(), project_id.clone())];
         all_resources.extend_from_slice(resources);
         for (kind, key) in all_resources {
@@ -1046,7 +1189,10 @@ impl Database {
                     expires_at.to_rfc3339(),
                 ],
             )
-            .with_context(|| format!("resource lock is unavailable: {kind}:{key}"))?;
+            .map_err(|_| SchedulerClaimRejection::ResourceLocked {
+                kind: kind.clone(),
+                key: key.clone(),
+            })?;
             resource_keys.push(format!("{kind}:{key}"));
         }
         transition_task_tx(
@@ -1364,10 +1510,11 @@ impl Database {
                 id, project_id, title, goal, rationale, scope_json, non_scope_json,
                 acceptance_json, verification_argv_json, priority, risk_class,
                 estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
-                fake_write_path, fake_write_content, status, version, created_at, updated_at
+                deadline_at, required_capabilities_json, fake_write_path, fake_write_content,
+                status, version, created_at, updated_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, 'draft', 1, ?18, ?18
+                ?15, ?16, ?17, ?18, ?19, 'draft', 1, ?20, ?20
              )",
             params![
                 id,
@@ -1385,6 +1532,8 @@ impl Database {
                 new.uncertainty_percent,
                 checkpoint_seconds,
                 new.day_affinity.to_string(),
+                new.deadline_at.map(|value| value.to_rfc3339()),
+                to_json(&new.required_capabilities)?,
                 new.fake_write_path,
                 new.fake_write_content,
                 now.to_rfc3339(),
@@ -1547,14 +1696,18 @@ impl Database {
         let (sql, argument) = if let Some(project_id) = project_id {
             (
                 format!(
-                    "{} WHERE project_id = ?1 ORDER BY priority DESC, created_at",
+                    "{} WHERE project_id = ?1
+                        ORDER BY priority DESC, deadline_at IS NULL, deadline_at, created_at, id",
                     TASK_SELECT
                 ),
                 Some(project_id),
             )
         } else {
             (
-                format!("{} ORDER BY priority DESC, created_at", TASK_SELECT),
+                format!(
+                    "{} ORDER BY priority DESC, deadline_at IS NULL, deadline_at, created_at, id",
+                    TASK_SELECT
+                ),
                 None,
             )
         };
@@ -1746,14 +1899,15 @@ impl Database {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO route_decisions(
-                id, task_id, selected_adapter, allowed, reason,
+                id, task_id, selected_adapter, allowed, reason_code, reason,
                 required_headroom_percent, quota_json, schedule_json, policy_hash, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 decision.id,
                 decision.task_id,
                 decision.selected_adapter,
                 decision.allowed,
+                decision.reason_code,
                 decision.reason,
                 decision.required_headroom_percent,
                 to_json(&decision.quota)?,
@@ -2659,6 +2813,52 @@ fn assert_scheduler_leader_tx(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn acquire_capacity_slot_tx(
+    tx: &Transaction<'_>,
+    claim_id: &str,
+    resource_kind: &str,
+    owner_key: &str,
+    limit: usize,
+    now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<String> {
+    for slot in 0..limit {
+        let resource_key = format!("{owner_key}:{slot}");
+        let occupied: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM resource_locks
+                WHERE resource_kind = ?1 AND resource_key = ?2 AND released_at IS NULL
+             )",
+            params![resource_kind, resource_key],
+            |row| row.get(0),
+        )?;
+        if occupied {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO resource_locks(
+                id, resource_kind, resource_key, claim_id, mode, acquired_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, 'exclusive', ?5, ?6)",
+            params![
+                Ulid::new().to_string(),
+                resource_kind,
+                resource_key,
+                claim_id,
+                now.to_rfc3339(),
+                expires_at.to_rfc3339(),
+            ],
+        )?;
+        return Ok(format!("{resource_kind}:{resource_key}"));
+    }
+    let rejection = match resource_kind {
+        "adapter-slot" => SchedulerClaimRejection::AdapterCapacity { limit },
+        "account-slot" => SchedulerClaimRejection::AccountCapacity { limit },
+        _ => SchedulerClaimRejection::GlobalCapacity { limit },
+    };
+    Err(rejection.into())
+}
+
 fn expire_scheduler_claims_tx(tx: &Transaction<'_>, now: DateTime<Utc>) -> Result<Vec<String>> {
     let mut stmt = tx.prepare(
         "SELECT id, task_id FROM scheduler_claims
@@ -2796,7 +2996,9 @@ fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         slug: row.get(1)?,
         title: row.get(2)?,
         root_path: row.get(3)?,
-        created_at: parse_time(row.get(4)?)?,
+        scheduler_paused: row.get(4)?,
+        scheduler_pause_reason: row.get(5)?,
+        created_at: parse_time(row.get(6)?)?,
     })
 }
 
@@ -2804,18 +3006,21 @@ const TASK_SELECT: &str = "SELECT
     id, project_id, title, goal, rationale, scope_json, non_scope_json,
     acceptance_json, verification_argv_json, priority, risk_class,
     estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
-    fake_write_path, fake_write_content, status, version, created_at, updated_at
+    deadline_at, required_capabilities_json, fake_write_path, fake_write_content,
+    status, version, created_at, updated_at
     FROM tasks";
 const TASK_SELECT_BY_ID: &str = "SELECT
     id, project_id, title, goal, rationale, scope_json, non_scope_json,
     acceptance_json, verification_argv_json, priority, risk_class,
     estimated_seconds, uncertainty_percent, checkpoint_seconds, day_affinity,
-    fake_write_path, fake_write_content, status, version, created_at, updated_at
+    deadline_at, required_capabilities_json, fake_write_path, fake_write_content,
+    status, version, created_at, updated_at
     FROM tasks WHERE id = ?1";
 
 fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let affinity: String = row.get(14)?;
-    let status: String = row.get(17)?;
+    let deadline_at: Option<String> = row.get(15)?;
+    let status: String = row.get(19)?;
     Ok(Task {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -2838,8 +3043,10 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
                 Box::new(err),
             )
         })?,
-        fake_write_path: row.get(15)?,
-        fake_write_content: row.get(16)?,
+        deadline_at: deadline_at.map(parse_time).transpose()?,
+        required_capabilities: parse_json(row.get(16)?)?,
+        fake_write_path: row.get(17)?,
+        fake_write_content: row.get(18)?,
         status: TaskStatus::from_str(&status).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 status.len(),
@@ -2847,9 +3054,9 @@ fn map_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
                 Box::new(err),
             )
         })?,
-        version: row.get(18)?,
-        created_at: parse_time(row.get(19)?)?,
-        updated_at: parse_time(row.get(20)?)?,
+        version: row.get(20)?,
+        created_at: parse_time(row.get(21)?)?,
+        updated_at: parse_time(row.get(22)?)?,
     })
 }
 
@@ -3550,6 +3757,23 @@ CREATE INDEX idx_local_notifications_pending
     ON local_notifications(created_at) WHERE acknowledged_at IS NULL;
 "#;
 
+const MIGRATION_7: &str = r#"
+ALTER TABLE projects
+    ADD COLUMN scheduler_paused INTEGER NOT NULL DEFAULT 0
+    CHECK(scheduler_paused IN (0, 1));
+ALTER TABLE projects ADD COLUMN scheduler_pause_reason TEXT;
+
+ALTER TABLE tasks ADD COLUMN deadline_at TEXT;
+ALTER TABLE tasks
+    ADD COLUMN required_capabilities_json TEXT NOT NULL DEFAULT '[]';
+
+ALTER TABLE route_decisions
+    ADD COLUMN reason_code TEXT NOT NULL DEFAULT 'legacy.unclassified';
+
+CREATE INDEX idx_tasks_scheduler_order
+    ON tasks(status, priority DESC, deadline_at, created_at, id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3582,6 +3806,8 @@ mod tests {
             uncertainty_percent: 10,
             checkpoint_seconds: 60,
             day_affinity: crate::domain::DayAffinity::Both,
+            deadline_at: None,
+            required_capabilities: vec![],
             fake_write_path: None,
             fake_write_content: None,
         }
@@ -3652,6 +3878,8 @@ mod tests {
                 uncertainty_percent: 10,
                 checkpoint_seconds: 60,
                 day_affinity: crate::domain::DayAffinity::Both,
+                deadline_at: None,
+                required_capabilities: vec![],
                 fake_write_path: None,
                 fake_write_content: None,
             })
@@ -3725,6 +3953,7 @@ mod tests {
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
             allowed: true,
+            reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
             required_headroom_percent: 21.0,
             quota: vec![],
@@ -3797,7 +4026,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -3998,6 +4227,162 @@ mod tests {
     }
 
     #[test]
+    fn adapter_and_account_capacity_slots_are_atomic_and_recoverable() {
+        let (dir, mut db) = database();
+        let mut tasks = Vec::new();
+        for index in 0..3 {
+            let root = dir.path().join(format!("project-{index}"));
+            fs::create_dir(&root).unwrap();
+            let project = db
+                .add_project(
+                    &format!("project-{index}"),
+                    &format!("Project {index}"),
+                    &root,
+                )
+                .unwrap();
+            tasks.push(
+                db.add_task(&new_task(&project.id, &format!("task-{index}"), vec![]))
+                    .unwrap(),
+            );
+        }
+        let now = Utc::now();
+        db.register_scheduler_instance("scheduler", "host", 1, now)
+            .unwrap();
+        let leader = db
+            .acquire_scheduler_leader("scheduler", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let first = db
+            .claim_task_for_scheduler_with_route_limits(
+                "scheduler",
+                leader.generation,
+                &tasks[0].id,
+                tasks[0].version,
+                now,
+                std::time::Duration::from_secs(2),
+                3,
+                None,
+                &[],
+                "fake",
+                "fake",
+                "primary",
+                1,
+                1,
+            )
+            .unwrap();
+        let adapter_error = db
+            .claim_task_for_scheduler_with_route_limits(
+                "scheduler",
+                leader.generation,
+                &tasks[1].id,
+                tasks[1].version,
+                now,
+                std::time::Duration::from_secs(2),
+                3,
+                None,
+                &[],
+                "fake",
+                "fake",
+                "secondary",
+                1,
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            adapter_error
+                .downcast_ref::<SchedulerClaimRejection>()
+                .unwrap()
+                .reason_code(),
+            "scheduler.adapter_capacity"
+        );
+        assert!(
+            adapter_error
+                .to_string()
+                .contains("adapter concurrency limit")
+        );
+        let account_error = db
+            .claim_task_for_scheduler_with_route_limits(
+                "scheduler",
+                leader.generation,
+                &tasks[1].id,
+                tasks[1].version,
+                now,
+                std::time::Duration::from_secs(2),
+                3,
+                None,
+                &[],
+                "fake-secondary",
+                "fake",
+                "primary",
+                1,
+                1,
+            )
+            .unwrap_err();
+        assert_eq!(
+            account_error
+                .downcast_ref::<SchedulerClaimRejection>()
+                .unwrap()
+                .reason_code(),
+            "scheduler.account_capacity"
+        );
+        assert!(
+            account_error
+                .to_string()
+                .contains("account concurrency limit")
+        );
+
+        let active_slots: (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM resource_locks
+                     WHERE resource_kind = 'adapter-slot' AND released_at IS NULL),
+                    (SELECT COUNT(*) FROM resource_locks
+                     WHERE resource_kind = 'account-slot' AND released_at IS NULL)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(active_slots, (1, 1));
+
+        let recovered_at = now + chrono::Duration::seconds(3);
+        assert_eq!(
+            db.recover_expired_scheduler_claims(recovered_at).unwrap(),
+            vec![tasks[0].id.clone()]
+        );
+        assert!(
+            db.claim_task_for_scheduler_with_route_limits(
+                "scheduler",
+                leader.generation,
+                &tasks[1].id,
+                tasks[1].version,
+                recovered_at,
+                std::time::Duration::from_secs(2),
+                3,
+                None,
+                &[],
+                "fake",
+                "fake",
+                "primary",
+                1,
+                1,
+            )
+            .is_ok()
+        );
+        assert!(
+            first
+                .resource_keys
+                .iter()
+                .any(|key| key.starts_with("adapter-slot:"))
+        );
+        assert!(
+            first
+                .resource_keys
+                .iter()
+                .any(|key| key.starts_with("account-slot:"))
+        );
+    }
+
+    #[test]
     fn claimed_run_start_is_atomic_single_use_and_releases_project_lock() {
         let (dir, mut db) = database();
         let root = dir.path().join("project");
@@ -4015,6 +4400,7 @@ mod tests {
             task_id: first.id.clone(),
             selected_adapter: Some("fake".into()),
             allowed: true,
+            reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
             required_headroom_percent: 21.0,
             quota: vec![],
@@ -4132,6 +4518,7 @@ mod tests {
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
             allowed: true,
+            reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
             required_headroom_percent: 21.0,
             quota: vec![],
@@ -4201,6 +4588,189 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 1, 0));
+    }
+
+    #[test]
+    fn crash_reopen_matrix_preserves_single_use_actions_at_material_boundaries() {
+        let (dir, mut db) = database();
+        let database_path = db.path().to_path_buf();
+        let mut tasks = Vec::new();
+        for index in 0..4 {
+            let root = dir.path().join(format!("crash-project-{index}"));
+            fs::create_dir(&root).unwrap();
+            let project = db
+                .add_project(
+                    &format!("crash-project-{index}"),
+                    &format!("Crash project {index}"),
+                    &root,
+                )
+                .unwrap();
+            tasks.push(
+                db.add_task(&new_task(&project.id, &format!("crash-{index}"), vec![]))
+                    .unwrap(),
+            );
+        }
+        let now = Utc::now();
+        db.register_scheduler_instance("scheduler", "host", 1, now)
+            .unwrap();
+        let leader = db
+            .acquire_scheduler_leader("scheduler", now, std::time::Duration::from_secs(60))
+            .unwrap();
+
+        // Boundary 0: task is durable and ready, but no claim was committed.
+        let untouched = tasks[0].clone();
+
+        // Boundary 1: a claim committed, but its single-use action was not consumed.
+        let unconsumed_claim = db
+            .claim_task_for_scheduler(
+                "scheduler",
+                leader.generation,
+                &tasks[1].id,
+                tasks[1].version,
+                now,
+                std::time::Duration::from_secs(1),
+                4,
+                None,
+                &[],
+            )
+            .unwrap();
+
+        let mut started = Vec::new();
+        for (index, run_id) in [(2, "run-consumed"), (3, "run-completed")] {
+            let decision = RouteDecision {
+                id: Ulid::new().to_string(),
+                task_id: tasks[index].id.clone(),
+                selected_adapter: Some("fake".into()),
+                allowed: true,
+                reason_code: "fixture.allowed".into(),
+                reason: "fixture".into(),
+                required_headroom_percent: 0.0,
+                quota: vec![],
+                candidates: vec![],
+                next_wake_at: None,
+                schedule: None,
+                policy_hash: "fixture".into(),
+                created_at: now,
+            };
+            db.record_route(&decision).unwrap();
+            let claim = db
+                .claim_task_for_scheduler(
+                    "scheduler",
+                    leader.generation,
+                    &tasks[index].id,
+                    tasks[index].version,
+                    now,
+                    std::time::Duration::from_secs(1),
+                    4,
+                    Some(&decision.id),
+                    &[],
+                )
+                .unwrap();
+            let run = db
+                .begin_claimed_run(
+                    &claim.id,
+                    "scheduler",
+                    leader.generation,
+                    run_id,
+                    "fake",
+                    "/fixture/worktree",
+                    "garnish/crash-fixture",
+                    "0123456789abcdef",
+                    now,
+                    std::time::Duration::from_secs(1),
+                )
+                .unwrap();
+            started.push((claim, run));
+        }
+
+        // Boundary 3: the run and its cleanup committed before the process disappeared.
+        db.transition_task(
+            &tasks[3].id,
+            TaskStatus::Running,
+            TaskStatus::Verifying,
+            "fixture",
+        )
+        .unwrap();
+        db.finish_run("run-completed", "review", None, 0).unwrap();
+        db.transition_task(
+            &tasks[3].id,
+            TaskStatus::Verifying,
+            TaskStatus::Review,
+            "fixture",
+        )
+        .unwrap();
+        drop(db);
+
+        let recovery_at = now + chrono::Duration::seconds(3);
+        let mut reopened = Database::open(&database_path).unwrap();
+        assert_eq!(
+            reopened
+                .recover_expired_scheduler_claims(recovery_at)
+                .unwrap(),
+            vec![tasks[1].id.clone()]
+        );
+        assert_eq!(
+            reopened.recover_expired_leases(recovery_at).unwrap(),
+            vec![tasks[2].id.clone()]
+        );
+        assert_eq!(
+            reopened.task(&untouched.id).unwrap().status,
+            TaskStatus::Ready
+        );
+        assert_eq!(
+            reopened.task(&tasks[1].id).unwrap().status,
+            TaskStatus::Ready
+        );
+        assert_eq!(
+            reopened.task(&tasks[2].id).unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            reopened.task(&tasks[3].id).unwrap().status,
+            TaskStatus::Review
+        );
+
+        assert!(
+            reopened
+                .recover_expired_scheduler_claims(recovery_at)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .recover_expired_leases(recovery_at)
+                .unwrap()
+                .is_empty()
+        );
+        let counts: (i64, i64, i64) = reopened
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM runs WHERE task_id IN (?1, ?2)),
+                    (SELECT COUNT(*) FROM scheduler_claims
+                     WHERE action_key IN (?3, ?4) AND status = 'consumed'),
+                    (SELECT COUNT(*) FROM resource_locks WHERE released_at IS NULL)",
+                params![
+                    tasks[2].id,
+                    tasks[3].id,
+                    started[0].1.action_key,
+                    started[1].1.action_key,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (2, 2, 0));
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM scheduler_claims WHERE id = ?1 AND action_key IS NULL",
+                    [&unconsumed_claim.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -4339,6 +4909,7 @@ mod tests {
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
             allowed: true,
+            reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
             required_headroom_percent: 0.0,
             candidates: vec![],
@@ -4445,6 +5016,7 @@ mod tests {
             task_id: running.id.clone(),
             selected_adapter: Some("fake".into()),
             allowed: true,
+            reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
             required_headroom_percent: 0.0,
             candidates: vec![],
@@ -4586,7 +5158,7 @@ mod tests {
         let destination = dir.path().join("backups/state.db");
         let backup = db.backup_to(&destination, Utc::now()).unwrap();
         assert_eq!(backup.integrity, "ok");
-        assert_eq!(backup.schema_version, 6);
+        assert_eq!(backup.schema_version, 7);
         assert_eq!(backup.sha256.len(), 64);
         assert_eq!(backup.size_bytes, fs::metadata(&destination).unwrap().len());
         assert!(db.backup_to(&destination, Utc::now()).is_err());

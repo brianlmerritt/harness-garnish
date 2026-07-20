@@ -72,11 +72,19 @@ The scheduler arbitration commands are deliberately explicit while the daemon is
 ```console
 garnish --data-dir .garnish-state scheduler register --instance local-1 --hostname my-mac
 garnish --data-dir .garnish-state scheduler acquire-leader --instance local-1
-garnish --data-dir .garnish-state scheduler tick --instance local-1 --generation 1 --provider fake --account test --max-active 2
+garnish --data-dir .garnish-state scheduler tick --instance local-1 --generation 1 --provider fake --account test --max-active 2 --max-active-per-adapter 1 --max-active-per-account 1
 garnish --data-dir .garnish-state scheduler wakes
 ```
 
-Leadership is fenced by a monotonically increasing generation. Claims, concurrency checks, and project locks commit atomically; a stale leader cannot claim work.
+Leadership is fenced by a monotonically increasing generation. Claims, global/adapter/account concurrency checks, and project locks commit atomically; a stale leader cannot claim work. Scheduler exclusions are persisted with stable machine reason codes.
+
+Projects can be paused independently, and task admission can include an RFC 3339 deadline and repeatable adapter capability requirements:
+
+```console
+garnish --data-dir .garnish-state project pause --project example --reason "project maintenance"
+garnish --data-dir .garnish-state project resume --project example --reason "maintenance complete"
+garnish --data-dir .garnish-state task add --project example --title "Timed work" --goal "Create result.txt" --accept "result.txt contains done" --verify-argv '["grep","-q","done","result.txt"]' --scope result.txt --non-scope "remote Git" --deadline-at 2026-07-21T17:00:00Z --requires-capability structured_output --fake-write-path result.txt --fake-write-content done
+```
 
 The continuous daemon owns and renews both the leader lease and its task claims. `TERM` or `INT` requests a bounded graceful stop that releases its claims and returns not-yet-started tasks to `ready`:
 

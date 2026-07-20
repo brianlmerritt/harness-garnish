@@ -8,9 +8,9 @@ use crate::{
         BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
         ControlState, DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewTask,
         Project, ProjectLink, QuotaSurface, RetryPlan, RetryState, RouteCandidate, RouteDecision,
-        RunCheckpoint, RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerDaemonConfig,
-        SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake,
-        Task, TaskStatus,
+        RunCheckpoint, RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerClaimRejection,
+        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
+        SchedulerTick, SchedulerWake, Task, TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -75,7 +75,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 6,
+            schema_version: 7,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -102,6 +102,16 @@ impl Garnish {
 
     pub fn projects(&self) -> Result<Vec<Project>> {
         self.db.list_projects()
+    }
+
+    pub fn set_project_scheduler_pause(
+        &mut self,
+        project: &str,
+        paused: bool,
+        reason: &str,
+    ) -> Result<Project> {
+        self.db
+            .set_project_scheduler_pause(project, paused, reason, Utc::now())
     }
 
     pub fn link_projects(
@@ -518,15 +528,15 @@ impl Garnish {
         claim_circuit_probe: bool,
     ) -> Result<RouteDecision> {
         let task = self.db.task(task_id)?;
-        if task.status != TaskStatus::Ready {
+        if !matches!(task.status, TaskStatus::Ready | TaskStatus::Draft) {
             bail!(
-                "task must be ready to route; current status is {}",
+                "task must be ready or waiting on dependencies to route; current status is {}",
                 task.status
             );
         }
-        if !self.db.dependencies_satisfied(task_id)? {
-            bail!("task dependencies are not complete");
-        }
+        let dependencies_allowed = self.db.dependencies_satisfied(task_id)?;
+        let project = self.db.project(&task.project_id)?;
+        let project_allowed = !project.scheduler_paused;
         let control = self.db.control_state()?;
         let operations_allowed = !control.pause_new_work && !control.emergency_stop;
         let schedule = self.evaluate_task_schedule_at(task_id, now)?;
@@ -534,6 +544,9 @@ impl Garnish {
         let retry_allowed = retry
             .retry_not_before
             .is_none_or(|retry_at| retry_at <= now);
+        let deadline_allowed = task.deadline_at.is_none_or(|deadline| now <= deadline);
+        let (capability_allowed, capability_reason) =
+            evaluate_adapter_capabilities(adapter, &task.required_capabilities);
         let (mut circuit_allowed, mut circuit_wake, mut circuit_reason) = self
             .db
             .adapter_circuit_gate(adapter, provider, account, now, false)?;
@@ -548,9 +561,10 @@ impl Garnish {
             .iter()
             .map(|surface| surface.reserve_percent + forecast)
             .fold(self.policy.reserve_percent + forecast, f64::max);
-        let (quota_allowed, quota_reason) = if quota.is_empty() {
+        let (quota_allowed, quota_reason_code, quota_reason) = if quota.is_empty() {
             (
                 self.policy.unknown_quota_unattended,
+                "quota.unavailable",
                 "no quota surfaces are available for the selected account".to_owned(),
             )
         } else if let Some(surface) = quota.iter().find(|surface| {
@@ -559,51 +573,71 @@ impl Garnish {
                     .effective_remaining_percent
                     .is_some_and(|remaining| remaining < surface.reserve_percent + forecast)
         }) {
-            let reason = match surface.effective_remaining_percent {
-                Some(remaining) => format!(
-                    "quota_headroom: {} has {:.1}% remaining but {:.1}% is required",
-                    surface.surface,
-                    remaining,
-                    surface.reserve_percent + forecast
+            let (reason_code, reason) = match surface.effective_remaining_percent {
+                Some(remaining) => (
+                    "quota.insufficient",
+                    format!(
+                        "quota_headroom: {} has {:.1}% remaining but {:.1}% is required",
+                        surface.surface,
+                        remaining,
+                        surface.reserve_percent + forecast
+                    ),
                 ),
-                None => format!(
-                    "quota_unknown: {} ({})",
-                    surface.surface,
-                    surface.unknown_reason.as_deref().unwrap_or("unspecified")
+                None => (
+                    "quota.unknown",
+                    format!(
+                        "quota_unknown: {} ({})",
+                        surface.surface,
+                        surface.unknown_reason.as_deref().unwrap_or("unspecified")
+                    ),
                 ),
             };
-            (false, reason)
+            (false, reason_code, reason)
         } else {
             (
                 true,
+                "route.allowed",
                 "all quota surfaces satisfy reserve plus forecast".to_owned(),
             )
         };
-        let (policy_allowed, policy_reason) = if !self.policy.allow_branch_changes {
+        let (policy_allowed, policy_reason_code, policy_reason) = if !self
+            .policy
+            .allow_branch_changes
+        {
             (
                 false,
+                "policy.git_branch_denied",
                 "policy.git_branch_denied: project policy denies automated branch and worktree creation"
                     .to_owned(),
             )
         } else {
             match self.policy.authorize(task.risk_class, true) {
-                PolicyDecision::Allow => (true, "policy allows the task".to_owned()),
+                PolicyDecision::Allow => {
+                    (true, "route.allowed", "policy allows the task".to_owned())
+                }
                 PolicyDecision::RequireApproval => (
                     false,
+                    "policy.approval_required",
                     format!(
                         "policy.approval_required: task risk class {} requires approval",
                         task.risk_class
                     ),
                 ),
-                PolicyDecision::Deny(reason) => (false, format!("policy.denied: {reason}")),
+                PolicyDecision::Deny(reason) => {
+                    (false, "policy.denied", format!("policy.denied: {reason}"))
+                }
             }
         };
         if claim_circuit_probe
             && circuit_allowed
             && circuit_reason == "circuit.probe_available"
             && operations_allowed
+            && project_allowed
+            && dependencies_allowed
             && schedule.eligible
+            && deadline_allowed
             && retry_allowed
+            && capability_allowed
             && policy_allowed
             && quota_allowed
         {
@@ -613,36 +647,83 @@ impl Garnish {
         }
         let allowed = schedule.eligible
             && operations_allowed
+            && project_allowed
+            && dependencies_allowed
+            && deadline_allowed
             && retry_allowed
             && circuit_allowed
+            && capability_allowed
             && policy_allowed
             && quota_allowed;
-        let reason = if control.emergency_stop {
-            format!(
-                "operations.emergency_stop: {}",
-                control.reason.as_deref().unwrap_or("emergency stop active")
+        let (reason_code, reason) = if control.emergency_stop {
+            (
+                "operations.emergency_stop".to_owned(),
+                format!(
+                    "operations.emergency_stop: {}",
+                    control.reason.as_deref().unwrap_or("emergency stop active")
+                ),
             )
         } else if control.pause_new_work {
-            format!(
-                "operations.paused: {}",
-                control.reason.as_deref().unwrap_or("new work is paused")
+            (
+                "operations.paused".to_owned(),
+                format!(
+                    "operations.paused: {}",
+                    control.reason.as_deref().unwrap_or("new work is paused")
+                ),
+            )
+        } else if !project_allowed {
+            (
+                "project.paused".to_owned(),
+                format!(
+                    "project.paused: {}",
+                    project
+                        .scheduler_pause_reason
+                        .as_deref()
+                        .unwrap_or("project scheduling is paused")
+                ),
+            )
+        } else if !dependencies_allowed {
+            (
+                "dependency.incomplete".to_owned(),
+                "dependency.incomplete: one or more prerequisite tasks are not completed".into(),
             )
         } else if !schedule.eligible {
-            format!(
-                "{}: task affinity {} does not match {} day {}",
-                schedule.reason_code, schedule.affinity, schedule.day_kind, schedule.local_date
+            (
+                schedule.reason_code.clone(),
+                format!(
+                    "{}: task affinity {} does not match {} day {}",
+                    schedule.reason_code, schedule.affinity, schedule.day_kind, schedule.local_date
+                ),
+            )
+        } else if !deadline_allowed {
+            (
+                "deadline.expired".to_owned(),
+                format!(
+                    "deadline.expired: task deadline {} has passed",
+                    task.deadline_at.expect("checked as present")
+                ),
             )
         } else if !retry_allowed {
-            format!(
-                "retry.backoff: retry is deferred until {}",
-                retry.retry_not_before.expect("checked as present")
+            (
+                "retry.backoff".to_owned(),
+                format!(
+                    "retry.backoff: retry is deferred until {}",
+                    retry.retry_not_before.expect("checked as present")
+                ),
             )
         } else if !circuit_allowed {
-            format!("{circuit_reason}: adapter is temporarily unavailable")
+            (
+                circuit_reason.clone(),
+                format!("{circuit_reason}: adapter is temporarily unavailable"),
+            )
+        } else if !capability_allowed {
+            ("capability.missing".to_owned(), capability_reason)
         } else if !policy_allowed {
-            policy_reason
+            (policy_reason_code.to_owned(), policy_reason)
+        } else if !quota_allowed {
+            (quota_reason_code.to_owned(), quota_reason)
         } else {
-            quota_reason
+            ("route.allowed".to_owned(), quota_reason)
         };
         let selected_adapter = allowed.then(|| adapter.to_owned());
         let quota_wake = (!quota_allowed)
@@ -665,6 +746,7 @@ impl Garnish {
             task_id: task.id,
             selected_adapter,
             allowed,
+            reason_code,
             reason: reason.clone(),
             required_headroom_percent: required_headroom,
             candidates: vec![RouteCandidate {
@@ -697,7 +779,7 @@ impl Garnish {
             .db
             .list_tasks(None)?
             .into_iter()
-            .filter(|task| task.status == TaskStatus::Ready)
+            .filter(|task| matches!(task.status, TaskStatus::Ready | TaskStatus::Draft))
             .collect::<Vec<_>>();
         let mut decisions = Vec::with_capacity(ready.len());
         for task in ready {
@@ -775,8 +857,11 @@ impl Garnish {
         N: FnMut() -> DateTime<Utc>,
         S: FnMut(std::time::Duration),
     {
-        if config.max_active_claims == 0 {
-            bail!("scheduler concurrency limit must be greater than zero");
+        if config.max_active_claims == 0
+            || config.max_active_per_adapter == 0
+            || config.max_active_per_account == 0
+        {
+            bail!("scheduler global, adapter, and account limits must be greater than zero");
         }
         if config.poll_interval.is_zero()
             || config.leader_ttl.is_zero()
@@ -831,7 +916,7 @@ impl Garnish {
                 )?;
                 scheduler_claims_recovered += self.recover_scheduler(tick_at)?.len();
                 run_leases_recovered += self.recover_at(tick_at)?.len();
-                let tick = self.scheduler_tick_at(
+                let tick = self.scheduler_tick_with_limits_at(
                     &config.instance_id,
                     leader.generation,
                     &config.adapter,
@@ -839,6 +924,8 @@ impl Garnish {
                     &config.account,
                     tick_at,
                     config.max_active_claims,
+                    config.max_active_per_adapter,
+                    config.max_active_per_account,
                     config.claim_ttl,
                 )?;
                 ticks += 1;
@@ -917,40 +1004,49 @@ impl Garnish {
         max_active_claims: usize,
         claim_ttl: std::time::Duration,
     ) -> Result<SchedulerTick> {
+        self.scheduler_tick_with_limits_at(
+            instance_id,
+            leader_generation,
+            adapter,
+            provider,
+            account,
+            now,
+            max_active_claims,
+            max_active_claims,
+            max_active_claims,
+            claim_ttl,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scheduler_tick_with_limits_at(
+        &mut self,
+        instance_id: &str,
+        leader_generation: i64,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+        max_active_claims: usize,
+        max_active_per_adapter: usize,
+        max_active_per_account: usize,
+        claim_ttl: std::time::Duration,
+    ) -> Result<SchedulerTick> {
         self.db.recover_expired_scheduler_claims(now)?;
         let ready = self
             .db
             .list_tasks(None)?
             .into_iter()
-            .filter(|task| task.status == TaskStatus::Ready)
+            .filter(|task| matches!(task.status, TaskStatus::Ready | TaskStatus::Draft))
             .collect::<Vec<_>>();
         let mut decisions = Vec::with_capacity(ready.len());
         let mut claims: Vec<SchedulerClaim> = Vec::new();
         for task in ready {
             let decision = self.route_task_at(&task.id, adapter, provider, account, now)?;
             if !decision.allowed {
-                let reason_code = decision
-                    .schedule
-                    .as_ref()
-                    .filter(|evaluation| !evaluation.eligible)
-                    .map(|evaluation| evaluation.reason_code.as_str())
-                    .unwrap_or_else(|| {
-                        decision
-                            .reason
-                            .split_once(':')
-                            .map(|(code, _)| code)
-                            .filter(|code| {
-                                code.starts_with("policy.")
-                                    || code.starts_with("operations.")
-                                    || code.starts_with("retry.")
-                                    || code.starts_with("circuit.")
-                                    || code.starts_with("quota_")
-                            })
-                            .unwrap_or("quota.unavailable")
-                    });
                 self.db.record_scheduler_wake(
                     &task.id,
-                    reason_code,
+                    &decision.reason_code,
                     decision.next_wake_at,
                     &serde_json::json!({
                         "route_decision_id": &decision.id,
@@ -961,7 +1057,7 @@ impl Garnish {
                 decisions.push(decision);
                 continue;
             }
-            match self.db.claim_task_for_scheduler(
+            match self.db.claim_task_for_scheduler_with_route_limits(
                 instance_id,
                 leader_generation,
                 &task.id,
@@ -971,17 +1067,20 @@ impl Garnish {
                 max_active_claims,
                 Some(&decision.id),
                 &[],
+                adapter,
+                provider,
+                account,
+                max_active_per_adapter,
+                max_active_per_account,
             ) {
                 Ok(claim) => claims.push(claim),
                 Err(error) => {
                     let message = error.to_string();
-                    let reason_code = if message.contains("concurrency limit") {
-                        "scheduler.capacity"
-                    } else if message.contains("resource lock") {
-                        "scheduler.resource_locked"
-                    } else {
-                        "scheduler.claim_conflict"
-                    };
+                    let reason_code = error
+                        .downcast_ref::<SchedulerClaimRejection>()
+                        .map_or("scheduler.claim_conflict", |rejection| {
+                            rejection.reason_code()
+                        });
                     self.db.record_scheduler_wake(
                         &task.id,
                         reason_code,
@@ -1462,6 +1561,55 @@ fn forecast_percent(task: &Task) -> f64 {
     (baseline * (1.0 + task.uncertainty_percent as f64 / 100.0)).clamp(1.0, 50.0)
 }
 
+fn evaluate_adapter_capabilities(adapter: &str, required: &[String]) -> (bool, String) {
+    if required.is_empty() {
+        return (true, "no task-specific capabilities are required".into());
+    }
+    let kind = if adapter.starts_with("fake") {
+        Some(AgentKind::Fake)
+    } else {
+        match adapter {
+            "codex" => Some(AgentKind::Codex),
+            "claude" => Some(AgentKind::Claude),
+            "antigravity" => Some(AgentKind::Antigravity),
+            _ => None,
+        }
+    };
+    let Some(kind) = kind else {
+        return (
+            false,
+            format!("capability.missing: adapter {adapter} is unknown"),
+        );
+    };
+    let probe = kind.probe();
+    if probe.health != "healthy" {
+        return (
+            false,
+            format!(
+                "capability.missing: adapter {adapter} is {} ({})",
+                probe.health,
+                probe.failure.as_deref().unwrap_or("no probe detail")
+            ),
+        );
+    }
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|required| !probe.capabilities.contains(required))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        (true, "adapter satisfies every required capability".into())
+    } else {
+        (
+            false,
+            format!(
+                "capability.missing: adapter {adapter} lacks {}",
+                missing.join(",")
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1529,6 +1677,8 @@ mod tests {
             uncertainty_percent: 20,
             checkpoint_seconds: 60,
             day_affinity: crate::domain::DayAffinity::Both,
+            deadline_at: None,
+            required_capabilities: vec![],
             fake_write_path: Some("result.txt".into()),
             fake_write_content: Some("done\n".into()),
         }
@@ -1540,6 +1690,7 @@ mod tests {
             task_id: task.id.clone(),
             selected_adapter: Some("fake".into()),
             allowed: true,
+            reason_code: "fixture.allowed".into(),
             reason: "fixture".into(),
             required_headroom_percent: 0.0,
             candidates: vec![],
@@ -1611,6 +1762,7 @@ mod tests {
             .route_task(&task.id, "fake", "fake", "test")
             .unwrap();
         assert!(!declined.allowed);
+        assert_eq!(declined.reason_code, "quota.insufficient");
         assert!(declined.reason.contains("quota_headroom"));
         garnish
             .override_quota("fake", "test", "five_hour", 90.0, "test override", None)
@@ -1646,6 +1798,7 @@ mod tests {
             .route_task(&task.id, "fake", "fake", "missing")
             .unwrap();
         assert!(!decision.allowed);
+        assert_eq!(decision.reason_code, "quota.unavailable");
     }
 
     #[test]
@@ -1674,6 +1827,7 @@ mod tests {
             .unwrap();
         assert!(!decision.allowed);
         assert_eq!(decision.selected_adapter, None);
+        assert_eq!(decision.reason_code, "operations.paused");
         assert!(decision.reason.starts_with("operations.paused:"));
         garnish.resume_operations("maintenance complete").unwrap();
         assert!(
@@ -2025,8 +2179,224 @@ mod tests {
             .route_task_at(&task.id, "fake", "fake", "test", now)
             .unwrap();
         assert!(!decision.allowed);
+        assert_eq!(decision.reason_code, "retry.backoff");
         assert!(decision.reason.starts_with("retry.backoff"));
         assert_eq!(decision.next_wake_at, plan.retry_at);
+    }
+
+    #[test]
+    fn scheduler_records_dependency_project_deadline_and_capability_exclusions() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+
+        let dependency_root = dir.path().join("dependency");
+        let paused_root = dir.path().join("paused");
+        let deadline_root = dir.path().join("deadline");
+        let capability_root = dir.path().join("capability");
+        for root in [
+            &dependency_root,
+            &paused_root,
+            &deadline_root,
+            &capability_root,
+        ] {
+            fixture_repo(root);
+        }
+
+        let dependency_project = garnish
+            .add_project("dependency", "Dependency", &dependency_root)
+            .unwrap();
+        let prerequisite = garnish
+            .add_task(&task(dependency_project.id.clone()))
+            .unwrap();
+        let mut dependent_spec = task(dependency_project.id);
+        dependent_spec.title = "Dependent".into();
+        dependent_spec.dependencies = vec![prerequisite.id.clone()];
+        let dependent = garnish.add_task(&dependent_spec).unwrap();
+        assert_eq!(dependent.status, TaskStatus::Draft);
+
+        let paused_project = garnish
+            .add_project("paused", "Paused", &paused_root)
+            .unwrap();
+        let paused_task = garnish.add_task(&task(paused_project.id.clone())).unwrap();
+        garnish
+            .set_project_scheduler_pause(&paused_project.id, true, "project maintenance")
+            .unwrap();
+
+        let deadline_project = garnish
+            .add_project("deadline", "Deadline", &deadline_root)
+            .unwrap();
+        let mut deadline_spec = task(deadline_project.id);
+        deadline_spec.deadline_at = Some(now - Duration::seconds(1));
+        let expired_task = garnish.add_task(&deadline_spec).unwrap();
+
+        let capability_project = garnish
+            .add_project("capability", "Capability", &capability_root)
+            .unwrap();
+        let mut capability_spec = task(capability_project.id);
+        capability_spec.required_capabilities = vec!["agent.nonexistent".into()];
+        let capability_task = garnish.add_task(&capability_spec).unwrap();
+
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        garnish
+            .register_scheduler("matrix", "fixture", 1, now)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("matrix", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let tick = garnish
+            .scheduler_tick_at(
+                "matrix",
+                leader.generation,
+                "fake",
+                "fake",
+                "test",
+                now,
+                10,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        let wakes = garnish.scheduler_wakes().unwrap();
+        for (task_id, expected_code) in [
+            (&dependent.id, "dependency.incomplete"),
+            (&paused_task.id, "project.paused"),
+            (&expired_task.id, "deadline.expired"),
+            (&capability_task.id, "capability.missing"),
+        ] {
+            let wake = wakes.iter().find(|wake| wake.task_id == *task_id).unwrap();
+            assert_eq!(wake.reason_code, expected_code);
+            let decision = tick
+                .decisions
+                .iter()
+                .find(|decision| decision.task_id == *task_id)
+                .unwrap();
+            assert_eq!(decision.reason_code, expected_code);
+            assert!(!decision.allowed);
+        }
+    }
+
+    #[test]
+    fn priority_and_deadline_order_survives_restart() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let data_dir = dir.path().join("data");
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+
+        let mut no_deadline = task(project.id.clone());
+        no_deadline.title = "No deadline".into();
+        let no_deadline = garnish.add_task(&no_deadline).unwrap();
+        let mut later = task(project.id.clone());
+        later.title = "Later".into();
+        later.deadline_at = Some(now + Duration::hours(2));
+        let later = garnish.add_task(&later).unwrap();
+        let mut earlier = task(project.id.clone());
+        earlier.title = "Earlier".into();
+        earlier.deadline_at = Some(now + Duration::hours(1));
+        let earlier = garnish.add_task(&earlier).unwrap();
+        let mut high_priority = task(project.id);
+        high_priority.title = "High priority".into();
+        high_priority.priority = 20;
+        let high_priority = garnish.add_task(&high_priority).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        drop(garnish);
+
+        let mut reopened = Garnish::open(&data_dir).unwrap();
+        let preview = reopened
+            .scheduler_preview_at("fake", "fake", "test", now)
+            .unwrap();
+        assert_eq!(
+            preview
+                .decisions
+                .iter()
+                .map(|decision| decision.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                high_priority.id.as_str(),
+                earlier.id.as_str(),
+                later.id.as_str(),
+                no_deadline.id.as_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn scheduler_records_project_resource_lock_exclusion() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let mut first_spec = task(project.id.clone());
+        first_spec.title = "First".into();
+        first_spec.priority = 20;
+        let first = garnish.add_task(&first_spec).unwrap();
+        let mut second_spec = task(project.id);
+        second_spec.title = "Second".into();
+        second_spec.priority = 10;
+        let second = garnish.add_task(&second_spec).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        garnish
+            .register_scheduler("lock-matrix", "fixture", 1, now)
+            .unwrap();
+        let leader = garnish
+            .acquire_scheduler_leader("lock-matrix", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        let tick = garnish
+            .scheduler_tick_at(
+                "lock-matrix",
+                leader.generation,
+                "fake",
+                "fake",
+                "test",
+                now,
+                2,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+
+        assert_eq!(tick.claims.len(), 1);
+        assert_eq!(tick.claims[0].task_id, first.id);
+        let wakes = garnish.scheduler_wakes().unwrap();
+        let wake = wakes.iter().find(|wake| wake.task_id == second.id).unwrap();
+        assert_eq!(wake.reason_code, "scheduler.resource_locked");
     }
 
     #[cfg(unix)]
@@ -2115,6 +2485,8 @@ mod tests {
             provider: "fake".into(),
             account: "test".into(),
             max_active_claims: 1,
+            max_active_per_adapter: 1,
+            max_active_per_account: 1,
             poll_interval: std::time::Duration::from_secs(1),
             leader_ttl: std::time::Duration::from_secs(10),
             claim_ttl: std::time::Duration::from_secs(10),
@@ -2171,6 +2543,8 @@ mod tests {
             provider: "fake".into(),
             account: "test".into(),
             max_active_claims: 1,
+            max_active_per_adapter: 1,
+            max_active_per_account: 1,
             poll_interval: std::time::Duration::from_secs(1),
             leader_ttl: std::time::Duration::from_secs(10),
             claim_ttl: std::time::Duration::from_secs(10),

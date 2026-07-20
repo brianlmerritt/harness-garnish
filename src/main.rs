@@ -81,6 +81,18 @@ enum Command {
 enum ProjectCommand {
     Add(ProjectAdd),
     List,
+    Pause {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Resume {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        reason: String,
+    },
     Link {
         #[arg(long)]
         parent: String,
@@ -156,6 +168,13 @@ struct TaskAdd {
     checkpoint_seconds: u64,
     #[arg(long, default_value = "B", help = "Day affinity: W, O, or B")]
     day_affinity: String,
+    #[arg(
+        long,
+        help = "Optional RFC3339 deadline; the task is excluded after it passes"
+    )]
+    deadline_at: Option<String>,
+    #[arg(long = "requires-capability")]
+    required_capabilities: Vec<String>,
     #[arg(long)]
     fake_write_path: Option<String>,
     #[arg(long)]
@@ -260,6 +279,10 @@ enum SchedulerCommand {
         account: String,
         #[arg(long, default_value_t = 1)]
         max_active: usize,
+        #[arg(long, default_value_t = 1)]
+        max_active_per_adapter: usize,
+        #[arg(long, default_value_t = 1)]
+        max_active_per_account: usize,
         #[arg(long, default_value_t = 300)]
         claim_ttl_seconds: u64,
         #[arg(long, help = "Optional RFC3339 instant; defaults to now")]
@@ -356,6 +379,10 @@ struct SchedulerDaemonArgs {
     account: String,
     #[arg(long, default_value_t = 1)]
     max_active: usize,
+    #[arg(long, default_value_t = 1)]
+    max_active_per_adapter: usize,
+    #[arg(long, default_value_t = 1)]
+    max_active_per_account: usize,
     #[arg(long, default_value_t = 1000)]
     poll_milliseconds: u64,
     #[arg(long, default_value_t = 30)]
@@ -499,6 +526,12 @@ fn run() -> Result<()> {
                 print_json(&project)
             }
             ProjectCommand::List => print_json(&garnish.projects()?),
+            ProjectCommand::Pause { project, reason } => {
+                print_json(&garnish.set_project_scheduler_pause(&project, true, &reason)?)
+            }
+            ProjectCommand::Resume { project, reason } => {
+                print_json(&garnish.set_project_scheduler_pause(&project, false, &reason)?)
+            }
             ProjectCommand::Link {
                 parent,
                 child,
@@ -526,6 +559,8 @@ fn run() -> Result<()> {
                     uncertainty_percent: args.uncertainty_percent,
                     checkpoint_seconds: args.checkpoint_seconds,
                     day_affinity: DayAffinity::from_str(&args.day_affinity)?,
+                    deadline_at: parse_optional_time(args.deadline_at.as_deref())?,
+                    required_capabilities: args.required_capabilities,
                     fake_write_path: args.fake_write_path,
                     fake_write_content: args.fake_write_content,
                 })?;
@@ -620,6 +655,8 @@ fn run() -> Result<()> {
                     provider: args.provider,
                     account: args.account,
                     max_active_claims: args.max_active,
+                    max_active_per_adapter: args.max_active_per_adapter,
+                    max_active_per_account: args.max_active_per_account,
                     poll_interval: StdDuration::from_millis(args.poll_milliseconds),
                     leader_ttl: StdDuration::from_secs(args.leader_ttl_seconds),
                     claim_ttl: StdDuration::from_secs(args.claim_ttl_seconds),
@@ -663,11 +700,13 @@ fn run() -> Result<()> {
                 provider,
                 account,
                 max_active,
+                max_active_per_adapter,
+                max_active_per_account,
                 claim_ttl_seconds,
                 at,
             } => {
                 let at = parse_optional_time(at.as_deref())?.unwrap_or_else(Utc::now);
-                print_json(&garnish.scheduler_tick_at(
+                print_json(&garnish.scheduler_tick_with_limits_at(
                     &instance,
                     generation,
                     &adapter,
@@ -675,6 +714,8 @@ fn run() -> Result<()> {
                     &account,
                     at,
                     max_active,
+                    max_active_per_adapter,
+                    max_active_per_account,
                     std::time::Duration::from_secs(claim_ttl_seconds),
                 )?)
             }

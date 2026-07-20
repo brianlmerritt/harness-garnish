@@ -157,6 +157,8 @@ mod tests {
             slug: "fixture".into(),
             title: "Fixture".into(),
             root_path: dir.path().to_string_lossy().into_owned(),
+            scheduler_paused: false,
+            scheduler_pause_reason: None,
             created_at: Utc::now(),
         };
         let projector = Projector::new(&project);

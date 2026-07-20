@@ -192,6 +192,8 @@ pub struct Project {
     pub slug: String,
     pub title: String,
     pub root_path: String,
+    pub scheduler_paused: bool,
+    pub scheduler_pause_reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -220,6 +222,8 @@ pub struct Task {
     pub uncertainty_percent: u8,
     pub checkpoint_seconds: u64,
     pub day_affinity: DayAffinity,
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub required_capabilities: Vec<String>,
     pub fake_write_path: Option<String>,
     pub fake_write_content: Option<String>,
     pub status: TaskStatus,
@@ -245,6 +249,8 @@ pub struct NewTask {
     pub uncertainty_percent: u8,
     pub checkpoint_seconds: u64,
     pub day_affinity: DayAffinity,
+    pub deadline_at: Option<DateTime<Utc>>,
+    pub required_capabilities: Vec<String>,
     pub fake_write_path: Option<String>,
     pub fake_write_content: Option<String>,
 }
@@ -278,6 +284,15 @@ impl NewTask {
         if self.checkpoint_seconds == 0 || self.checkpoint_seconds > 300 {
             return Err(DomainError::InvalidTask(
                 "checkpoint seconds must be in 1..=300".into(),
+            ));
+        }
+        if self
+            .required_capabilities
+            .iter()
+            .any(|value| value.trim().is_empty() || value.chars().any(char::is_whitespace))
+        {
+            return Err(DomainError::InvalidTask(
+                "required capabilities must be non-empty names without whitespace".into(),
             ));
         }
         match (&self.fake_write_path, &self.fake_write_content) {
@@ -315,6 +330,7 @@ pub struct RouteDecision {
     pub task_id: String,
     pub selected_adapter: Option<String>,
     pub allowed: bool,
+    pub reason_code: String,
     pub reason: String,
     pub required_headroom_percent: f64,
     pub quota: Vec<QuotaSurface>,
@@ -552,6 +568,8 @@ pub struct SchedulerDaemonConfig {
     pub provider: String,
     pub account: String,
     pub max_active_claims: usize,
+    pub max_active_per_adapter: usize,
+    pub max_active_per_account: usize,
     pub poll_interval: std::time::Duration,
     pub leader_ttl: std::time::Duration,
     pub claim_ttl: std::time::Duration,
@@ -605,4 +623,27 @@ pub enum DomainError {
     DependencyCycle,
     #[error("invalid supervision value: {0}")]
     InvalidSupervision(String),
+}
+
+#[derive(Debug, Error)]
+pub enum SchedulerClaimRejection {
+    #[error("scheduler global concurrency limit reached ({limit})")]
+    GlobalCapacity { limit: usize },
+    #[error("scheduler adapter concurrency limit reached ({limit})")]
+    AdapterCapacity { limit: usize },
+    #[error("scheduler account concurrency limit reached ({limit})")]
+    AccountCapacity { limit: usize },
+    #[error("scheduler resource lock is unavailable: {kind}:{key}")]
+    ResourceLocked { kind: String, key: String },
+}
+
+impl SchedulerClaimRejection {
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::GlobalCapacity { .. } => "scheduler.capacity",
+            Self::AdapterCapacity { .. } => "scheduler.adapter_capacity",
+            Self::AccountCapacity { .. } => "scheduler.account_capacity",
+            Self::ResourceLocked { .. } => "scheduler.resource_locked",
+        }
+    }
 }

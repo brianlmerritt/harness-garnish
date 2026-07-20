@@ -42,13 +42,14 @@ erDiagram
 
 ### `projects`
 
-`id`, `slug`, `title`, `purpose`, `root_path`, `status`, `default_policy_revision_id`, `created_at`, `updated_at`, `version`.
+`id`, `slug`, `title`, `purpose`, `root_path`, `status`, `scheduler_paused`, `scheduler_pause_reason`, `default_policy_revision_id`, `created_at`, `updated_at`, `version`.
 
 Invariants:
 
 - the canonicalised root is unique among active projects;
 - removal is archival by default and cannot orphan live tasks;
 - an overarching project links repositories explicitly through `project_repositories`.
+- a scheduler pause is durable, requires an operator reason, and blocks new claims for only that project.
 
 ### `project_repositories`
 
@@ -63,10 +64,10 @@ Required fields:
 - identity: immutable `id`, `project_id`;
 - intent: `title`, `goal`, `rationale`, `scope_json`, `non_scope_json`;
 - contract: `acceptance_json`, `verification_commands_json`;
-- scheduling: `priority`, `deadline_at`, `deadline_timezone`, `expected_benefit`, `risk_class`;
+- scheduling: `priority`, optional UTC `deadline_at`, `deadline_timezone`, `expected_benefit`, `risk_class`;
 - day scheduling: `day_affinity` (`W`, `O`, or `B`; default `B`) resolved against the project's calendar profile;
 - forecast: `estimated_wall_seconds_low/high`, `uncertainty`, `expected_context_bytes`, `checkpoint_strategy_json`, `checkpoint_max_seconds`;
-- constraints: allowed/disallowed agents, models, skills, MCP servers, networks, secret references, path globs, commands, and backends as validated JSON or normalised child tables;
+- constraints: required adapter capabilities plus allowed/disallowed agents, models, skills, MCP servers, networks, secret references, path globs, commands, and backends as validated JSON or normalised child tables;
 - Git: worktree, branch, base/head commit, repository/submodule revision manifest;
 - supervision: `lease_id`, `retry_budget`, `retries_used`, `cancellation_id`;
 - routing: latest snapshot/reservation and rationale reference;
@@ -100,6 +101,16 @@ A run is immutable after terminalisation except for redaction/quarantine metadat
 `resource_locks`: `resource_kind`, `resource_key`, `lease_id`, `mode`, `expires_at`.
 
 Lease acquisition is compare-and-swap. Recovery may expire a lease only after its generation and heartbeat are rechecked. Agent/account, worktree, sandbox, updater, migration, and scheduler-leader locks use the same mechanism.
+
+The Phase 2 scheduler represents per-adapter and per-account concurrency as numbered `adapter-slot` and `account-slot` resource locks. Global capacity, both route-specific ceilings, and the project lock are acquired in the same immediate transaction as the task claim. Expiry or release frees all of those locks together.
+
+### `route_decisions`, `scheduler_claims`, and `scheduler_wakes`
+
+`route_decisions` persist the selected adapter, allow/deny result, a stable machine `reason_code`, bounded human rationale, quota/schedule evidence, policy hash, and evaluation time. Human wording is never parsed to recover the machine reason.
+
+`scheduler_claims` bind a ready task version, fenced scheduler generation, route decision, lease interval, and optional consumed run/action key. Claim creation atomically transitions `ready -> leased` and acquires all resource locks.
+
+`scheduler_wakes` retain the latest exclusion for a task as a stable reason code, optional exact wake time, and bounded supporting detail. Dependency, project pause, calendar, quota, policy, retry, expired deadline, capability, capacity, and resource-lock exclusions use distinct codes.
 
 ### `events`
 
