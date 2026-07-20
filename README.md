@@ -133,7 +133,7 @@ Use a current rustup-managed Rust toolchain and keep the checkout in the WSL2 Li
 ./scripts/test-wsl2-exit
 ```
 
-The bundle consumes no provider quota. It runs the Linux midpoint, verifies default denial of Windows-mounted project roots, requires a healthy rootless Podman or Docker runtime, exercises operational backup/status, and checks private Linux permissions.
+The bundle consumes no provider quota. It runs the Linux midpoint, verifies default denial of Windows-mounted project roots, requires a healthy rootless Podman or Docker runtime, exercises operational backup/status, and checks private Linux permissions. It passed on Ubuntu 24.04 under WSL2 with rootless Podman on 2026-07-20; the captured evidence and cgroup fallback caveat are in [`docs/phase-2-wsl2-exit.md`](docs/phase-2-wsl2-exit.md).
 
 ## Repository authority
 

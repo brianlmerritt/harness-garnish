@@ -69,8 +69,8 @@ Calendar examples:
 - Schema 5 and the runtime-supervision core are implemented locally: lease-fenced checkpoint sequences and heartbeats, durable cancellation intent, TERM-to-KILL process-tree evidence, stable failure categories, bounded retry budgets with deterministic exponential jitter, persisted retry wake gates, and per-adapter/account circuit breakers with a single half-open probe.
 - Active-run checkpoint evaluation now covers day eligibility, live quota headroom, policy revocation, continue, shortened interval, graceful pause, and cancellation. A pause/cancel decision retains ownership until process termination is acknowledged, then releases the run lease and project lock.
 - Schema 6 adds durable global pause/emergency-stop state and a bounded local notification outbox. Operational status, diagnostics, explicit resume, notification acknowledgement, and private integrity-checked state backup are exposed through the CLI. Emergency stop atomically blocks new claims, releases unstarted claims, and requests—not falsely completes—active-run cancellation.
-- WSL2 now defaults to denying project roots under `/mnt/<drive>` and has a quota-free exit script covering the Linux bundle, runtime discovery, permissions, operational backup, and the mounted-path policy.
-- Real-agent claim execution, native desktop notification delivery, encrypted portable export, full sandbox-backend conformance, and execution of the WSL2 exit bundle remain pending.
+- WSL2 defaults to denying project roots under `/mnt/<drive>`. The quota-free exit bundle passed on Ubuntu 24.04 under WSL2 with Linux-native paths, lifecycle/restart checks, private state and backup permissions, and rootless Podman selection; see `phase-2-wsl2-exit.md`. This supplies P2-13 evidence.
+- Real-agent claim execution, native desktop notification delivery, encrypted portable export, full sandbox-backend conformance, and the remaining incomplete Phase 2 acceptance cases remain pending.
 
 ## Explicit non-goals
 
