@@ -487,6 +487,44 @@ pub struct CircuitBreaker {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlState {
+    pub pause_new_work: bool,
+    pub emergency_stop: bool,
+    pub reason: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalNotification {
+    pub id: String,
+    pub kind: String,
+    pub severity: String,
+    pub task_id: Option<String>,
+    pub run_id: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub created_at: DateTime<Utc>,
+    pub acknowledged_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmergencyStopResult {
+    pub control: ControlState,
+    pub cancellation_requested_run_ids: Vec<String>,
+    pub released_task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupRecord {
+    pub path: String,
+    pub schema_version: i64,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub integrity: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerWake {
     pub task_id: String,
     pub reason_code: String,

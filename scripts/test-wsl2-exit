@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+kernel_release="$(uname -r)"
+if [[ -z "${WSL_INTEROP:-}" && -z "${WSL_DISTRO_NAME:-}" && "${kernel_release,,}" != *microsoft* ]]; then
+  echo "error: this acceptance bundle must run inside WSL2" >&2
+  exit 1
+fi
+
+if [[ "$(id -u)" == "0" ]]; then
+  echo "error: run the WSL2 bundle as a dedicated non-root user" >&2
+  exit 1
+fi
+
+case "$(pwd -P)" in
+  /mnt/[a-zA-Z]/*)
+    echo "error: clone Harness Garnish into the WSL2 Linux filesystem, not /mnt/<drive>" >&2
+    exit 1
+    ;;
+esac
+
+echo "wsl distribution: ${WSL_DISTRO_NAME:-unknown}"
+echo "kernel: $(uname -srmo)"
+echo "rustc: $(rustc --version)"
+echo "cargo: $(cargo --version)"
+
+./scripts/test-linux-midpoint
+cargo test service::tests::wsl2_denies_windows_mounted_project_roots_by_default --lib
+
+runtime_healthy=false
+if command -v podman >/dev/null 2>&1; then
+  podman info >/dev/null
+  rootless="$(podman info --format '{{.Host.Security.Rootless}}')"
+  [[ "$rootless" == "true" ]]
+  echo "wsl runtime: rootless Podman"
+  runtime_healthy=true
+fi
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  echo "wsl runtime: Docker"
+  runtime_healthy=true
+fi
+if [[ "$runtime_healthy" != "true" ]]; then
+  echo "error: WSL2 exit requires a healthy rootless Podman or Docker runtime" >&2
+  exit 1
+fi
+
+wsl_state_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$wsl_state_dir"
+}
+trap cleanup EXIT
+
+target/debug/garnish --data-dir "$wsl_state_dir/state" ops status
+target/debug/garnish \
+  --data-dir "$wsl_state_dir/state" \
+  ops backup \
+  --output "$wsl_state_dir/backup/state.db"
+
+state_mode="$(stat -c '%a' "$wsl_state_dir/state")"
+database_mode="$(stat -c '%a' "$wsl_state_dir/state/state.db")"
+backup_mode="$(stat -c '%a' "$wsl_state_dir/backup/state.db")"
+[[ "$state_mode" == "700" ]]
+[[ "$database_mode" == "600" ]]
+[[ "$backup_mode" == "600" ]]
+echo "wsl permissions: directory=$state_mode database=$database_mode backup=$backup_mode"
+
+echo "WSL2 exit bundle passed"

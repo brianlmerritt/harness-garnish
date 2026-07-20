@@ -1,9 +1,10 @@
 use crate::{
     domain::{
-        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ClaimedRunStart,
-        DayKind, FailureCategory, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan,
-        RetryState, RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerLeader, SchedulerWake,
-        Task, TaskStatus,
+        BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
+        ClaimedRunStart, ControlState, DayKind, EmergencyStopResult, FailureCategory,
+        LocalNotification, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan, RetryState,
+        RouteDecision, RunCheckpoint, SchedulerClaim, SchedulerLeader, SchedulerWake, Task,
+        TaskStatus,
     },
     schedule,
 };
@@ -14,12 +15,13 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     str::FromStr,
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 pub struct Database {
     path: PathBuf,
@@ -46,6 +48,367 @@ impl Database {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn schema_version(&self) -> i64 {
+        SCHEMA_VERSION
+    }
+
+    pub fn control_state(&self) -> Result<ControlState> {
+        self.conn
+            .query_row(
+                "SELECT pause_new_work, emergency_stop, reason, updated_at
+                 FROM control_state WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(ControlState {
+                        pause_new_work: row.get(0)?,
+                        emergency_stop: row.get(1)?,
+                        reason: row.get(2)?,
+                        updated_at: parse_time(row.get(3)?)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_pause_new_work(
+        &mut self,
+        paused: bool,
+        reason: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<ControlState> {
+        if paused && reason.is_none_or(|value| value.trim().is_empty()) {
+            bail!("pausing new work requires a reason");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let emergency: bool = tx.query_row(
+            "SELECT emergency_stop FROM control_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if emergency && !paused {
+            bail!("resume requires clearing emergency stop explicitly");
+        }
+        tx.execute(
+            "UPDATE control_state SET pause_new_work = ?1, reason = ?2, updated_at = ?3
+             WHERE singleton = 1",
+            params![paused, reason, now.to_rfc3339()],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            if paused {
+                "operations.paused"
+            } else {
+                "operations.resumed"
+            },
+            "user",
+            &serde_json::json!({"reason": reason}),
+        )?;
+        tx.commit()?;
+        self.control_state()
+    }
+
+    pub fn resume_operations(&mut self, reason: &str, now: DateTime<Utc>) -> Result<ControlState> {
+        if reason.trim().is_empty() {
+            bail!("resuming operations requires a reason");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE control_state
+             SET pause_new_work = 0, emergency_stop = 0, reason = ?1, updated_at = ?2
+             WHERE singleton = 1",
+            params![reason, now.to_rfc3339()],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "operations.resumed",
+            "user",
+            &serde_json::json!({"reason": reason, "cleared_emergency_stop": true}),
+        )?;
+        tx.commit()?;
+        self.control_state()
+    }
+
+    pub fn emergency_stop(
+        &mut self,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<EmergencyStopResult> {
+        if reason.trim().is_empty() {
+            bail!("emergency stop requires a reason");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE control_state
+             SET pause_new_work = 1, emergency_stop = 1, reason = ?1, updated_at = ?2
+             WHERE singleton = 1",
+            params![reason, now.to_rfc3339()],
+        )?;
+
+        let mut run_stmt = tx.prepare(
+            "SELECT r.id, r.task_id FROM runs r
+             JOIN tasks t ON t.id = r.task_id
+             WHERE r.status = 'running' AND t.status = 'running'
+             ORDER BY r.started_at, r.id",
+        )?;
+        let active_runs = run_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(run_stmt);
+        for (run_id, task_id) in &active_runs {
+            tx.execute(
+                "UPDATE run_supervision
+                 SET cancellation_status = 'requested', cancellation_reason = ?2,
+                     cancellation_requested_at = COALESCE(cancellation_requested_at, ?3),
+                     requested_action = 'cancel', updated_at = ?3, version = version + 1
+                 WHERE run_id = ?1 AND cancellation_status != 'completed'",
+                params![run_id, reason, now.to_rfc3339()],
+            )?;
+            append_event_tx(
+                &tx,
+                None,
+                Some(task_id),
+                Some(run_id),
+                "run.emergency_stop_requested",
+                "user",
+                &serde_json::json!({"reason": reason}),
+            )?;
+        }
+
+        let mut claim_stmt = tx.prepare(
+            "SELECT id, task_id FROM scheduler_claims
+             WHERE status = 'active' ORDER BY acquired_at, id",
+        )?;
+        let claims = claim_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(claim_stmt);
+        let mut released_task_ids = Vec::new();
+        for (claim_id, task_id) in &claims {
+            let status: String =
+                tx.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                    row.get(0)
+                })?;
+            if status == TaskStatus::Leased.to_string() {
+                transition_task_tx(
+                    &tx,
+                    task_id,
+                    TaskStatus::Leased,
+                    TaskStatus::Paused,
+                    "emergency_stop",
+                )?;
+                released_task_ids.push(task_id.clone());
+            }
+            tx.execute(
+                "UPDATE scheduler_claims SET status = 'released', released_at = ?2
+                 WHERE id = ?1 AND status = 'active'",
+                params![claim_id, now.to_rfc3339()],
+            )?;
+            tx.execute(
+                "UPDATE resource_locks SET released_at = ?2
+                 WHERE claim_id = ?1 AND released_at IS NULL",
+                params![claim_id, now.to_rfc3339()],
+            )?;
+        }
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "operations.emergency_stop",
+            "user",
+            &serde_json::json!({
+                "reason": reason,
+                "active_run_count": active_runs.len(),
+                "released_claim_count": claims.len(),
+            }),
+        )?;
+        enqueue_notification_tx(
+            &tx,
+            "operation",
+            "critical",
+            None,
+            None,
+            "Harness Garnish emergency stop",
+            reason,
+            now,
+        )?;
+        tx.commit()?;
+        Ok(EmergencyStopResult {
+            control: self.control_state()?,
+            cancellation_requested_run_ids: active_runs
+                .into_iter()
+                .map(|(run_id, _)| run_id)
+                .collect(),
+            released_task_ids,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_notification(
+        &mut self,
+        kind: &str,
+        severity: &str,
+        task_id: Option<&str>,
+        run_id: Option<&str>,
+        title: &str,
+        body: &str,
+        now: DateTime<Utc>,
+    ) -> Result<LocalNotification> {
+        let tx = self.conn.transaction()?;
+        let notification =
+            enqueue_notification_tx(&tx, kind, severity, task_id, run_id, title, body, now)?;
+        tx.commit()?;
+        Ok(notification)
+    }
+
+    pub fn local_notifications(
+        &self,
+        include_acknowledged: bool,
+        limit: usize,
+    ) -> Result<Vec<LocalNotification>> {
+        if limit == 0 || limit > 200 {
+            bail!("notification limit must be in 1..=200");
+        }
+        let sql = if include_acknowledged {
+            "SELECT id, kind, severity, task_id, run_id, title, body, created_at, acknowledged_at
+             FROM local_notifications ORDER BY created_at DESC, id DESC LIMIT ?1"
+        } else {
+            "SELECT id, kind, severity, task_id, run_id, title, body, created_at, acknowledged_at
+             FROM local_notifications WHERE acknowledged_at IS NULL
+             ORDER BY created_at DESC, id DESC LIMIT ?1"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([limit as i64], map_local_notification)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn acknowledge_notification(
+        &mut self,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<LocalNotification> {
+        let changed = self.conn.execute(
+            "UPDATE local_notifications SET acknowledged_at = ?2
+             WHERE id = ?1 AND acknowledged_at IS NULL",
+            params![id, now.to_rfc3339()],
+        )?;
+        if changed != 1 {
+            bail!("notification is missing or already acknowledged: {id}");
+        }
+        self.conn
+            .query_row(
+                "SELECT id, kind, severity, task_id, run_id, title, body, created_at, acknowledged_at
+                 FROM local_notifications WHERE id = ?1",
+                [id],
+                map_local_notification,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn operational_counts(&self, now: DateTime<Utc>) -> Result<serde_json::Value> {
+        let task_counts = self.counts_by_status("tasks")?;
+        let run_counts = self.counts_by_status("runs")?;
+        let active_claims: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM scheduler_claims WHERE status = 'active' AND expires_at > ?1",
+            [now.to_rfc3339()],
+            |row| row.get(0),
+        )?;
+        let active_schedulers: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM scheduler_instances WHERE status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending_notifications: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM local_notifications WHERE acknowledged_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::json!({
+            "evaluated_at": now,
+            "control": self.control_state()?,
+            "task_counts": task_counts,
+            "run_counts": run_counts,
+            "active_scheduler_claims": active_claims,
+            "active_schedulers": active_schedulers,
+            "pending_notifications": pending_notifications,
+        }))
+    }
+
+    fn counts_by_status(&self, table: &str) -> Result<serde_json::Map<String, serde_json::Value>> {
+        let sql = match table {
+            "tasks" => "SELECT status, COUNT(*) FROM tasks GROUP BY status ORDER BY status",
+            "runs" => "SELECT status, COUNT(*) FROM runs GROUP BY status ORDER BY status",
+            _ => bail!("unsupported status-count table"),
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut counts = serde_json::Map::new();
+        for row in rows {
+            let (status, count) = row?;
+            counts.insert(status, serde_json::json!(count));
+        }
+        Ok(counts)
+    }
+
+    pub fn backup_to(&self, destination: &Path, now: DateTime<Utc>) -> Result<BackupRecord> {
+        if destination.exists() {
+            bail!(
+                "backup destination already exists: {}",
+                destination.display()
+            );
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating backup directory {}", parent.display()))?;
+        }
+        self.conn
+            .execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])?;
+        secure_database_file(destination)?;
+        let check = Connection::open(destination)?;
+        let integrity: String = check.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            let _ = fs::remove_file(destination);
+            bail!("backup failed integrity check: {integrity}");
+        }
+        let mut file = fs::File::open(destination)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(BackupRecord {
+            path: destination.to_string_lossy().into_owned(),
+            schema_version: SCHEMA_VERSION,
+            size_bytes: fs::metadata(destination)?.len(),
+            sha256: hex::encode(digest.finalize()),
+            integrity,
+            created_at: now,
+        })
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -76,6 +439,9 @@ impl Database {
         }
         if current < 5 {
             tx.execute_batch(MIGRATION_5)?;
+        }
+        if current < 6 {
+            tx.execute_batch(MIGRATION_6)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -601,6 +967,17 @@ impl Database {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         assert_scheduler_leader_tx(&tx, instance_id, leader_generation, now)?;
+        let (pause_new_work, emergency_stop): (bool, bool) = tx.query_row(
+            "SELECT pause_new_work, emergency_stop FROM control_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if emergency_stop {
+            bail!("operations.emergency_stop: new scheduler claims are disabled");
+        }
+        if pause_new_work {
+            bail!("operations.paused: new scheduler claims are disabled");
+        }
         expire_scheduler_claims_tx(&tx, now)?;
         let active: i64 = tx.query_row(
             "SELECT COUNT(*) FROM scheduler_claims WHERE status = 'active' AND expires_at > ?1",
@@ -1911,6 +2288,45 @@ impl Database {
             "supervisor",
             outcome,
         )?;
+        match task_next {
+            TaskStatus::Paused => {
+                enqueue_notification_tx(
+                    &tx,
+                    "blocked",
+                    "warning",
+                    Some(&task_id),
+                    Some(run_id),
+                    "Task paused",
+                    "Runtime supervision paused the task after terminating its process safely.",
+                    now,
+                )?;
+            }
+            TaskStatus::Failed => {
+                enqueue_notification_tx(
+                    &tx,
+                    "failure",
+                    "error",
+                    Some(&task_id),
+                    Some(run_id),
+                    "Task run failed",
+                    "The supervised process failed; inspect the bounded run evidence and retry state.",
+                    now,
+                )?;
+            }
+            TaskStatus::Cancelled => {
+                enqueue_notification_tx(
+                    &tx,
+                    "operation",
+                    "warning",
+                    Some(&task_id),
+                    Some(run_id),
+                    "Task run cancelled",
+                    "The supervised process exited after a cancellation request.",
+                    now,
+                )?;
+            }
+            _ => {}
+        }
         tx.commit()?;
         Ok(task_id)
     }
@@ -2590,6 +3006,73 @@ fn deterministic_retry_delay(
     Ok(std::time::Duration::from_millis(milliseconds))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn enqueue_notification_tx(
+    tx: &Transaction<'_>,
+    kind: &str,
+    severity: &str,
+    task_id: Option<&str>,
+    run_id: Option<&str>,
+    title: &str,
+    body: &str,
+    now: DateTime<Utc>,
+) -> Result<LocalNotification> {
+    if !matches!(kind, "review" | "blocked" | "failure" | "operation") {
+        bail!("unsupported notification kind: {kind}");
+    }
+    if !matches!(severity, "info" | "warning" | "error" | "critical") {
+        bail!("unsupported notification severity: {severity}");
+    }
+    if !(1..=200).contains(&title.chars().count()) {
+        bail!("notification title must contain 1..=200 characters");
+    }
+    if !(1..=2_000).contains(&body.chars().count()) {
+        bail!("notification body must contain 1..=2000 characters");
+    }
+    let notification = LocalNotification {
+        id: Ulid::new().to_string(),
+        kind: kind.into(),
+        severity: severity.into(),
+        task_id: task_id.map(str::to_owned),
+        run_id: run_id.map(str::to_owned),
+        title: title.into(),
+        body: body.into(),
+        created_at: now,
+        acknowledged_at: None,
+    };
+    tx.execute(
+        "INSERT INTO local_notifications(
+            id, kind, severity, task_id, run_id, title, body, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            notification.id,
+            kind,
+            severity,
+            task_id,
+            run_id,
+            title,
+            body,
+            now.to_rfc3339(),
+        ],
+    )?;
+    Ok(notification)
+}
+
+fn map_local_notification(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalNotification> {
+    let acknowledged_at: Option<String> = row.get(8)?;
+    Ok(LocalNotification {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        severity: row.get(2)?,
+        task_id: row.get(3)?,
+        run_id: row.get(4)?,
+        title: row.get(5)?,
+        body: row.get(6)?,
+        created_at: parse_time(row.get(7)?)?,
+        acknowledged_at: acknowledged_at.map(parse_time).transpose()?,
+    })
+}
+
 fn ensure_acyclic_tx(tx: &Transaction<'_>) -> Result<()> {
     let cycle: bool = tx.query_row(
         "WITH RECURSIVE walk(origin, node) AS (
@@ -3039,6 +3522,34 @@ CREATE INDEX idx_adapter_circuit_probe
     ON adapter_circuits(state, next_probe_at);
 "#;
 
+const MIGRATION_6: &str = r#"
+CREATE TABLE control_state (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    pause_new_work INTEGER NOT NULL CHECK(pause_new_work IN (0, 1)),
+    emergency_stop INTEGER NOT NULL CHECK(emergency_stop IN (0, 1)),
+    reason TEXT,
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO control_state(singleton, pause_new_work, emergency_stop, reason, updated_at)
+VALUES (1, 0, 0, NULL, '1970-01-01T00:00:00Z');
+
+CREATE TABLE local_notifications (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('review', 'blocked', 'failure', 'operation')),
+    severity TEXT NOT NULL CHECK(severity IN ('info', 'warning', 'error', 'critical')),
+    task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 200),
+    body TEXT NOT NULL CHECK(length(body) BETWEEN 1 AND 2000),
+    created_at TEXT NOT NULL,
+    acknowledged_at TEXT
+);
+
+CREATE INDEX idx_local_notifications_pending
+    ON local_notifications(created_at) WHERE acknowledged_at IS NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3286,7 +3797,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let backup = fs::read_dir(dir.path())
             .unwrap()
@@ -3914,5 +4425,178 @@ mod tests {
         .unwrap();
         assert_eq!(db.task(&task.id).unwrap().status, TaskStatus::Cancelled);
         assert!(db.run_lease_context("run-checkpoint").is_err());
+    }
+
+    #[test]
+    fn emergency_stop_cancels_running_work_and_releases_unstarted_claims() {
+        let (dir, mut db) = database();
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let project = db.add_project("one", "One", &root).unwrap();
+        let running = db
+            .add_task(&new_task(&project.id, "running", vec![]))
+            .unwrap();
+        let queued = db
+            .add_task(&new_task(&project.id, "queued", vec![]))
+            .unwrap();
+        let now = Utc::now();
+        let decision = RouteDecision {
+            id: Ulid::new().to_string(),
+            task_id: running.id.clone(),
+            selected_adapter: Some("fake".into()),
+            allowed: true,
+            reason: "fixture".into(),
+            required_headroom_percent: 0.0,
+            candidates: vec![],
+            next_wake_at: None,
+            schedule: None,
+            quota: vec![],
+            policy_hash: "fixture".into(),
+            created_at: now,
+        };
+        db.record_route(&decision).unwrap();
+        db.transition_task(
+            &running.id,
+            TaskStatus::Ready,
+            TaskStatus::Leased,
+            "fixture",
+        )
+        .unwrap();
+        db.transition_task(
+            &running.id,
+            TaskStatus::Leased,
+            TaskStatus::Planning,
+            "fixture",
+        )
+        .unwrap();
+        db.transition_task(
+            &running.id,
+            TaskStatus::Planning,
+            TaskStatus::Running,
+            "fixture",
+        )
+        .unwrap();
+        db.create_run(
+            "run-emergency",
+            &running.id,
+            "fake",
+            &decision.id,
+            "/fixture/worktree",
+            "fixture",
+            "0123456789abcdef",
+            now + chrono::Duration::minutes(5),
+        )
+        .unwrap();
+        db.register_scheduler_instance("scheduler", "host", 1, now)
+            .unwrap();
+        let leader = db
+            .acquire_scheduler_leader("scheduler", now, std::time::Duration::from_secs(60))
+            .unwrap();
+        db.claim_task_for_scheduler(
+            "scheduler",
+            leader.generation,
+            &queued.id,
+            queued.version,
+            now,
+            std::time::Duration::from_secs(60),
+            2,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let stopped = db.emergency_stop("fixture emergency", now).unwrap();
+        assert!(stopped.control.pause_new_work);
+        assert!(stopped.control.emergency_stop);
+        assert_eq!(
+            stopped.cancellation_requested_run_ids,
+            vec!["run-emergency"]
+        );
+        assert_eq!(stopped.released_task_ids, vec![queued.id.clone()]);
+        assert!(db.run_cancellation_requested("run-emergency").unwrap());
+        assert_eq!(db.task(&running.id).unwrap().status, TaskStatus::Running);
+        assert_eq!(db.task(&queued.id).unwrap().status, TaskStatus::Paused);
+        assert!(
+            db.claim_task_for_scheduler(
+                "scheduler",
+                leader.generation,
+                &queued.id,
+                db.task(&queued.id).unwrap().version,
+                now + chrono::Duration::seconds(1),
+                std::time::Duration::from_secs(60),
+                2,
+                None,
+                &[],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("emergency_stop")
+        );
+        let resumed = db
+            .resume_operations("incident resolved", now + chrono::Duration::seconds(2))
+            .unwrap();
+        assert!(!resumed.pause_new_work);
+        assert!(!resumed.emergency_stop);
+    }
+
+    #[test]
+    fn durable_notifications_are_bounded_and_single_acknowledgement() {
+        let (_dir, mut db) = database();
+        let notification = db
+            .enqueue_notification(
+                "operation",
+                "info",
+                None,
+                None,
+                "Fixture notice",
+                "Bounded local notification body",
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(db.local_notifications(false, 10).unwrap().len(), 1);
+        let acknowledged = db
+            .acknowledge_notification(&notification.id, Utc::now())
+            .unwrap();
+        assert!(acknowledged.acknowledged_at.is_some());
+        assert!(db.local_notifications(false, 10).unwrap().is_empty());
+        assert!(
+            db.acknowledge_notification(&notification.id, Utc::now())
+                .is_err()
+        );
+        assert!(
+            db.enqueue_notification(
+                "operation",
+                "info",
+                None,
+                None,
+                "Fixture notice",
+                &"x".repeat(2_001),
+                Utc::now(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn online_backup_is_private_integrity_checked_and_content_addressed() {
+        let (dir, mut db) = database();
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        db.add_project("one", "One", &root).unwrap();
+        let destination = dir.path().join("backups/state.db");
+        let backup = db.backup_to(&destination, Utc::now()).unwrap();
+        assert_eq!(backup.integrity, "ok");
+        assert_eq!(backup.schema_version, 6);
+        assert_eq!(backup.sha256.len(), 64);
+        assert_eq!(backup.size_bytes, fs::metadata(&destination).unwrap().len());
+        assert!(db.backup_to(&destination, Utc::now()).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

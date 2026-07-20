@@ -58,6 +58,14 @@ enum Command {
         #[command(subcommand)]
         command: RuntimeCommand,
     },
+    Ops {
+        #[command(subcommand)]
+        command: OpsCommand,
+    },
+    Notification {
+        #[command(subcommand)]
+        command: NotificationCommand,
+    },
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -297,6 +305,41 @@ enum RuntimeCommand {
         limit: u32,
     },
     Circuits,
+}
+
+#[derive(Subcommand)]
+enum OpsCommand {
+    Status,
+    Pause {
+        #[arg(long)]
+        reason: String,
+    },
+    Resume {
+        #[arg(long)]
+        reason: String,
+    },
+    EmergencyStop {
+        #[arg(long)]
+        reason: String,
+    },
+    Diagnostics,
+    Backup {
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationCommand {
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    Acknowledge {
+        id: String,
+    },
 }
 
 #[derive(Args)]
@@ -666,6 +709,22 @@ fn run() -> Result<()> {
                 print_json(&garnish.set_retry_limit(&task, limit)?)
             }
             RuntimeCommand::Circuits => print_json(&garnish.adapter_circuits()?),
+        },
+        Command::Ops { command } => match command {
+            OpsCommand::Status => print_json(&garnish.operational_status()?),
+            OpsCommand::Pause { reason } => print_json(&garnish.pause_new_work(&reason)?),
+            OpsCommand::Resume { reason } => print_json(&garnish.resume_operations(&reason)?),
+            OpsCommand::EmergencyStop { reason } => print_json(&garnish.emergency_stop(&reason)?),
+            OpsCommand::Diagnostics => print_json(&garnish.diagnostics()?),
+            OpsCommand::Backup { output } => print_json(&garnish.create_backup(output.as_deref())?),
+        },
+        Command::Notification { command } => match command {
+            NotificationCommand::List { all, limit } => {
+                print_json(&garnish.local_notifications(all, limit)?)
+            }
+            NotificationCommand::Acknowledge { id } => {
+                print_json(&garnish.acknowledge_notification(&id)?)
+            }
         },
         Command::Agent { command } => match command {
             AgentCommand::Probe => print_json(&garnish.doctor().probes),

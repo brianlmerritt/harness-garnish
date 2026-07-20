@@ -24,4 +24,17 @@ The opt-in real-Docker test remained ignored by design because no healthy daemon
 
 ## Podman follow-up
 
-A follow-up run used Linux `6.8.0-107-generic` on `x86_64` with Rust/Cargo `1.97.1`. It exposed a Linux timing race in the quota-free adapter fixture: the fixture exited without consuming Codex's stdin prompt, so the supervisor correctly reported `EPIPE`. The fixture now drains stdin before returning its result; the focused regression, full suite, formatting, and lint all pass locally. The follow-up run stopped before reaching the Podman probe, so rootless Podman evidence remains pending until the corrected fixture is rerun on the VPS.
+A follow-up run used Linux `6.8.0-107-generic` on `x86_64` with Rust/Cargo `1.97.1`. It exposed a Linux timing race in the quota-free adapter fixture: the fixture exited without consuming Codex's stdin prompt, so the supervisor correctly reported `EPIPE`. The fixture now drains stdin before returning its result.
+
+The corrected quota-free bundle passed on 2026-07-20:
+
+- Rust library suite: 52 passed, 0 failed, 1 explicitly ignored real-Docker test.
+- CLI suite: 2 passed, 0 failed.
+- MVP vertical slice: 1 passed, 0 failed.
+- Runtime-supervision checkpoint, retry, circuit-breaker, cancellation, and descendant-cleanup tests passed.
+- Bounded and signal-driven daemon checks passed with the expected `max_ticks` and `signal` shutdown reasons.
+- State directory and database modes remained `0700` and `0600`.
+- `podman info` succeeded and reported a healthy rootless runtime.
+- Docker was not installed, so Docker conformance remains separate and opt-in.
+
+This closes the Linux midpoint and rootless-Podman capability probe. It does not yet prove the full backend-specific Podman sandbox attestation matrix; that remains part of later runtime conformance work.

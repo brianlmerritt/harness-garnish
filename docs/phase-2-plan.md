@@ -26,7 +26,7 @@ Calendar examples:
 
 ## Implementation stages
 
-1. Schema versions 2–5: calendar profiles, project-to-calendar selection, dated exceptions, task affinity, scheduler instances, leader fencing, durable wake records, task claims, resource locks, claim-to-run bindings, checkpoints, retry state, and adapter circuits. Prove version-1 backup and migration integrity. Ordered development migrations remain separate so an early Phase 2 database can advance safely.
+1. Schema versions 2–6: calendar profiles, project-to-calendar selection, dated exceptions, task affinity, scheduler instances, leader fencing, durable wake records, task claims, resource locks, claim-to-run bindings, checkpoints, retry state, adapter circuits, operational controls, and local notifications. Prove version-1 backup and migration integrity. Ordered development migrations remain separate so an early Phase 2 database can advance safely.
 2. Pure scheduler kernel: injected clock, ready-set calculation, deterministic ordering, eligibility reasons, next wake, concurrency ceilings, and atomic lease claims.
 3. Local daemon: singleton leader lease, heartbeats, graceful shutdown, stale-leader recovery, orphan cleanup, and idempotency claims around external actions.
 4. Runtime supervision: checkpoint timers, cancellation, retry budgets, stable failure categories, exponential backoff with jitter derived from persisted state, and adapter circuit breakers.
@@ -64,11 +64,13 @@ Calendar examples:
 - Schema migrations, calendar scheduling, deterministic ready-set routing, leader fencing, atomic task claims, global concurrency, and exclusive project locks are implemented.
 - The local daemon now renews leadership and active claims, performs scheduler/run-lease recovery, handles `TERM`/`INT`, and releases unstarted claims on graceful shutdown.
 - State directories and SQLite database files are restricted to the owning user on Unix.
-- `scripts/test-linux-midpoint` passed the scheduler, signal, cleanup, and permission bundle on a Linux VPS; see `phase-2-linux-midpoint.md`. Container-runtime conformance remains pending because that host had neither Podman nor Docker installed.
+- `scripts/test-linux-midpoint` passed the scheduler, runtime-supervision, signal, cleanup, permission, and rootless-Podman probe bundle on a Linux VPS; see `phase-2-linux-midpoint.md`. Full backend-specific Podman sandbox attestation and Docker conformance remain separate work.
 - The opt-in quota-free fake path now binds a route and scheduler claim atomically to one run and one single-use external-action key. Completed and orphaned runs release project locks, and clean prepared worktrees can be adopted after a pre-consumption restart.
 - Schema 5 and the runtime-supervision core are implemented locally: lease-fenced checkpoint sequences and heartbeats, durable cancellation intent, TERM-to-KILL process-tree evidence, stable failure categories, bounded retry budgets with deterministic exponential jitter, persisted retry wake gates, and per-adapter/account circuit breakers with a single half-open probe.
 - Active-run checkpoint evaluation now covers day eligibility, live quota headroom, policy revocation, continue, shortened interval, graceful pause, and cancellation. A pause/cancel decision retains ownership until process termination is acknowledged, then releases the run lease and project lock.
-- Real-agent claim execution, active-run notification/operations work, Linux rerun evidence with rootless Podman, and the WSL2 exit bundle remain pending.
+- Schema 6 adds durable global pause/emergency-stop state and a bounded local notification outbox. Operational status, diagnostics, explicit resume, notification acknowledgement, and private integrity-checked state backup are exposed through the CLI. Emergency stop atomically blocks new claims, releases unstarted claims, and requests—not falsely completes—active-run cancellation.
+- WSL2 now defaults to denying project roots under `/mnt/<drive>` and has a quota-free exit script covering the Linux bundle, runtime discovery, permissions, operational backup, and the mounted-path policy.
+- Real-agent claim execution, native desktop notification delivery, encrypted portable export, full sandbox-backend conformance, and execution of the WSL2 exit bundle remain pending.
 
 ## Explicit non-goals
 

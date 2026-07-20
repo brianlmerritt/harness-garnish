@@ -5,11 +5,12 @@ use crate::{
     },
     db::Database,
     domain::{
-        CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, DayKind,
-        FailureCategory, NewTask, Project, ProjectLink, QuotaSurface, RetryPlan, RetryState,
-        RouteCandidate, RouteDecision, RunCheckpoint, RunSummary, ScheduleEvaluation,
-        SchedulerClaim, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
-        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus,
+        BackupRecord, CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker,
+        ControlState, DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewTask,
+        Project, ProjectLink, QuotaSurface, RetryPlan, RetryState, RouteCandidate, RouteDecision,
+        RunCheckpoint, RunSummary, ScheduleEvaluation, SchedulerClaim, SchedulerDaemonConfig,
+        SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake,
+        Task, TaskStatus,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -74,7 +75,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 5,
+            schema_version: 6,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -89,6 +90,10 @@ impl Garnish {
 
     pub fn add_project(&mut self, slug: &str, title: &str, root: &Path) -> Result<Project> {
         validate_slug(slug)?;
+        let canonical_root = root.canonicalize().map_err(|error| {
+            anyhow::anyhow!("canonicalizing project path {}: {error}", root.display())
+        })?;
+        validate_project_root_for_platform(&canonical_root, is_wsl2())?;
         let project = self.db.add_project(slug, title, root)?;
         Projector::new(&project).initialize(&project)?;
         Ok(project)
@@ -246,6 +251,72 @@ impl Garnish {
 
     pub fn adapter_circuits(&self) -> Result<Vec<CircuitBreaker>> {
         self.db.adapter_circuits()
+    }
+
+    pub fn control_state(&self) -> Result<ControlState> {
+        self.db.control_state()
+    }
+
+    pub fn pause_new_work(&mut self, reason: &str) -> Result<ControlState> {
+        self.db.set_pause_new_work(true, Some(reason), Utc::now())
+    }
+
+    pub fn resume_operations(&mut self, reason: &str) -> Result<ControlState> {
+        self.db.resume_operations(reason, Utc::now())
+    }
+
+    pub fn emergency_stop(&mut self, reason: &str) -> Result<EmergencyStopResult> {
+        self.db.emergency_stop(reason, Utc::now())
+    }
+
+    pub fn operational_status(&self) -> Result<serde_json::Value> {
+        self.db.operational_counts(Utc::now())
+    }
+
+    pub fn diagnostics(&self) -> Result<serde_json::Value> {
+        let mut circuits = self.db.adapter_circuits()?;
+        circuits.truncate(100);
+        let mut wakes = self.db.scheduler_wakes()?;
+        wakes.truncate(100);
+        Ok(serde_json::json!({
+            "schema_version": self.db.schema_version(),
+            "data_dir": self.data_dir,
+            "database": {
+                "path": self.db.path(),
+                "size_bytes": fs::metadata(self.db.path())?.len(),
+            },
+            "status": self.db.operational_counts(Utc::now())?,
+            "pending_notifications": self.db.local_notifications(false, 20)?,
+            "adapter_circuits": circuits,
+            "scheduler_wakes": wakes,
+            "bounds": {
+                "notifications": 20,
+                "adapter_circuits": 100,
+                "scheduler_wakes": 100,
+            },
+        }))
+    }
+
+    pub fn create_backup(&self, destination: Option<&Path>) -> Result<BackupRecord> {
+        let now = Utc::now();
+        let default_path = self.data_dir.join("backups").join(format!(
+            "state-{}-{}.db",
+            now.format("%Y%m%dT%H%M%SZ"),
+            Ulid::new()
+        ));
+        self.db.backup_to(destination.unwrap_or(&default_path), now)
+    }
+
+    pub fn local_notifications(
+        &self,
+        include_acknowledged: bool,
+        limit: usize,
+    ) -> Result<Vec<LocalNotification>> {
+        self.db.local_notifications(include_acknowledged, limit)
+    }
+
+    pub fn acknowledge_notification(&mut self, id: &str) -> Result<LocalNotification> {
+        self.db.acknowledge_notification(id, Utc::now())
     }
 
     pub fn request_run_cancellation(&mut self, run_id: &str, reason: &str) -> Result<bool> {
@@ -455,6 +526,8 @@ impl Garnish {
         if !self.db.dependencies_satisfied(task_id)? {
             bail!("task dependencies are not complete");
         }
+        let control = self.db.control_state()?;
+        let operations_allowed = !control.pause_new_work && !control.emergency_stop;
         let schedule = self.evaluate_task_schedule_at(task_id, now)?;
         let retry = self.db.retry_state(task_id)?;
         let retry_allowed = retry
@@ -527,6 +600,7 @@ impl Garnish {
         if claim_circuit_probe
             && circuit_allowed
             && circuit_reason == "circuit.probe_available"
+            && operations_allowed
             && schedule.eligible
             && retry_allowed
             && policy_allowed
@@ -537,11 +611,22 @@ impl Garnish {
                 .adapter_circuit_gate(adapter, provider, account, now, true)?;
         }
         let allowed = schedule.eligible
+            && operations_allowed
             && retry_allowed
             && circuit_allowed
             && policy_allowed
             && quota_allowed;
-        let reason = if !schedule.eligible {
+        let reason = if control.emergency_stop {
+            format!(
+                "operations.emergency_stop: {}",
+                control.reason.as_deref().unwrap_or("emergency stop active")
+            )
+        } else if control.pause_new_work {
+            format!(
+                "operations.paused: {}",
+                control.reason.as_deref().unwrap_or("new work is paused")
+            )
+        } else if !schedule.eligible {
             format!(
                 "{}: task affinity {} does not match {} day {}",
                 schedule.reason_code, schedule.affinity, schedule.day_kind, schedule.local_date
@@ -853,7 +938,13 @@ impl Garnish {
                             .reason
                             .split_once(':')
                             .map(|(code, _)| code)
-                            .filter(|code| code.starts_with("policy."))
+                            .filter(|code| {
+                                code.starts_with("policy.")
+                                    || code.starts_with("operations.")
+                                    || code.starts_with("retry.")
+                                    || code.starts_with("circuit.")
+                                    || code.starts_with("quota_")
+                            })
                             .unwrap_or("quota.unavailable")
                     });
                 self.db.record_scheduler_wake(
@@ -1213,6 +1304,15 @@ impl Garnish {
             )?;
             self.db
                 .finish_run(&run_id, "review", Some(&head_commit), exit_code)?;
+            self.db.enqueue_notification(
+                "review",
+                "info",
+                Some(&task.id),
+                Some(&run_id),
+                "Task ready for review",
+                &format!("{} passed independent verification.", task.title),
+                Utc::now(),
+            )?;
         } else {
             self.db.transition_task(
                 &task.id,
@@ -1222,6 +1322,15 @@ impl Garnish {
             )?;
             self.db
                 .finish_run(&run_id, "failed", Some(&head_commit), exit_code)?;
+            self.db.enqueue_notification(
+                "failure",
+                "error",
+                Some(&task.id),
+                Some(&run_id),
+                "Task verification failed",
+                &format!("{} failed independent verification.", task.title),
+                Utc::now(),
+            )?;
         }
         let events = self.db.events_for_run(&run_id)?;
         evidence.write_events(&events)?;
@@ -1307,6 +1416,34 @@ fn validate_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_project_root_for_platform(root: &Path, wsl2: bool) -> Result<()> {
+    if wsl2 && is_windows_mounted_path(root) {
+        bail!(
+            "wsl.windows_mount_denied: project roots under /mnt/<drive> are denied by default; clone the repository into the WSL2 Linux filesystem"
+        );
+    }
+    Ok(())
+}
+
+fn is_windows_mounted_path(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(std::path::Component::RootDir))
+        && components
+            .next()
+            .is_some_and(|component| component.as_os_str() == "mnt")
+        && components.next().is_some_and(|component| {
+            let value = component.as_os_str().to_string_lossy();
+            value.len() == 1 && value.as_bytes()[0].is_ascii_alphabetic()
+        })
+}
+
+fn is_wsl2() -> bool {
+    std::env::var_os("WSL_INTEROP").is_some()
+        || std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || fs::read_to_string("/proc/sys/kernel/osrelease")
+            .is_ok_and(|release| release.to_ascii_lowercase().contains("microsoft"))
+}
+
 #[cfg(unix)]
 fn secure_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1358,6 +1495,15 @@ mod tests {
             .current_dir(path)
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn wsl2_denies_windows_mounted_project_roots_by_default() {
+        assert!(validate_project_root_for_platform(Path::new("/mnt/c/dev/project"), true).is_err());
+        assert!(validate_project_root_for_platform(Path::new("/mnt/z/project"), true).is_err());
+        assert!(validate_project_root_for_platform(Path::new("/home/user/project"), true).is_ok());
+        assert!(validate_project_root_for_platform(Path::new("/mnt/wsl/project"), true).is_ok());
+        assert!(validate_project_root_for_platform(Path::new("/mnt/c/dev/project"), false).is_ok());
     }
 
     fn task(project_id: String) -> NewTask {
@@ -1481,6 +1627,10 @@ mod tests {
             0
         );
         assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Review);
+        let notifications = garnish.local_notifications(false, 10).unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].kind, "review");
+        assert_eq!(notifications[0].task_id.as_deref(), Some(task.id.as_str()));
     }
 
     #[test]
@@ -1495,6 +1645,42 @@ mod tests {
             .route_task(&task.id, "fake", "fake", "missing")
             .unwrap();
         assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn operational_pause_declines_routes_with_stable_reason() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let task = garnish.add_task(&task(project.id)).unwrap();
+        garnish
+            .set_quota(
+                "fake",
+                "test",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        garnish.pause_new_work("host maintenance").unwrap();
+        let decision = garnish
+            .route_task(&task.id, "fake", "fake", "test")
+            .unwrap();
+        assert!(!decision.allowed);
+        assert_eq!(decision.selected_adapter, None);
+        assert!(decision.reason.starts_with("operations.paused:"));
+        garnish.resume_operations("maintenance complete").unwrap();
+        assert!(
+            garnish
+                .route_task(&task.id, "fake", "fake", "test")
+                .unwrap()
+                .allowed
+        );
     }
 
     #[test]

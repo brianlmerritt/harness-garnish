@@ -118,3 +118,68 @@ fn scheduler_daemon_can_run_one_diagnostic_tick_and_stop_cleanly() {
     assert_eq!(value["ticks"], 1);
     assert_eq!(value["shutdown_reason"], "max_ticks");
 }
+
+#[test]
+fn operational_controls_status_and_backup_are_stable_json() {
+    let dir = tempdir().unwrap();
+    let data = dir.path().join("state");
+    let pause = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "ops",
+            "pause",
+            "--reason",
+            "maintenance",
+        ])
+        .output()
+        .unwrap();
+    assert!(pause.status.success());
+    let value: Value = serde_json::from_slice(&pause.stdout).unwrap();
+    assert_eq!(value["pause_new_work"], true);
+
+    let status = cargo_bin_cmd!("garnish")
+        .args(["--data-dir", data.to_str().unwrap(), "ops", "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let value: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["control"]["pause_new_work"], true);
+
+    let backup_path = dir.path().join("backups/state.db");
+    let backup = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "ops",
+            "backup",
+            "--output",
+            backup_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        backup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+    let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
+    assert_eq!(value["integrity"], "ok");
+    assert_eq!(value["schema_version"], 6);
+    assert!(backup_path.exists());
+
+    let resume = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            data.to_str().unwrap(),
+            "ops",
+            "resume",
+            "--reason",
+            "maintenance complete",
+        ])
+        .output()
+        .unwrap();
+    assert!(resume.status.success());
+    let value: Value = serde_json::from_slice(&resume.stdout).unwrap();
+    assert_eq!(value["pause_new_work"], false);
+}

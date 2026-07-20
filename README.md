@@ -100,6 +100,21 @@ garnish --data-dir .garnish-state runtime retry-limit --task TASK_ID --limit 3
 garnish --data-dir .garnish-state runtime circuits
 ```
 
+Operational controls are durable and emit bounded JSON. `pause` stops new claims; `emergency-stop` also releases unstarted claims and requests graceful cancellation of active runs. Neither command claims a process has stopped until its supervisor records termination evidence.
+
+```console
+garnish --data-dir .garnish-state ops status
+garnish --data-dir .garnish-state ops pause --reason "host maintenance"
+garnish --data-dir .garnish-state ops emergency-stop --reason "credential incident"
+garnish --data-dir .garnish-state ops resume --reason "incident resolved"
+garnish --data-dir .garnish-state ops diagnostics
+garnish --data-dir .garnish-state ops backup
+garnish --data-dir .garnish-state notification list
+garnish --data-dir .garnish-state notification acknowledge NOTIFICATION_ID
+```
+
+Local backups use SQLite `VACUUM INTO`, pass an integrity check, receive mode `0600` on Unix, and return a SHA-256 digest. They are private state backups, not portable support-bundle exports; encrypted export remains separate work.
+
 ### Linux midpoint checkpoint
 
 After cloning the repository on an Ubuntu or Debian host, run the quota-free Linux checkpoint as a dedicated non-root user:
@@ -108,7 +123,17 @@ After cloning the repository on an Ubuntu or Debian host, run the quota-free Lin
 ./scripts/test-linux-midpoint
 ```
 
-It runs formatting, lint, build and tests; exercises bounded and signal-driven daemon shutdown; verifies private state permissions; and reports rootless Podman and Docker health when installed. A container runtime is optional for this checkpoint, but rootless Podman conformance will be required before Linux runtime support is claimed.
+It runs formatting, lint, build and tests; exercises bounded and signal-driven daemon shutdown; verifies private state permissions; and reports rootless Podman and Docker health when installed. The 2026-07-20 VPS run passed this checkpoint and confirmed a healthy rootless Podman capability probe.
+
+### WSL2 exit bundle
+
+Use a current rustup-managed Rust toolchain and keep the checkout in the WSL2 Linux filesystem, not under `/mnt/c` or another Windows drive mount. The project requires Rust 1.97 or newer; Rust edition 2024 is supported normally on WSL2 when the compiler is current.
+
+```console
+./scripts/test-wsl2-exit
+```
+
+The bundle consumes no provider quota. It runs the Linux midpoint, verifies default denial of Windows-mounted project roots, requires a healthy rootless Podman or Docker runtime, exercises operational backup/status, and checks private Linux permissions.
 
 ## Repository authority
 
