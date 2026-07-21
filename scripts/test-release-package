@@ -130,6 +130,11 @@ printf 'fixture\n' > "$fixture_repository/README.md"
 "${fixture_git[@]}" -C "$fixture_repository" commit -q -m fixture
 source_head="$("${fixture_git[@]}" -C "$fixture_repository" rev-parse HEAD)"
 source_status="$("${fixture_git[@]}" -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)"
+if [[ -n "$source_status" ]]; then
+  echo "error: temporary source fixture was not clean before Garnish registration" >&2
+  printf '%s\n' "$source_status" >&2
+  exit 1
+fi
 
 acceptance_step="packaged binary fixture initialization"
 echo "fixture: initializing packaged Garnish state"
@@ -166,9 +171,42 @@ printf '%s\n' "$review_json" | grep -F '"integration_authorized": false' >/dev/n
 printf '%s\n' "$review_json" | grep -F '"result.txt"' >/dev/null
 
 acceptance_step="source immutability and private state verification"
-[[ "$("${fixture_git[@]}" -C "$fixture_repository" rev-parse HEAD)" == "$source_head" ]]
-[[ "$("${fixture_git[@]}" -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)" == "$source_status" ]]
-[[ ! -e "$fixture_repository/result.txt" ]]
+final_source_head="$("${fixture_git[@]}" -C "$fixture_repository" rev-parse HEAD)"
+if [[ "$final_source_head" != "$source_head" ]]; then
+  printf 'error: source fixture HEAD changed: before=%s after=%s\n' \
+    "$source_head" "$final_source_head" >&2
+  exit 1
+fi
+final_source_status="$("${fixture_git[@]}" -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)"
+if ! "${fixture_git[@]}" -C "$fixture_repository" diff --quiet --; then
+  echo "error: Garnish changed a tracked file in the registered source fixture" >&2
+  exit 1
+fi
+if ! "${fixture_git[@]}" -C "$fixture_repository" diff --cached --quiet --; then
+  echo "error: Garnish staged a change in the registered source fixture" >&2
+  exit 1
+fi
+if [[ -z "$final_source_status" ]]; then
+  echo "error: expected Garnish project projections were not created" >&2
+  exit 1
+fi
+while IFS= read -r status_line; do
+  if [[ "$status_line" != "?? .harness-garnish/"* ]]; then
+    echo "error: source fixture change escaped the .harness-garnish projection boundary" >&2
+    printf '%s\n' "$status_line" >&2
+    exit 1
+  fi
+done <<< "$final_source_status"
+for required_projection in PROJECT.md TASKS.md HANDOFF.md; do
+  if [[ ! -f "$fixture_repository/.harness-garnish/$required_projection" ]]; then
+    echo "error: required project projection is missing: $required_projection" >&2
+    exit 1
+  fi
+done
+if [[ -e "$fixture_repository/result.txt" ]]; then
+  echo "error: result.txt was written to the registered source fixture" >&2
+  exit 1
+fi
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
   state_mode="$(stat -f '%Lp' "$fixture_state")"
@@ -177,11 +215,18 @@ else
   state_mode="$(stat -c '%a' "$fixture_state")"
   database_mode="$(stat -c '%a' "$fixture_state/state.db")"
 fi
-[[ "$state_mode" == "700" ]]
-[[ "$database_mode" == "600" ]]
+echo "fixture: observed state permissions directory=$state_mode database=$database_mode"
+if [[ "$state_mode" != "700" ]]; then
+  echo "error: packaged Garnish state directory mode must be 700, observed $state_mode" >&2
+  exit 1
+fi
+if [[ "$database_mode" != "600" ]]; then
+  echo "error: packaged Garnish database mode must be 600, observed $database_mode" >&2
+  exit 1
+fi
 
 echo "packaged binary: garnish $package_version"
 echo "repeated package checksum: deterministic"
 echo "state permissions: directory=$state_mode database=$database_mode"
-echo "fixture result: review passed; source checkout unchanged; integration unauthorized"
+echo "fixture result: review passed; source HEAD/tracked files unchanged; projections confined; integration unauthorized"
 echo "Packaged CLI acceptance passed"

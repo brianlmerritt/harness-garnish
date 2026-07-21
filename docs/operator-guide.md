@@ -46,7 +46,7 @@ garnish task run "$TASK_ID" --adapter fake --provider fake --account test
 garnish task review "$TASK_ID"
 ```
 
-Before accepting the result, confirm that readiness reported `allowed: true`, the final task status is `review`, `verification.passed` is `true`, `handoff.changed_files` contains only `result.txt`, and `integration_authorized` is `false`. Inspect the exact file at `artifacts.patch_path`. The registered source checkout remains unchanged until the operator deliberately integrates the reviewed patch.
+Before accepting the result, confirm that readiness reported `allowed: true`, the final task status is `review`, `verification.passed` is `true`, `handoff.changed_files` contains only `result.txt`, and `integration_authorized` is `false`. Inspect the exact file at `artifacts.patch_path`. The registered source HEAD and tracked project files remain unchanged until the operator deliberately integrates the reviewed patch. Garnish does create and update its bounded human-readable state beneath `.harness-garnish/`; those files are projections of canonical SQLite state, not integration of the task patch.
 
 ## Codex subscription task
 
