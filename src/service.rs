@@ -4,11 +4,11 @@ use crate::{
         probe_docker, probe_podman, run_invocation_with_tick, safe_write,
     },
     api_providers::{
-        ApiFailureKind, ApiProviderResponse, ApiRequestSpec, ApiTerminalStatus, ApiTransport,
-        LiveApiTransport, LiveApiTransportConfig, PreparedApiRequest,
-        api_request_conservative_content_token_bound, api_request_conservative_input_token_bound,
-        api_request_content_digest, api_request_digest, parse_api_transport_response,
-        prepare_api_request,
+        ApiFailureKind, ApiOutputItem, ApiProviderResponse, ApiRequestSpec, ApiTerminalStatus,
+        ApiToolDefinition, ApiTransport, LiveApiTransport, LiveApiTransportConfig,
+        PreparedApiRequest, api_request_conservative_content_token_bound,
+        api_request_conservative_input_token_bound, api_request_content_digest, api_request_digest,
+        parse_api_transport_response, prepare_api_request,
     },
     db::Database,
     domain::{
@@ -39,21 +39,27 @@ use crate::{
 use anyhow::{Result, bail};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 use ulid::Ulid;
 
-const API_TASK_TEMPLATE_VERSION: &str = "task-v1";
+const API_TASK_TEMPLATE_VERSION: &str = "task-v2";
+const API_PATCH_CAPABILITY: &str = "agent.patch_submission";
+const API_PATCH_TOOL: &str = "submit_patch";
+const MAX_API_PATCH_BYTES: usize = 1024 * 1024;
 pub const PAID_API_DAEMON_ACKNOWLEDGEMENT: &str = "I_ACCEPT_PAID_API_TASK_EXECUTION";
+pub const API_PATCH_DAEMON_ACKNOWLEDGEMENT: &str = "I_ACCEPT_ISOLATED_API_PATCH_EXECUTION";
 
 pub struct Garnish {
     data_dir: PathBuf,
     db: Database,
     policy: EffectivePolicy,
+    api_patch_execution_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +95,7 @@ impl Garnish {
             data_dir,
             db,
             policy: EffectivePolicy::default(),
+            api_patch_execution_enabled: false,
         })
     }
 
@@ -1772,12 +1779,8 @@ impl Garnish {
         config: &SchedulerDaemonConfig,
         shutdown: &AtomicBool,
     ) -> Result<SchedulerDaemonSummary> {
+        validate_api_runtime_config(config)?;
         if config.execute_api_claims {
-            if config.paid_api_acknowledgement.as_deref() != Some(PAID_API_DAEMON_ACKNOWLEDGEMENT) {
-                bail!(
-                    "api.execution_acknowledgement_required: --execute-api requires the exact paid API acknowledgement"
-                );
-            }
             let mut transport = LiveApiTransport::new(LiveApiTransportConfig {
                 network_enabled: true,
                 ..LiveApiTransportConfig::default()
@@ -1805,6 +1808,8 @@ impl Garnish {
         N: FnMut() -> DateTime<Utc>,
         S: FnMut(std::time::Duration),
     {
+        self.api_patch_execution_enabled = false;
+        validate_api_runtime_config(config)?;
         if config.max_active_claims == 0
             || config.max_active_per_adapter == 0
             || config.max_active_per_account == 0
@@ -1836,11 +1841,6 @@ impl Garnish {
             config.route_candidates.clone()
         };
         if config.execute_api_claims {
-            if config.paid_api_acknowledgement.as_deref() != Some(PAID_API_DAEMON_ACKNOWLEDGEMENT) {
-                bail!(
-                    "api.execution_acknowledgement_required: --execute-api requires the exact paid API acknowledgement"
-                );
-            }
             if api_transport.is_none() {
                 bail!(
                     "api.transport_unavailable: paid API execution requires an explicit transport"
@@ -1867,62 +1867,64 @@ impl Garnish {
             );
         }
 
-        let started_at = now();
-        self.register_scheduler(
-            &config.instance_id,
-            &config.hostname,
-            std::process::id(),
-            started_at,
-        )?;
-        let leader =
-            self.acquire_scheduler_leader(&config.instance_id, started_at, config.leader_ttl)?;
-        let mut ticks = 0;
-        let mut claims_created = 0;
-        let mut claims_renewed = 0;
-        let mut runs_completed = 0;
-        let mut scheduler_claims_recovered = self.recover_scheduler(started_at)?.len();
-        let mut run_leases_recovered = self.recover_at(started_at)?.len();
-        let mut shutdown_reason = "signal".to_owned();
+        self.api_patch_execution_enabled = config.execute_api_patches;
+        let daemon_result = (|| -> Result<SchedulerDaemonSummary> {
+            let started_at = now();
+            self.register_scheduler(
+                &config.instance_id,
+                &config.hostname,
+                std::process::id(),
+                started_at,
+            )?;
+            let leader =
+                self.acquire_scheduler_leader(&config.instance_id, started_at, config.leader_ttl)?;
+            let mut ticks = 0;
+            let mut claims_created = 0;
+            let mut claims_renewed = 0;
+            let mut runs_completed = 0;
+            let mut scheduler_claims_recovered = self.recover_scheduler(started_at)?.len();
+            let mut run_leases_recovered = self.recover_at(started_at)?.len();
+            let mut shutdown_reason = "signal".to_owned();
 
-        let loop_result: Result<()> = (|| {
-            loop {
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                let tick_at = now();
-                self.heartbeat_scheduler_leader(
-                    &config.instance_id,
-                    leader.generation,
-                    tick_at,
-                    config.leader_ttl,
-                )?;
-                claims_renewed += self.db.heartbeat_scheduler_claims(
-                    &config.instance_id,
-                    leader.generation,
-                    tick_at,
-                    config.claim_ttl,
-                )?;
-                scheduler_claims_recovered += self.recover_scheduler(tick_at)?.len();
-                run_leases_recovered += self.recover_at(tick_at)?.len();
-                let tick = self.scheduler_tick_candidates_with_limits_at(
-                    &config.instance_id,
-                    leader.generation,
-                    &route_targets,
-                    tick_at,
-                    config.max_active_claims,
-                    config.max_active_per_adapter,
-                    config.max_active_per_account,
-                    config.claim_ttl,
-                )?;
-                ticks += 1;
-                claims_created += tick.claims.len();
-                if config.execute_fake_claims || config.execute_api_claims {
-                    for claim in &tick.claims {
-                        let route_decision_id =
-                            claim.route_decision_id.as_deref().ok_or_else(|| {
-                                anyhow::anyhow!("claim {} has no route decision", claim.id)
-                            })?;
-                        let route = tick
+            let loop_result: Result<()> = (|| {
+                loop {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let tick_at = now();
+                    self.heartbeat_scheduler_leader(
+                        &config.instance_id,
+                        leader.generation,
+                        tick_at,
+                        config.leader_ttl,
+                    )?;
+                    claims_renewed += self.db.heartbeat_scheduler_claims(
+                        &config.instance_id,
+                        leader.generation,
+                        tick_at,
+                        config.claim_ttl,
+                    )?;
+                    scheduler_claims_recovered += self.recover_scheduler(tick_at)?.len();
+                    run_leases_recovered += self.recover_at(tick_at)?.len();
+                    let tick = self.scheduler_tick_candidates_with_limits_at(
+                        &config.instance_id,
+                        leader.generation,
+                        &route_targets,
+                        tick_at,
+                        config.max_active_claims,
+                        config.max_active_per_adapter,
+                        config.max_active_per_account,
+                        config.claim_ttl,
+                    )?;
+                    ticks += 1;
+                    claims_created += tick.claims.len();
+                    if config.execute_fake_claims || config.execute_api_claims {
+                        for claim in &tick.claims {
+                            let route_decision_id =
+                                claim.route_decision_id.as_deref().ok_or_else(|| {
+                                    anyhow::anyhow!("claim {} has no route decision", claim.id)
+                                })?;
+                            let route = tick
                             .decisions
                             .iter()
                             .find(|decision| decision.id == route_decision_id)
@@ -1933,69 +1935,73 @@ impl Garnish {
                                     claim.id
                                 )
                             })?;
-                        let selected_adapter = route.selected_adapter.clone().ok_or_else(|| {
-                            anyhow::anyhow!("allowed route has no selected adapter")
-                        })?;
-                        if selected_adapter.starts_with("fake") && config.execute_fake_claims {
-                            self.run_scheduler_claim(
-                                claim,
-                                &config.instance_id,
-                                leader.generation,
-                                &selected_adapter,
-                                route,
-                                tick_at,
-                            )?;
-                            runs_completed += 1;
-                        } else if selected_adapter == "api" && config.execute_api_claims {
-                            let transport = api_transport.as_deref_mut().ok_or_else(|| {
+                            let selected_adapter =
+                                route.selected_adapter.clone().ok_or_else(|| {
+                                    anyhow::anyhow!("allowed route has no selected adapter")
+                                })?;
+                            if selected_adapter.starts_with("fake") && config.execute_fake_claims {
+                                self.run_scheduler_claim(
+                                    claim,
+                                    &config.instance_id,
+                                    leader.generation,
+                                    &selected_adapter,
+                                    route,
+                                    tick_at,
+                                )?;
+                                runs_completed += 1;
+                            } else if selected_adapter == "api" && config.execute_api_claims {
+                                let transport = api_transport.as_deref_mut().ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "api.transport_unavailable: paid API execution requires an explicit transport"
                                 )
                             })?;
-                            self.run_scheduler_api_claim(
-                                claim,
-                                &config.instance_id,
-                                leader.generation,
-                                route,
-                                transport,
-                                tick_at,
-                            )?;
-                            runs_completed += 1;
+                                self.run_scheduler_api_claim(
+                                    claim,
+                                    &config.instance_id,
+                                    leader.generation,
+                                    route,
+                                    transport,
+                                    tick_at,
+                                )?;
+                                runs_completed += 1;
+                            }
                         }
                     }
+                    if config.max_ticks.is_some_and(|limit| ticks >= limit) {
+                        shutdown_reason = "max_ticks".to_owned();
+                        break;
+                    }
+                    sleep(config.poll_interval);
                 }
-                if config.max_ticks.is_some_and(|limit| ticks >= limit) {
-                    shutdown_reason = "max_ticks".to_owned();
-                    break;
-                }
-                sleep(config.poll_interval);
-            }
-            Ok(())
-        })();
+                Ok(())
+            })();
 
-        let stopped_at = now();
-        let stop_result = self.stop_scheduler(&config.instance_id, stopped_at);
-        match (loop_result, stop_result) {
-            (Err(error), Ok(_)) => Err(error),
-            (Err(error), Err(stop_error)) => {
-                Err(error.context(format!("also failed to stop scheduler: {stop_error:#}")))
+            let stopped_at = now();
+            let stop_result = self.stop_scheduler(&config.instance_id, stopped_at);
+            match (loop_result, stop_result) {
+                (Err(error), Ok(_)) => Err(error),
+                (Err(error), Err(stop_error)) => {
+                    Err(error.context(format!("also failed to stop scheduler: {stop_error:#}")))
+                }
+                (Ok(()), Err(error)) => Err(error),
+                (Ok(()), Ok(released_task_ids)) => Ok(SchedulerDaemonSummary {
+                    instance_id: config.instance_id.clone(),
+                    leader_generation: leader.generation,
+                    started_at,
+                    stopped_at,
+                    ticks,
+                    claims_created,
+                    claims_renewed,
+                    runs_completed,
+                    scheduler_claims_recovered,
+                    run_leases_recovered,
+                    released_task_ids,
+                    shutdown_reason,
+                }),
             }
-            (Ok(()), Err(error)) => Err(error),
-            (Ok(()), Ok(released_task_ids)) => Ok(SchedulerDaemonSummary {
-                instance_id: config.instance_id.clone(),
-                leader_generation: leader.generation,
-                started_at,
-                stopped_at,
-                ticks,
-                claims_created,
-                claims_renewed,
-                runs_completed,
-                scheduler_claims_recovered,
-                run_leases_recovered,
-                released_task_ids,
-                shutdown_reason,
-            }),
-        }
+        })();
+        self.api_patch_execution_enabled = false;
+        daemon_result
     }
 
     fn route_task_candidates_at(
@@ -2080,13 +2086,18 @@ impl Garnish {
                 decision.candidates[0].reason_code = reason_code.into();
                 decision.candidates[0].filter_reason = reason;
             }
-            if target.adapter == "api" && decision.allowed && task.risk_class != 0 {
+            if target.adapter == "api"
+                && decision.allowed
+                && let Err(error) = api_patch_mode(&task, self.api_patch_execution_enabled)
+            {
+                let reason = error.to_string();
+                let reason_code = api_error_reason_code(&reason);
                 decision.allowed = false;
                 decision.selected_adapter = None;
                 decision.selected_provider = None;
                 decision.selected_account = None;
-                decision.reason_code = "api.execution_tools_unavailable".into();
-                decision.reason = "api.execution_tools_unavailable: direct API scheduler execution is response-only and permits only risk-class 0 tasks".into();
+                decision.reason_code = reason_code.into();
+                decision.reason = reason;
                 decision.candidates[0].allowed = false;
                 decision.candidates[0].reason_code = decision.reason_code.clone();
                 decision.candidates[0].filter_reason = decision.reason.clone();
@@ -2791,11 +2802,12 @@ impl Garnish {
                 task.status
             );
         }
-        if task.risk_class != 0 {
-            bail!(
-                "api.execution_tools_unavailable: direct API scheduler execution is response-only and permits only risk-class 0 tasks"
-            );
-        }
+        let patch_mode = api_patch_mode(&task, self.api_patch_execution_enabled)?;
+        let allowed_patch_paths = if patch_mode {
+            Some(validated_patch_scope(&task)?)
+        } else {
+            None
+        };
         let (plan, spec, _) = self.planned_api_request_for_version_at(
             &task,
             claim.task_version,
@@ -2838,11 +2850,14 @@ impl Garnish {
                 return Err(error);
             }
         };
-        let sandbox = direct_api_attestation(provider);
-        match self
-            .policy
-            .authorize(task.risk_class, sandbox.secure_container)
-        {
+        let sandbox = direct_api_attestation(provider, Path::new(&worktree.path), patch_mode);
+        let policy_decision = if patch_mode {
+            self.policy.authorize_isolated_patch(task.risk_class, true)
+        } else {
+            self.policy
+                .authorize(task.risk_class, sandbox.secure_container)
+        };
+        match policy_decision {
             PolicyDecision::Allow => {}
             PolicyDecision::RequireApproval => bail!(
                 "task risk class {} requires approval before claim consumption",
@@ -2914,12 +2929,56 @@ impl Garnish {
                 "currency": execution.spend.currency,
             }),
         )?;
-        if execution.response.terminal_status != ApiTerminalStatus::Completed {
+        let expected_status = if patch_mode {
+            ApiTerminalStatus::ToolUse
+        } else {
+            ApiTerminalStatus::Completed
+        };
+        if execution.response.terminal_status != expected_status {
             self.fail_scheduler_api_run(&task, &run_id, "api.non_completed_response", now)?;
             bail!(
-                "api.non_completed_response: provider returned {:?}",
-                execution.response.terminal_status
+                "api.non_completed_response: provider returned {:?}; expected {:?}",
+                execution.response.terminal_status,
+                expected_status
             );
+        }
+        if patch_mode {
+            let apply_result = (|| {
+                let patch = extract_api_patch(&execution.response)?;
+                git::apply_untrusted_patch(Path::new(&worktree.path), patch.as_bytes())?;
+                let changed_files = git::changed_files(Path::new(&worktree.path))?;
+                validate_applied_patch_paths(
+                    Path::new(&worktree.path),
+                    &changed_files,
+                    allowed_patch_paths
+                        .as_ref()
+                        .expect("patch scope was validated before execution"),
+                )?;
+                self.db.append_run_event(
+                    &task.id,
+                    &run_id,
+                    "api.patch_applied",
+                    "control_plane",
+                    &serde_json::json!({
+                        "tool": API_PATCH_TOOL,
+                        "patch_bytes": patch.len(),
+                        "patch_sha256": hex::encode(Sha256::digest(patch.as_bytes())),
+                        "changed_files": changed_files,
+                    }),
+                )?;
+                Ok::<(), anyhow::Error>(())
+            })();
+            if let Err(error) = apply_result {
+                let reason_code = api_error_reason_code(&error.to_string()).to_owned();
+                if let Err(finish_error) =
+                    self.fail_scheduler_api_run(&task, &run_id, &reason_code, now)
+                {
+                    return Err(error.context(format!(
+                        "also failed to terminalise rejected API patch run: {finish_error:#}"
+                    )));
+                }
+                return Err(error);
+            }
         }
         self.finish_agent_run(
             task,
@@ -2930,10 +2989,17 @@ impl Garnish {
             run_id,
             sandbox,
             false,
-            vec![
-                "direct API response content is not persisted or applied to the worktree".into(),
-                "independent verification evaluates the unchanged isolated worktree".into(),
-            ],
+            if patch_mode {
+                vec![
+                    "the control plane applied one validated submit_patch result to the isolated task worktree".into(),
+                    "independent verification evaluates the resulting patch in a separate detached worktree".into(),
+                ]
+            } else {
+                vec![
+                    "direct API response content is not persisted or applied to the worktree".into(),
+                    "independent verification evaluates the unchanged isolated worktree".into(),
+                ]
+            },
         )
     }
 
@@ -3330,6 +3396,7 @@ fn render_task_api_request(
     max_output_tokens: u64,
     stream: bool,
 ) -> Result<ApiRequestSpec> {
+    let patch_mode = task_requests_api_patch(task);
     let input = serde_json::to_string(&serde_json::json!({
         "task_id": task.id,
         "task_version": task.version,
@@ -3343,13 +3410,36 @@ fn render_task_api_request(
         "risk_class": task.risk_class,
         "required_capabilities": task.required_capabilities,
     }))?;
+    let tools = if patch_mode {
+        vec![ApiToolDefinition {
+            name: API_PATCH_TOOL.into(),
+            description: "Submit exactly one UTF-8 git patch for deterministic validation and application to the isolated task worktree. Do not include binary data, links, submodules, renames, or out-of-scope files.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "A complete unified git diff beginning with diff --git"
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+        }]
+    } else {
+        vec![]
+    };
     Ok(ApiRequestSpec {
         provider: provider.into(),
         model: model.into(),
-        instructions: "Execute only the supplied canonical task. Respect scope and return a concise implementation result with verification evidence.".into(),
+        instructions: if patch_mode {
+            "Execute only the supplied canonical task. Return exactly one submit_patch tool call containing a UTF-8 git diff. Change only exact paths listed in scope; do not call any other tool or return prose.".into()
+        } else {
+            "Execute only the supplied canonical task. Respect scope and return a concise implementation result with verification evidence.".into()
+        },
         input,
         max_output_tokens,
-        tools: vec![],
+        tools,
         stream,
     })
 }
@@ -3562,15 +3652,23 @@ fn evaluate_adapter_capabilities(adapter: &str, required: &[String]) -> (bool, S
 }
 
 fn api_adapter_capabilities() -> Vec<String> {
-    vec!["agent.headless".into(), "agent.tool_policy".into()]
+    vec![
+        "agent.headless".into(),
+        "agent.tool_policy".into(),
+        API_PATCH_CAPABILITY.into(),
+    ]
 }
 
-fn direct_api_attestation(provider: &str) -> SandboxAttestation {
+fn direct_api_attestation(provider: &str, worktree: &Path, patch_mode: bool) -> SandboxAttestation {
     SandboxAttestation {
         backend: "host-direct-api".into(),
         secure_container: false,
         image: "not-applicable".into(),
-        writable_mounts: vec![],
+        writable_mounts: if patch_mode {
+            vec![worktree.to_string_lossy().into_owned()]
+        } else {
+            vec![]
+        },
         network: format!("fixed-https:{provider}"),
         user: "current-host-user".into(),
         container_socket_mounted: false,
@@ -3583,12 +3681,149 @@ fn direct_api_attestation(provider: &str) -> SandboxAttestation {
         effective_capabilities: None,
         capability_evidence_source: Some("compiled-direct-transport".into()),
         inherited_proxy_environment: vec![],
-        reasons: vec![
-            "provider receives only the bounded request; no worktree or repository tool is exposed"
-                .into(),
-            "response content is not persisted or applied to the isolated worktree".into(),
-        ],
+        reasons: if patch_mode {
+            vec![
+                "provider receives only the bounded request and exposes no shell, filesystem, or network tool".into(),
+                "the deterministic control plane may apply one validated patch to the named isolated worktree".into(),
+            ]
+        } else {
+            vec![
+                "provider receives only the bounded request; no worktree or repository tool is exposed".into(),
+                "response content is not persisted or applied to the isolated worktree".into(),
+            ]
+        },
     }
+}
+
+fn validate_api_runtime_config(config: &SchedulerDaemonConfig) -> Result<()> {
+    if config.execute_api_claims {
+        if config.paid_api_acknowledgement.as_deref() != Some(PAID_API_DAEMON_ACKNOWLEDGEMENT) {
+            bail!(
+                "api.execution_acknowledgement_required: --execute-api requires the exact paid API acknowledgement"
+            );
+        }
+    } else if config.paid_api_acknowledgement.is_some() {
+        bail!("api.execution_disabled: paid API acknowledgement is invalid without --execute-api");
+    }
+    if config.execute_api_patches {
+        if !config.execute_api_claims {
+            bail!("api.patch_execution_disabled: --execute-api-patches requires --execute-api");
+        }
+        if config.api_patch_acknowledgement.as_deref() != Some(API_PATCH_DAEMON_ACKNOWLEDGEMENT) {
+            bail!(
+                "api.patch_acknowledgement_required: --execute-api-patches requires the exact isolated patch acknowledgement"
+            );
+        }
+    } else if config.api_patch_acknowledgement.is_some() {
+        bail!(
+            "api.patch_execution_disabled: patch acknowledgement is invalid without --execute-api-patches"
+        );
+    }
+    Ok(())
+}
+
+fn task_requests_api_patch(task: &Task) -> bool {
+    task.required_capabilities
+        .iter()
+        .any(|capability| capability == API_PATCH_CAPABILITY)
+}
+
+fn api_patch_mode(task: &Task, enabled: bool) -> Result<bool> {
+    match (task.risk_class, task_requests_api_patch(task), enabled) {
+        (0, false, _) => Ok(false),
+        (1, true, true) => Ok(true),
+        (1, true, false) => bail!(
+            "api.patch_execution_disabled: risk-class 1 API patch tasks require the separately acknowledged patch runtime"
+        ),
+        (0, true, _) => {
+            bail!("api.patch_risk_mismatch: agent.patch_submission requires risk class 1")
+        }
+        (1, false, _) => bail!(
+            "api.execution_tools_unavailable: risk-class 1 API tasks must explicitly require agent.patch_submission"
+        ),
+        (2 | 3, _, _) => {
+            bail!("api.approval_required: API patch execution is limited to risk class 1")
+        }
+        _ => bail!("api.risk_denied: unsupported task risk class"),
+    }
+}
+
+fn validated_patch_scope(task: &Task) -> Result<BTreeSet<String>> {
+    if task.scope.is_empty() {
+        bail!("api.patch_scope_invalid: patch tasks require at least one exact path");
+    }
+    let mut allowed = BTreeSet::new();
+    for relative in &task.scope {
+        let path = Path::new(relative);
+        let valid = !relative.is_empty()
+            && !relative.contains('\\')
+            && path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+            && !matches!(relative.as_str(), ".git" | ".harness-garnish")
+            && !relative.starts_with(".git/")
+            && !relative.starts_with(".harness-garnish/");
+        if !valid {
+            bail!(
+                "api.patch_scope_invalid: scope entries must be exact safe repository-relative paths"
+            );
+        }
+        allowed.insert(relative.clone());
+    }
+    Ok(allowed)
+}
+
+fn extract_api_patch(response: &ApiProviderResponse) -> Result<String> {
+    let [
+        ApiOutputItem::ToolCall {
+            name, arguments, ..
+        },
+    ] = response.output.as_slice()
+    else {
+        bail!("api.patch_tool_result_invalid: expected exactly one tool call");
+    };
+    if name != API_PATCH_TOOL {
+        bail!("api.patch_tool_denied: provider called an unexpected tool");
+    }
+    let object = arguments.as_object().ok_or_else(|| {
+        anyhow::anyhow!("api.patch_arguments_invalid: submit_patch arguments must be an object")
+    })?;
+    if object.len() != 1 || !object.contains_key("patch") {
+        bail!("api.patch_arguments_invalid: submit_patch requires only the patch field");
+    }
+    let patch = object["patch"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("api.patch_arguments_invalid: patch must be a string"))?;
+    if patch.is_empty() {
+        bail!("api.patch_empty: submit_patch returned an empty patch");
+    }
+    if patch.len() > MAX_API_PATCH_BYTES {
+        bail!("api.patch_too_large: patch exceeds the 1 MiB limit");
+    }
+    Ok(patch.to_owned())
+}
+
+fn validate_applied_patch_paths(
+    worktree: &Path,
+    changed_files: &[String],
+    allowed: &BTreeSet<String>,
+) -> Result<()> {
+    if changed_files.is_empty() {
+        bail!("api.patch_empty: applied patch changed no files");
+    }
+    for relative in changed_files {
+        if !allowed.contains(relative) {
+            bail!("api.patch_scope_denied: patch changed out-of-scope path {relative}");
+        }
+        let target = worktree.join(relative);
+        if target
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            bail!("api.patch_type_denied: patch created or changed a symbolic link");
+        }
+    }
+    Ok(())
 }
 
 fn api_error_reason_code(message: &str) -> &str {
@@ -4643,6 +4878,157 @@ mod tests {
         assert!(result.spend.output_tokens <= 32);
         assert_eq!(result.spend.cost_micros, 0);
         assert_eq!(result.spend.currency, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "real-paid-api-patch: requires the explicit scripts/test-real-api-patch-smoke opt-in"]
+    fn real_paid_api_patch_smoke_is_explicit_scoped_and_verified() {
+        use std::time::Duration as StdDuration;
+
+        const ACKNOWLEDGEMENT: &str = "I_ACCEPT_ONE_PAID_API_PATCH_REQUEST";
+        assert_eq!(
+            std::env::var("GARNISH_ACKNOWLEDGE_PAID_API_PATCH").as_deref(),
+            Ok(ACKNOWLEDGEMENT),
+            "the paid API patch acknowledgement is missing or incorrect"
+        );
+        let provider = std::env::var("GARNISH_REAL_API_PROVIDER")
+            .expect("GARNISH_REAL_API_PROVIDER is required");
+        assert!(matches!(provider.as_str(), "openai" | "anthropic"));
+        let model =
+            std::env::var("GARNISH_REAL_API_MODEL").expect("GARNISH_REAL_API_MODEL is required");
+        let secret_reference = std::env::var("GARNISH_REAL_API_SECRET_REFERENCE")
+            .expect("GARNISH_REAL_API_SECRET_REFERENCE is required");
+
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        fixture_repo(&source);
+        let now = Utc::now();
+        let data_dir = directory.path().join("data");
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish
+            .add_project("real-api-patch-smoke", "Real API patch smoke", &source)
+            .unwrap();
+        let mut new_task = task(project.id.clone());
+        new_task.title = "Create the exact scoped smoke-test file".into();
+        new_task.goal = "Create result.txt containing exactly one line: done".into();
+        new_task.required_capabilities = vec![API_PATCH_CAPABILITY.into()];
+        new_task.fake_write_path = None;
+        new_task.fake_write_content = None;
+        let task = garnish.add_task(&new_task).unwrap();
+        garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id,
+                provider: provider.clone(),
+                account: "smoke".into(),
+                enabled: true,
+                secret_reference,
+                currency: None,
+                currency_limit_micros: None,
+                token_limit: Some(100_000),
+                request_limit: Some(1),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::minutes(10),
+                allowed_models: vec![model.clone()],
+                allowed_tools: vec![API_PATCH_TOOL.into()],
+                allowed_roles: vec!["implementer".into()],
+                max_output_tokens: 512,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "explicit one-request paid API patch smoke test".into(),
+            })
+            .unwrap();
+        garnish
+            .set_task_route_pin(
+                &task.id,
+                "api",
+                &provider,
+                "smoke",
+                "explicit paid API patch smoke",
+            )
+            .unwrap();
+        garnish
+            .configure_api_request_plan_at(
+                &NewApiRequestPlan {
+                    task_id: task.id.clone(),
+                    provider: provider.clone(),
+                    account: "smoke".into(),
+                    enabled: true,
+                    model: model.clone(),
+                    role: "implementer".into(),
+                    max_input_tokens: 65_536,
+                    max_output_tokens: 512,
+                    max_retries: 0,
+                    stream: false,
+                    reason: "exact one-request paid API patch smoke".into(),
+                },
+                now,
+            )
+            .unwrap();
+        let config = SchedulerDaemonConfig {
+            instance_id: "real-api-patch-smoke".into(),
+            hostname: "local".into(),
+            adapter: "api".into(),
+            provider: provider.clone(),
+            account: "smoke".into(),
+            route_candidates: vec![],
+            max_active_claims: 1,
+            max_active_per_adapter: 1,
+            max_active_per_account: 1,
+            poll_interval: StdDuration::from_secs(1),
+            leader_ttl: StdDuration::from_secs(30),
+            claim_ttl: StdDuration::from_secs(300),
+            max_ticks: Some(1),
+            execute_fake_claims: false,
+            execute_api_claims: true,
+            paid_api_acknowledgement: Some(PAID_API_DAEMON_ACKNOWLEDGEMENT.into()),
+            execute_api_patches: true,
+            api_patch_acknowledgement: Some(API_PATCH_DAEMON_ACKNOWLEDGEMENT.into()),
+        };
+        let mut transport = LiveApiTransport::new(LiveApiTransportConfig {
+            network_enabled: true,
+            connect_timeout: StdDuration::from_secs(10),
+            request_timeout: StdDuration::from_secs(120),
+            max_response_bytes: 1024 * 1024,
+        })
+        .unwrap();
+        let summary = garnish
+            .run_scheduler_daemon_with(
+                &config,
+                &AtomicBool::new(false),
+                Some(&mut transport),
+                Utc::now,
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(summary.claims_created, 1);
+        assert_eq!(summary.runs_completed, 1);
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Review);
+        assert_eq!(
+            fs::read_to_string(
+                data_dir
+                    .join("worktrees/real-api-patch-smoke")
+                    .join(&task.id)
+                    .join("result.txt")
+            )
+            .unwrap(),
+            "done\n"
+        );
+        assert!(!source.join("result.txt").exists());
+        assert_eq!(
+            garnish
+                .api_reservations(Some("real-api-patch-smoke"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            garnish
+                .api_spend(Some("real-api-patch-smoke"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -6558,6 +6944,8 @@ mod tests {
             execute_fake_claims: false,
             execute_api_claims: false,
             paid_api_acknowledgement: None,
+            execute_api_patches: false,
+            api_patch_acknowledgement: None,
         };
         let shutdown = AtomicBool::new(false);
         let mut instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
@@ -6620,6 +7008,8 @@ mod tests {
             execute_fake_claims: true,
             execute_api_claims: false,
             paid_api_acknowledgement: None,
+            execute_api_patches: false,
+            api_patch_acknowledgement: None,
         };
         let shutdown = AtomicBool::new(false);
         let mut instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
@@ -6814,6 +7204,8 @@ mod tests {
             execute_fake_claims: false,
             execute_api_claims: true,
             paid_api_acknowledgement: Some(PAID_API_DAEMON_ACKNOWLEDGEMENT.into()),
+            execute_api_patches: false,
+            api_patch_acknowledgement: None,
         };
         let shutdown = AtomicBool::new(false);
         let mut transport = SchedulerApiTransport {
@@ -6999,6 +7391,273 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn daemon_applies_exactly_scoped_api_patches_for_both_providers_with_fake_transports() {
+        use crate::api_providers::ApiTransportResponse;
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        struct PatchTransport {
+            provider: &'static str,
+            patch_path: &'static str,
+            sends: usize,
+        }
+
+        impl ApiTransport for PatchTransport {
+            fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse> {
+                self.sends += 1;
+                request.with_sensitive_parts(|endpoint, _, _, _, secret, body| {
+                    assert_eq!(secret, b"patch-api-secret-canary");
+                    assert_eq!(
+                        endpoint,
+                        match self.provider {
+                            "openai" => "https://api.openai.com/v1/responses",
+                            "anthropic" => "https://api.anthropic.com/v1/messages",
+                            _ => unreachable!(),
+                        }
+                    );
+                    let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+                    assert_eq!(body["tools"][0]["name"], API_PATCH_TOOL);
+                });
+                let patch = format!(
+                    "diff --git a/{0} b/{0}\nnew file mode 100644\n--- /dev/null\n+++ b/{0}\n@@ -0,0 +1 @@\n+done\n",
+                    self.patch_path
+                );
+                let body = match self.provider {
+                    "openai" => serde_json::json!({
+                        "id": "response_patch_fixture",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "model-fixture",
+                        "output": [{
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": "call_patch_fixture",
+                            "name": API_PATCH_TOOL,
+                            "arguments": serde_json::to_string(&serde_json::json!({"patch": patch})).unwrap()
+                        }],
+                        "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
+                    }),
+                    "anthropic" => serde_json::json!({
+                        "id": "message_patch_fixture",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "model-fixture",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "tool_patch_fixture",
+                            "name": API_PATCH_TOOL,
+                            "input": {"patch": patch}
+                        }],
+                        "stop_reason": "tool_use",
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 8, "output_tokens": 2}
+                    }),
+                    _ => unreachable!(),
+                };
+                ApiTransportResponse::new(
+                    200,
+                    "request_patch_fixture".into(),
+                    serde_json::to_vec(&body).unwrap(),
+                    false,
+                )
+            }
+        }
+
+        for provider in ["openai", "anthropic"] {
+            let dir = tempdir().unwrap();
+            let source = dir.path().join("source");
+            fixture_repo(&source);
+            let secret_path = dir.path().join("provider-key");
+            let mut secret_file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&secret_path)
+                .unwrap();
+            writeln!(secret_file, "patch-api-secret-canary").unwrap();
+            drop(secret_file);
+
+            let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 21, 12, 0, 0).unwrap();
+            let data_dir = dir.path().join("data");
+            let mut garnish = Garnish::open(&data_dir).unwrap();
+            match provider {
+                "openai" => garnish.policy.openai_api_enabled = true,
+                "anthropic" => garnish.policy.anthropic_api_enabled = true,
+                _ => unreachable!(),
+            }
+            let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+            let mut new_task = task(project.id.clone());
+            new_task.required_capabilities = vec![API_PATCH_CAPABILITY.into()];
+            new_task.fake_write_path = None;
+            new_task.fake_write_content = None;
+            let task = garnish.add_task(&new_task).unwrap();
+            garnish
+                .configure_api_budget(&NewApiBudget {
+                    project_id: project.id.clone(),
+                    provider: provider.into(),
+                    account: "paid".into(),
+                    enabled: true,
+                    secret_reference: format!("file:{}", secret_path.display()),
+                    currency: Some("USD".into()),
+                    currency_limit_micros: Some(1_000_000),
+                    token_limit: Some(100_000),
+                    request_limit: Some(1),
+                    period_start: now - Duration::minutes(1),
+                    period_end: now + Duration::days(1),
+                    allowed_models: vec!["model-fixture".into()],
+                    allowed_tools: vec![API_PATCH_TOOL.into()],
+                    allowed_roles: vec!["implementer".into()],
+                    max_output_tokens: 1_000,
+                    max_retries: 0,
+                    max_concurrent_requests: 1,
+                    reason: "explicit fixture patch budget".into(),
+                })
+                .unwrap();
+            garnish
+                .configure_api_model_price(&NewApiModelPrice {
+                    provider: provider.into(),
+                    account: "paid".into(),
+                    model: "model-fixture".into(),
+                    currency: "USD".into(),
+                    input_micros_per_million: 1_000_000,
+                    cached_input_micros_per_million: 500_000,
+                    cache_creation_input_micros_per_million: 1_500_000,
+                    output_micros_per_million: 2_000_000,
+                    effective_from: now - Duration::minutes(1),
+                    effective_to: Some(now + Duration::days(1)),
+                    source: "fixture price evidence".into(),
+                    reason: "explicit fixture patch price".into(),
+                })
+                .unwrap();
+            garnish
+                .set_task_route_pin(&task.id, "api", provider, "paid", "explicit API patch")
+                .unwrap();
+            garnish
+                .configure_api_request_plan_at(
+                    &NewApiRequestPlan {
+                        task_id: task.id.clone(),
+                        provider: provider.into(),
+                        account: "paid".into(),
+                        enabled: true,
+                        model: "model-fixture".into(),
+                        role: "implementer".into(),
+                        max_input_tokens: 10_000,
+                        max_output_tokens: 500,
+                        max_retries: 0,
+                        stream: false,
+                        reason: "exact API patch request".into(),
+                    },
+                    now,
+                )
+                .unwrap();
+            let config = SchedulerDaemonConfig {
+                instance_id: format!("daemon-{provider}-patch"),
+                hostname: "fixture".into(),
+                adapter: "api".into(),
+                provider: provider.into(),
+                account: "paid".into(),
+                route_candidates: vec![],
+                max_active_claims: 1,
+                max_active_per_adapter: 1,
+                max_active_per_account: 1,
+                poll_interval: std::time::Duration::from_secs(1),
+                leader_ttl: std::time::Duration::from_secs(10),
+                claim_ttl: std::time::Duration::from_secs(10),
+                max_ticks: Some(1),
+                execute_fake_claims: false,
+                execute_api_claims: true,
+                paid_api_acknowledgement: Some(PAID_API_DAEMON_ACKNOWLEDGEMENT.into()),
+                execute_api_patches: true,
+                api_patch_acknowledgement: Some(API_PATCH_DAEMON_ACKNOWLEDGEMENT.into()),
+            };
+            let mut transport = PatchTransport {
+                provider,
+                patch_path: "result.txt",
+                sends: 0,
+            };
+            let mut instant = now;
+            let summary = garnish
+                .run_scheduler_daemon_with(
+                    &config,
+                    &AtomicBool::new(false),
+                    Some(&mut transport),
+                    || {
+                        let current = instant;
+                        instant += Duration::seconds(1);
+                        current
+                    },
+                    |_| {},
+                )
+                .unwrap();
+
+            assert_eq!(transport.sends, 1);
+            assert_eq!(summary.runs_completed, 1);
+            assert!(!garnish.api_patch_execution_enabled);
+            assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Review);
+            let result = data_dir
+                .join("worktrees/fixture")
+                .join(&task.id)
+                .join("result.txt");
+            assert_eq!(fs::read_to_string(result).unwrap(), "done\n");
+            assert!(!source.join("result.txt").exists());
+            let implementer = garnish
+                .db
+                .run_records_for_task(&task.id)
+                .unwrap()
+                .into_iter()
+                .find(|run| run.adapter == "api")
+                .unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(
+                    data_dir
+                        .join("runs")
+                        .join(implementer.id)
+                        .join("manifest.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["sandbox"]["backend"], "host-direct-api");
+            assert_eq!(manifest["sandbox"]["secure_container"], false);
+            assert_eq!(
+                manifest["sandbox"]["writable_mounts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                garnish.api_reservations(Some("fixture")).unwrap()[0].status,
+                "settled"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_scope_gate_rejects_an_out_of_scope_patch_in_the_isolated_worktree() {
+        // The dual-provider fixture above proves the accepted path. This assertion exercises the
+        // final exact-scope gate directly after a patch has been safely confined to a worktree.
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let worktree =
+            git::create_task_worktree(&source, &dir.path().join("worktree"), "01OUTOFSCOPE")
+                .unwrap();
+        let patch = b"diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-fixture\n+changed\n";
+        git::apply_untrusted_patch(Path::new(&worktree.path), patch).unwrap();
+        let changed = git::changed_files(Path::new(&worktree.path)).unwrap();
+        let allowed = BTreeSet::from(["result.txt".to_owned()]);
+        let error = validate_applied_patch_paths(Path::new(&worktree.path), &changed, &allowed)
+            .unwrap_err();
+        assert!(error.to_string().contains("api.patch_scope_denied"));
+        assert_eq!(
+            fs::read_to_string(source.join("README.md")).unwrap(),
+            "fixture\n"
+        );
+    }
+
     #[test]
     fn paid_api_daemon_requires_exact_runtime_acknowledgement_before_claiming() {
         let dir = tempdir().unwrap();
@@ -7020,6 +7679,8 @@ mod tests {
             execute_fake_claims: false,
             execute_api_claims: true,
             paid_api_acknowledgement: Some("NOT_ACCEPTED".into()),
+            execute_api_patches: false,
+            api_patch_acknowledgement: None,
         };
         let shutdown = AtomicBool::new(false);
         let error = garnish

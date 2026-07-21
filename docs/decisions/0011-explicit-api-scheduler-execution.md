@@ -1,6 +1,6 @@
 # ADR 0011: Explicitly pinned paid API scheduler execution
 
-- Status: accepted
+- Status: accepted; response-only limitation partially superseded by ADR 0012
 - Date: 2026-07-21
 - Supersedes: the scheduler activation boundary in ADR 0010
 

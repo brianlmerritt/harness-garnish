@@ -940,6 +940,8 @@ pub struct SchedulerDaemonConfig {
     pub execute_fake_claims: bool,
     pub execute_api_claims: bool,
     pub paid_api_acknowledgement: Option<String>,
+    pub execute_api_patches: bool,
+    pub api_patch_acknowledgement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

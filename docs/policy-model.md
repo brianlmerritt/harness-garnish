@@ -165,6 +165,8 @@ OpenAI and Anthropic API providers are disabled by default. Enabling one per pro
 
 Budget evaluation uses actual spend where reported and a conservative estimate otherwise. A request is denied when its maximum reservation could exceed remaining budget. Budget changes are Class 2 or 3 according to the monetary impact.
 
+Direct API repository changes use only the built-in `submit_patch` boundary. The task must be Class 1, explicitly require `agent.patch_submission`, declare exact safe repository-relative scope, and use a tool-allowlisted budget plus the separate session patch acknowledgement. The provider receives no shell or filesystem authority. Garnish may deterministically validate and apply one bounded UTF-8 patch only to a clean isolated task worktree when branch-change policy allows it; exact post-apply scope and a separate detached verifier remain mandatory. This exception does not authorize general host writes or Class 2/3 effects.
+
 ## Network policy
 
 Network is off in the main execution phase by default. Setup may receive a domain/registry allowlist and is recorded as a separate phase. IP-only or wildcard grants require stronger approval. Redirects are revalidated. Localhost access to control, runtime, metadata, or credential services is denied from task containers unless explicitly required through a scoped proxy.

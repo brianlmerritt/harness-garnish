@@ -171,7 +171,7 @@ fn api_budget_configuration_is_explicit_and_stable_json() {
     );
     let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(plan["task_id"], task_id);
-    assert_eq!(plan["template_version"], "task-v1");
+    assert_eq!(plan["template_version"], "task-v2");
     assert_eq!(plan["request_digest"].as_str().unwrap().len(), 64);
 
     let output = cargo_bin_cmd!("garnish")
@@ -597,6 +597,46 @@ fn scheduler_daemon_paid_api_execution_requires_exact_acknowledgement() {
             .as_str()
             .unwrap()
             .contains("api.execution_acknowledgement_required")
+    );
+}
+
+#[test]
+fn scheduler_daemon_api_patch_execution_requires_a_second_exact_acknowledgement() {
+    let dir = tempdir().unwrap();
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "scheduler",
+            "daemon",
+            "--instance",
+            "cli-api-patch-denied",
+            "--candidate",
+            "api:openai:paid",
+            "--execute-api",
+            "--acknowledge-paid-api",
+            "I_ACCEPT_PAID_API_TASK_EXECUTION",
+            "--execute-api-patches",
+            "--poll-milliseconds",
+            "1",
+            "--leader-ttl-seconds",
+            "2",
+            "--claim-ttl-seconds",
+            "2",
+            "--max-ticks",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["ok"], false);
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("api.patch_acknowledgement_required")
     );
 }
 

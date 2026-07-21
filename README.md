@@ -182,7 +182,15 @@ Paid scheduler execution has a separate, conspicuous runtime gate. The following
 garnish --data-dir .garnish-state scheduler daemon --instance paid-local --candidate api:openai:ACCOUNT --execute-api --acknowledge-paid-api I_ACCEPT_PAID_API_TASK_EXECUTION
 ```
 
-The acknowledgement is session-scoped and enables only the named API provider candidates; a budget or environment variable alone remains inert. This first direct scheduler executor accepts only risk-class 0 tasks because it exposes no repository-write tool. Direct API responses are not persisted or applied as repository changes. The run records an honest host-direct-API attestation rather than claiming container isolation, and a completed response advances only through the task's predeclared independent verifier against the unchanged isolated worktree. Tasks requiring code changes are denied as `api.execution_tools_unavailable` until a separately reviewed tool/patch execution boundary exists.
+The acknowledgement is session-scoped and enables only the named API provider candidates; a budget or environment variable alone remains inert. Risk-class 0 execution remains response-only: direct API responses are not persisted or applied as repository changes. The run records an honest host-direct-API attestation rather than claiming container isolation, and a completed response advances only through the task's predeclared independent verifier against the unchanged isolated worktree.
+
+An implementation task has a separate, narrower patch boundary. It must be risk class 1, explicitly require `agent.patch_submission`, declare exact file paths in scope, use a budget that allowlists `submit_patch`, and have a current exact request plan. The daemon additionally requires both patch flags below. The provider receives only that single typed tool—never a shell or filesystem—and Garnish applies one bounded UTF-8 git diff to the isolated task worktree after structural checks. Binary patches, links, submodules, renames, copies, extra calls/arguments, and paths outside exact scope fail the task. A separate detached worktree independently verifies the resulting patch.
+
+```console
+garnish --data-dir .garnish-state scheduler daemon --instance paid-patch-local --candidate api:openai:ACCOUNT --execute-api --acknowledge-paid-api I_ACCEPT_PAID_API_TASK_EXECUTION --execute-api-patches --acknowledge-api-patches I_ACCEPT_ISOLATED_API_PATCH_EXECUTION
+```
+
+This command can make multiple chargeable requests within the explicitly configured task and project budgets. The second acknowledgement is session-scoped and does not authorize risk classes 2 or 3, general tool execution, source-checkout writes, or automatic integration. ADR 0012 records the exact boundary.
 
 ### Explicit paid API smoke test
 
@@ -200,6 +208,13 @@ export GARNISH_ACKNOWLEDGE_PAID_API='I_ACCEPT_ONE_PAID_API_REQUEST'
 ```
 
 For Anthropic, use `ANTHROPIC_API_KEY`, provider `anthropic`, secret reference `env:ANTHROPIC_API_KEY`, and an exact Anthropic model ID. No API call is required for the current development checkpoint; run this only when explicitly choosing to spend one request.
+
+`scripts/test-real-api-patch-smoke` is the separately ignored, one-request implementation diagnostic. It creates only a temporary repository and Garnish state, asks the selected provider for one exact `result.txt` patch, verifies that patch in a separate worktree, and proves the source checkout remains unchanged. It may incur a provider charge and is never part of normal testing. With the same provider, model, and secret-reference variables shown above, replace the response-smoke acknowledgement with:
+
+```console
+export GARNISH_ACKNOWLEDGE_PAID_API_PATCH='I_ACCEPT_ONE_PAID_API_PATCH_REQUEST'
+./scripts/test-real-api-patch-smoke
+```
 
 Successful fake execution now creates separate implementer and verifier run records. The quota-free `garnish-command-verifier:local:default` is independently selected, receives a clean detached verification worktree and its own evidence directory, and runs only the task's predeclared verification argv. It is a deterministic command verifier, not a claim of semantic agent review. Default policy requires a different verifier adapter; project policy can also require a different provider.
 

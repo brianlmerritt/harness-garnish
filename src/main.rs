@@ -686,6 +686,19 @@ struct SchedulerDaemonArgs {
         help = "Required literal acknowledgement for paid daemon execution"
     )]
     acknowledge_paid_api: Option<String>,
+    #[arg(
+        long,
+        requires = "execute_api",
+        help = "Allow validated submit_patch tool results for explicitly opted-in risk-class 1 API tasks"
+    )]
+    execute_api_patches: bool,
+    #[arg(
+        long,
+        value_name = "ACKNOWLEDGEMENT",
+        requires = "execute_api_patches",
+        help = "Required literal acknowledgement for isolated paid API patch application"
+    )]
+    acknowledge_api_patches: Option<String>,
 }
 
 #[derive(Args)]
@@ -1077,6 +1090,8 @@ fn run() -> Result<()> {
                     execute_fake_claims: args.execute_fake,
                     execute_api_claims: args.execute_api,
                     paid_api_acknowledgement: args.acknowledge_paid_api,
+                    execute_api_patches: args.execute_api_patches,
+                    api_patch_acknowledgement: args.acknowledge_api_patches,
                 };
                 print_json(&garnish.run_scheduler_daemon(&config, &SCHEDULER_SHUTDOWN)?)
             }

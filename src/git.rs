@@ -2,9 +2,12 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
+
+const MAX_UNTRUSTED_PATCH_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
@@ -59,7 +62,6 @@ pub fn create_verification_worktree(
             .stderr(Stdio::piped())
             .spawn()
             .context("starting git apply for verifier")?;
-        use std::io::Write;
         child
             .stdin
             .take()
@@ -254,6 +256,50 @@ pub fn changed_files(worktree: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+pub fn apply_untrusted_patch(worktree: &Path, patch: &[u8]) -> Result<()> {
+    if patch.is_empty() {
+        bail!("api.patch_empty: submit_patch returned an empty patch");
+    }
+    if patch.len() > MAX_UNTRUSTED_PATCH_BYTES {
+        bail!("api.patch_too_large: patch exceeds the 1 MiB limit");
+    }
+    let text =
+        std::str::from_utf8(patch).context("api.patch_encoding: patch must be valid UTF-8")?;
+    if text.as_bytes().contains(&0) || text.contains("GIT binary patch") {
+        bail!("api.patch_binary_denied: binary patches are not allowed");
+    }
+    if !text.contains("diff --git ") {
+        bail!("api.patch_format: patch must contain a git diff");
+    }
+    for denied in [
+        "new file mode 120000",
+        "old mode 120000",
+        "new mode 120000",
+        "new file mode 160000",
+        "old mode 160000",
+        "new mode 160000",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+    ] {
+        if text.lines().any(|line| line.starts_with(denied)) {
+            bail!("api.patch_type_denied: links, submodules, renames, and copies are not allowed");
+        }
+    }
+    if has_user_changes(&snapshot(worktree)?.status_porcelain_v2) {
+        bail!("api.patch_worktree_dirty: isolated worktree must be clean before patch application");
+    }
+    run_git_apply(
+        worktree,
+        &["apply", "--check", "--whitespace=error-all", "-"],
+        patch,
+    )
+    .context("api.patch_check_failed")?;
+    run_git_apply(worktree, &["apply", "--whitespace=error-all", "-"], patch)
+        .context("api.patch_apply_failed")
+}
+
 pub fn head(worktree: &Path) -> Result<String> {
     Ok(git_text(worktree, &["rev-parse", "HEAD"])?
         .trim()
@@ -291,6 +337,27 @@ fn git_output(repository: &Path, args: &[&str]) -> Result<Output> {
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("executing git {}", args.join(" ")))
+}
+
+fn run_git_apply(repository: &Path, args: &[&str], input: &[u8]) -> Result<()> {
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(repository)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("executing git {}", args.join(" ")))?;
+    child
+        .stdin
+        .take()
+        .context("opening git apply stdin")?
+        .write_all(input)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -390,5 +457,36 @@ mod tests {
             "verified\n"
         );
         assert!(!source.join("result.txt").exists());
+    }
+
+    #[test]
+    fn untrusted_patch_is_applied_only_to_a_clean_worktree() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        init_repo(&source);
+        let destination = dir.path().join("worktree");
+        create_task_worktree(&source, &destination, "01PATCH").unwrap();
+        let patch = b"diff --git a/result.txt b/result.txt\nnew file mode 100644\n--- /dev/null\n+++ b/result.txt\n@@ -0,0 +1 @@\n+done\n";
+        apply_untrusted_patch(&destination, patch).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("result.txt")).unwrap(),
+            "done\n"
+        );
+        assert!(!source.join("result.txt").exists());
+    }
+
+    #[test]
+    fn untrusted_patch_rejects_binary_links_and_dirty_worktrees() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        init_repo(&source);
+        let destination = dir.path().join("worktree");
+        create_task_worktree(&source, &destination, "01DENY").unwrap();
+        assert!(apply_untrusted_patch(&destination, b"GIT binary patch\0").is_err());
+        let link = b"diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+target\n";
+        assert!(apply_untrusted_patch(&destination, link).is_err());
+        fs::write(destination.join("dirty.txt"), "dirty\n").unwrap();
+        let patch = b"diff --git a/result.txt b/result.txt\nnew file mode 100644\n--- /dev/null\n+++ b/result.txt\n@@ -0,0 +1 @@\n+done\n";
+        assert!(apply_untrusted_patch(&destination, patch).is_err());
     }
 }

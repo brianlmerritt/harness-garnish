@@ -33,10 +33,12 @@ cargo fmt --check
 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
   -u GARNISH_REAL_API_PROVIDER -u GARNISH_REAL_API_MODEL \
   -u GARNISH_REAL_API_SECRET_REFERENCE -u GARNISH_ACKNOWLEDGE_PAID_API \
+  -u GARNISH_ACKNOWLEDGE_PAID_API_PATCH \
   cargo clippy --locked --workspace --all-targets -- -D warnings
 env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
   -u GARNISH_REAL_API_PROVIDER -u GARNISH_REAL_API_MODEL \
   -u GARNISH_REAL_API_SECRET_REFERENCE -u GARNISH_ACKNOWLEDGE_PAID_API \
+  -u GARNISH_ACKNOWLEDGE_PAID_API_PATCH \
   cargo test --locked --workspace
 
 echo "Phase 4 quota-free portability checkpoint passed on $platform"

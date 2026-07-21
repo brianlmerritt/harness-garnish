@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+required=(
+  GARNISH_REAL_API_PROVIDER
+  GARNISH_REAL_API_MODEL
+  GARNISH_REAL_API_SECRET_REFERENCE
+  GARNISH_ACKNOWLEDGE_PAID_API_PATCH
+)
+for name in "${required[@]}"; do
+  if [[ -z "${!name:-}" ]]; then
+    echo "error: $name is required" >&2
+    exit 2
+  fi
+done
+
+case "$GARNISH_REAL_API_PROVIDER" in
+  openai) endpoint='https://api.openai.com/v1/responses' ;;
+  anthropic) endpoint='https://api.anthropic.com/v1/messages' ;;
+  *)
+    echo 'error: GARNISH_REAL_API_PROVIDER must be openai or anthropic' >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$GARNISH_ACKNOWLEDGE_PAID_API_PATCH" != 'I_ACCEPT_ONE_PAID_API_PATCH_REQUEST' ]]; then
+  echo 'error: GARNISH_ACKNOWLEDGE_PAID_API_PATCH must equal I_ACCEPT_ONE_PAID_API_PATCH_REQUEST' >&2
+  exit 2
+fi
+
+case "$GARNISH_REAL_API_SECRET_REFERENCE" in
+  env:*)
+    secret_name="${GARNISH_REAL_API_SECRET_REFERENCE#env:}"
+    if [[ ! "$secret_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ || -z "${!secret_name:-}" ]]; then
+      echo 'error: the referenced credential environment variable is invalid or unavailable' >&2
+      exit 2
+    fi
+    ;;
+  file:*)
+    secret_path="${GARNISH_REAL_API_SECRET_REFERENCE#file:}"
+    if [[ "$secret_path" != /* || ! -f "$secret_path" ]]; then
+      echo 'error: file: must name an existing absolute credential file' >&2
+      exit 2
+    fi
+    ;;
+  keychain:*)
+    if [[ "$(uname -s)" != 'Darwin' ]]; then
+      echo 'error: keychain: credential references require macOS' >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo 'error: the credential reference must use env:, file:, or keychain:' >&2
+    exit 2
+    ;;
+esac
+
+echo 'REAL PAID API PATCH SMOKE TEST'
+echo "provider: $GARNISH_REAL_API_PROVIDER"
+echo "model: $GARNISH_REAL_API_MODEL"
+echo "endpoint: $endpoint"
+echo "credential reference: $GARNISH_REAL_API_SECRET_REFERENCE (value will not be printed)"
+echo 'network requests: exactly 1; redirects, proxies, and implicit HTTP retries disabled'
+echo 'maximum output: 512 tokens; request timeout: 120 seconds; response limit: 1 MiB'
+echo 'cost: the provider may charge this request; request/token ceilings apply but no currency price is inferred'
+echo 'filesystem: temporary Git repository and state only; source checkout must remain unchanged'
+echo 'authority: one submit_patch call, exact result.txt scope, no provider shell or filesystem access'
+echo 'verification: a separate detached worktree must confirm result.txt contains done'
+
+cargo test --locked service::tests::real_paid_api_patch_smoke_is_explicit_scoped_and_verified \
+  -- --ignored --exact --nocapture

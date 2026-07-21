@@ -61,6 +61,20 @@ impl EffectivePolicy {
         }
     }
 
+    pub fn authorize_isolated_patch(&self, effect_class: u8, exact_scope: bool) -> PolicyDecision {
+        match effect_class {
+            1 if exact_scope && self.allow_branch_changes => PolicyDecision::Allow,
+            1 if !exact_scope => {
+                PolicyDecision::Deny("isolated API patches require exact task scope".into())
+            }
+            1 => PolicyDecision::Deny("policy denies isolated worktree branch changes".into()),
+            2 | 3 => PolicyDecision::RequireApproval,
+            _ => PolicyDecision::Deny(
+                "isolated API patch authorization is limited to effect class 1".into(),
+            ),
+        }
+    }
+
     pub fn api_allowed(&self, provider: &str) -> bool {
         match provider {
             "openai" => self.openai_api_enabled,
@@ -104,5 +118,30 @@ mod tests {
         assert!(!policy.allow_branch_changes);
         assert!(!policy.allow_local_commit);
         assert!(!policy.allow_remote_git);
+    }
+
+    #[test]
+    fn isolated_patch_requires_class_one_exact_scope_and_branch_policy() {
+        let policy = EffectivePolicy::default();
+        assert_eq!(
+            policy.authorize_isolated_patch(1, true),
+            PolicyDecision::Allow
+        );
+        assert!(matches!(
+            policy.authorize_isolated_patch(1, false),
+            PolicyDecision::Deny(_)
+        ));
+        assert!(matches!(
+            policy.authorize_isolated_patch(0, true),
+            PolicyDecision::Deny(_)
+        ));
+        assert_eq!(
+            policy.authorize_isolated_patch(2, true),
+            PolicyDecision::RequireApproval
+        );
+        assert!(matches!(
+            EffectivePolicy::for_garnish_repository().authorize_isolated_patch(1, true),
+            PolicyDecision::Deny(_)
+        ));
     }
 }

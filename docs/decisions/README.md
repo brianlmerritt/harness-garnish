@@ -12,6 +12,7 @@
 | [0008](0008-historical-usage-forecasting.md) | Explicit usage evidence with conservative identity-scoped forecasts | Accepted |
 | [0009](0009-independent-verifier-runs.md) | Separate verifier selection, run identity, clean worktree, and evidence | Accepted |
 | [0010](0010-direct-api-transport.md) | Direct TLS provider transport with explicit paid-smoke opt-in and no hidden replay | Accepted; scheduler activation boundary superseded by 0011 |
-| [0011](0011-explicit-api-scheduler-execution.md) | Explicitly pinned paid API scheduler execution with a session acknowledgement | Accepted |
+| [0011](0011-explicit-api-scheduler-execution.md) | Explicitly pinned paid API scheduler execution with a session acknowledgement | Accepted; response-only limitation partially superseded by 0012 |
+| [0012](0012-controlled-api-patch-submission.md) | Controlled, exactly scoped API patch submission to an isolated worktree | Accepted |
 
 ADRs describe decisions, not implementation completion. A changed decision is recorded by a new ADR that supersedes the old one.
