@@ -26,5 +26,5 @@ The supervisor renews halfway through each checkpoint interval and re-evaluates 
 - Model-directed commands can inspect the isolated checkout but cannot write it or access Garnish's MCP registration state.
 - Garnish, not the model, owns the only write step, exact-scope validation, verification, and review handoff.
 - The one-task acknowledgement has literal effect and bounds accidental subscription consumption per daemon invocation.
-- Normal tests use a fake Codex executable and consume no subscription quota. A separately opted-in Codex 0.144.6 fixture task passed on macOS after a compatibility regression established the bounded progress-message rule; this is narrow live evidence, not general or cross-platform conformance.
+- Normal tests use a fake Codex executable and consume no subscription quota. Separately opted-in Codex 0.144.6 fixture tasks passed on macOS, native Linux, and WSL2 after bounded regressions established the progress-message and exact Node-launcher rules; this is narrow live boundary evidence, not a broader quality or production-readiness claim.
 - Claude Code, Antigravity, AoE, executable MCP servers, and automatic Git integration remain outside this CLI MVP.
