@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repository_root"
+
+test_root="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$test_root"
+}
+trap cleanup EXIT
+
+quota_free_env=(
+  env
+  -u OPENAI_API_KEY
+  -u ANTHROPIC_API_KEY
+  -u ANTHROPIC_AUTH_TOKEN
+  -u GARNISH_DATA_DIR
+  -u GARNISH_REAL_API_PROVIDER
+  -u GARNISH_REAL_API_MODEL
+  -u GARNISH_REAL_API_SECRET_REFERENCE
+  -u GARNISH_ACKNOWLEDGE_PAID_API
+  -u GARNISH_ACKNOWLEDGE_PAID_API_PATCH
+  -u GARNISH_API_SMOKE_RECEIPT_DIR
+  -u GARNISH_REAL_CODEX_REMAINING_PERCENT
+  -u GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION
+  -u GARNISH_CODEX_SMOKE_RECEIPT_DIR
+  -u GARNISH_REAL_DOCKER_IMAGE
+  -u GARNISH_REAL_PODMAN_IMAGE
+)
+
+echo "PACKAGED CLI ACCEPTANCE TEST"
+echo "provider credentials and live-test acknowledgements: removed from the package and test processes"
+echo "network/provider use: none; deterministic fake task only"
+
+GARNISH_RELEASE_OUTPUT_DIR="$test_root/packages" \
+GARNISH_PACKAGE_ALLOW_DIRTY='I_ACCEPT_TESTING_AN_UNCOMMITTED_PACKAGE' \
+  "${quota_free_env[@]}" ./scripts/package-release
+
+first_archive_checksum="$(awk 'NR == 1 {print $1}' "$test_root/packages/SHA256SUMS")"
+GARNISH_RELEASE_OUTPUT_DIR="$test_root/packages" \
+GARNISH_PACKAGE_ALLOW_DIRTY='I_ACCEPT_TESTING_AN_UNCOMMITTED_PACKAGE' \
+  "${quota_free_env[@]}" ./scripts/package-release >/dev/null
+second_archive_checksum="$(awk 'NR == 1 {print $1}' "$test_root/packages/SHA256SUMS")"
+if [[ -z "$first_archive_checksum" || "$first_archive_checksum" != "$second_archive_checksum" ]]; then
+  echo "error: repeated native packaging was not deterministic" >&2
+  exit 1
+fi
+
+mapfile_compatible_archives=()
+while IFS= read -r archive; do
+  mapfile_compatible_archives+=("$archive")
+done < <(find "$test_root/packages" -maxdepth 1 -type f -name 'harness-garnish-*.tar.gz' -print | LC_ALL=C sort)
+
+if [[ "${#mapfile_compatible_archives[@]}" != "1" ]]; then
+  echo "error: package test expected exactly one native archive" >&2
+  exit 1
+fi
+archive_path="${mapfile_compatible_archives[0]}"
+
+(
+  cd "$test_root/packages"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c SHA256SUMS
+  else
+    shasum -a 256 -c SHA256SUMS
+  fi
+)
+
+mkdir -p "$test_root/extracted"
+tar -xzf "$archive_path" -C "$test_root/extracted"
+package_root="$(find "$test_root/extracted" -mindepth 1 -maxdepth 1 -type d -print)"
+if [[ -z "$package_root" || "$(printf '%s\n' "$package_root" | wc -l | tr -d ' ')" != "1" ]]; then
+  echo "error: package test expected exactly one extracted package directory" >&2
+  exit 1
+fi
+
+packaged_binary="$package_root/bin/garnish"
+[[ -x "$packaged_binary" ]]
+[[ -f "$package_root/README.md" ]]
+[[ -f "$package_root/LICENSE" ]]
+[[ -f "$package_root/VERSION" ]]
+[[ -f "$package_root/MANIFEST.txt" ]]
+[[ -f "$package_root/docs/installation.md" ]]
+[[ -f "$package_root/docs/operator-guide.md" ]]
+[[ -z "$(find "$package_root" -type l -print -quit)" ]]
+
+package_version="$(tr -d '\r\n' < "$package_root/VERSION")"
+"${quota_free_env[@]}" "$packaged_binary" --version | grep -Fx "garnish $package_version"
+"${quota_free_env[@]}" "$packaged_binary" --help | grep -F 'Harness Garnish local control plane'
+
+fixture_repository="$test_root/repository"
+fixture_state="$test_root/state"
+git init -q --initial-branch=main "$fixture_repository"
+git -C "$fixture_repository" config user.email fixture@example.invalid
+git -C "$fixture_repository" config user.name Fixture
+printf 'fixture\n' > "$fixture_repository/README.md"
+git -C "$fixture_repository" add README.md
+git -C "$fixture_repository" commit -q -m fixture
+source_head="$(git -C "$fixture_repository" rev-parse HEAD)"
+source_status="$(git -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)"
+
+"${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" init >/dev/null
+"${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
+  project add --slug package-test --title 'Package test' --path "$fixture_repository" >/dev/null
+"${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
+  quota set --provider fake --account test --surface five_hour --remaining-percent 90 >/dev/null
+
+task_json="$("${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
+  task add --project package-test --title 'Packaged fixture' --goal 'Create result.txt' \
+  --accept 'result.txt contains done' --verify-argv '["grep","-qx","done","result.txt"]' \
+  --scope result.txt --non-scope 'all other files; Git integration' --risk-class 1 \
+  --fake-write-path result.txt --fake-write-content done)"
+task_id="$(printf '%s\n' "$task_json" | sed -n 's/.*"id": "\([^"]*\)".*/\1/p' | head -1)"
+if [[ -z "$task_id" ]]; then
+  echo "error: package test could not read the task ID" >&2
+  exit 1
+fi
+
+readiness_json="$("${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
+  task readiness "$task_id" --adapter fake --provider fake --account test)"
+printf '%s\n' "$readiness_json" | grep -F '"allowed": true' >/dev/null
+
+"${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
+  task run "$task_id" --adapter fake --provider fake --account test >/dev/null
+review_json="$("${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" task review "$task_id")"
+printf '%s\n' "$review_json" | grep -F '"status": "review"' >/dev/null
+printf '%s\n' "$review_json" | grep -F '"passed": true' >/dev/null
+printf '%s\n' "$review_json" | grep -F '"integration_authorized": false' >/dev/null
+printf '%s\n' "$review_json" | grep -F '"result.txt"' >/dev/null
+
+[[ "$(git -C "$fixture_repository" rev-parse HEAD)" == "$source_head" ]]
+[[ "$(git -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)" == "$source_status" ]]
+[[ ! -e "$fixture_repository/result.txt" ]]
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  state_mode="$(stat -f '%Lp' "$fixture_state")"
+  database_mode="$(stat -f '%Lp' "$fixture_state/state.db")"
+else
+  state_mode="$(stat -c '%a' "$fixture_state")"
+  database_mode="$(stat -c '%a' "$fixture_state/state.db")"
+fi
+[[ "$state_mode" == "700" ]]
+[[ "$database_mode" == "600" ]]
+
+echo "packaged binary: garnish $package_version"
+echo "repeated package checksum: deterministic"
+echo "state permissions: directory=$state_mode database=$database_mode"
+echo "fixture result: review passed; source checkout unchanged; integration unauthorized"
+echo "Packaged CLI acceptance passed"

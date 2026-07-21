@@ -55,3 +55,7 @@ No automatic subscription-to-API fallback was enabled or exercised.
 ## Conclusion
 
 The repository now has an accepted CLI MVP for source-based local operation. The next practical product milestone is packaging plus concise operator workflows; executable MCP and additional agent systems remain later, separately accepted capabilities.
+
+## Subsequent distributable slice
+
+After this source-run exit, ADR 0015 added native versioned archives, checksum manifests, installation instructions, task-oriented operator instructions, and a quota-free acceptance script that executes the extracted binary. The macOS Apple Silicon package acceptance passes locally. Native-Linux and WSL2 package acceptance remain required before recording a complete initial packaging matrix; this later work does not alter the revision-specific source-run result above.

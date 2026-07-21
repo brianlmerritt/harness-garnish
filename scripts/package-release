@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repository_root"
+
+release_output_dir="${GARNISH_RELEASE_OUTPUT_DIR:-$repository_root/target/release-packages}"
+dirty_acknowledgement="${GARNISH_PACKAGE_ALLOW_DIRTY:-}"
+normalized_timestamp="198001010000"
+
+case "$(rustc -vV | sed -n 's/^host: //p')" in
+  aarch64-apple-darwin)
+    release_platform="macos-aarch64"
+    ;;
+  x86_64-unknown-linux-gnu)
+    release_platform="linux-x86_64"
+    ;;
+  *)
+    echo "error: unsupported native release target; accepted targets are aarch64-apple-darwin and x86_64-unknown-linux-gnu" >&2
+    exit 1
+    ;;
+esac
+
+source_tree="clean"
+if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then
+  if [[ "$dirty_acknowledgement" != "I_ACCEPT_TESTING_AN_UNCOMMITTED_PACKAGE" ]]; then
+    echo "error: release packaging requires a clean source tree" >&2
+    echo "error: scripts/test-release-package supplies a test-only dirty-tree acknowledgement during development" >&2
+    exit 1
+  fi
+  source_tree="dirty-test-only"
+  echo "warning: creating a test-only package from an uncommitted source tree" >&2
+fi
+
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+  else
+    echo "error: sha256sum or shasum is required" >&2
+    return 1
+  fi
+}
+
+cargo build --release --locked
+
+release_binary="$repository_root/target/release/garnish"
+[[ -x "$release_binary" ]]
+release_version="$($release_binary --version | sed -n 's/^garnish //p')"
+if [[ -z "$release_version" || "$release_version" == *[!0-9A-Za-z.+-]* ]]; then
+  echo "error: packaged binary returned an invalid version" >&2
+  exit 1
+fi
+
+package_name="harness-garnish-$release_version-$release_platform"
+archive_name="$package_name.tar.gz"
+mkdir -p "$release_output_dir"
+
+staging_directory="$(mktemp -d)"
+cleanup() {
+  rm -rf -- "$staging_directory"
+}
+trap cleanup EXIT
+
+package_root="$staging_directory/$package_name"
+mkdir -p "$package_root/bin" "$package_root/docs"
+install -m 0755 "$release_binary" "$package_root/bin/garnish"
+install -m 0644 README.md "$package_root/README.md"
+install -m 0644 LICENSE "$package_root/LICENSE"
+install -m 0644 docs/installation.md "$package_root/docs/installation.md"
+install -m 0644 docs/operator-guide.md "$package_root/docs/operator-guide.md"
+
+printf '%s\n' "$release_version" > "$package_root/VERSION"
+printf '%s\n' \
+  "package=$package_name" \
+  "version=$release_version" \
+  "platform=$release_platform" \
+  "rust_host=$(rustc -vV | sed -n 's/^host: //p')" \
+  "source_revision=$(git rev-parse HEAD)" \
+  "source_tree=$source_tree" \
+  "files:" \
+  "bin/garnish" \
+  "README.md" \
+  "LICENSE" \
+  "docs/installation.md" \
+  "docs/operator-guide.md" \
+  "VERSION" > "$package_root/MANIFEST.txt"
+
+find "$package_root" -type d -exec chmod 0755 {} +
+find "$package_root" -type f ! -path '*/bin/garnish' -exec chmod 0644 {} +
+find "$package_root" -exec touch -t "$normalized_timestamp" {} +
+
+tar_list="$staging_directory/tar-list.txt"
+(
+  cd "$staging_directory"
+  find "$package_name" -print | LC_ALL=C sort > "$tar_list"
+)
+
+archive_path="$release_output_dir/$archive_name"
+if tar --version 2>/dev/null | head -1 | grep -q 'GNU tar'; then
+  (
+    cd "$staging_directory"
+    tar --no-recursion --format=ustar --owner=0 --group=0 --numeric-owner \
+      --mtime='@315532800' -cf - -T "$tar_list"
+  ) | gzip -n > "$archive_path"
+else
+  (
+    cd "$staging_directory"
+    tar --no-recursion --format=ustar --uid 0 --gid 0 --uname root --gname root \
+      --numeric-owner -cf - -T "$tar_list"
+  ) | gzip -n > "$archive_path"
+fi
+chmod 0644 "$archive_path"
+
+checksum_temporary="$(mktemp "$release_output_dir/.SHA256SUMS.XXXXXX")"
+while IFS= read -r candidate; do
+  printf '%s  %s\n' "$(sha256_file "$candidate")" "$(basename "$candidate")" >> "$checksum_temporary"
+done < <(find "$release_output_dir" -maxdepth 1 -type f -name 'harness-garnish-*.tar.gz' -print | LC_ALL=C sort)
+chmod 0644 "$checksum_temporary"
+mv -f "$checksum_temporary" "$release_output_dir/SHA256SUMS"
+
+printf 'release archive: %s\n' "$archive_path"
+printf 'checksum manifest: %s\n' "$release_output_dir/SHA256SUMS"
+printf 'source tree: %s\n' "$source_tree"

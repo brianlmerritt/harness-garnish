@@ -36,6 +36,21 @@ Harness Garnish is not an API proxy, a provider-limit bypass, an autonomous merg
 - [MVP acceptance tests](docs/mvp-acceptance.md)
 - [Architecture decision records](docs/decisions/README.md)
 
+## Install and operate the CLI MVP
+
+The source-run CLI MVP can now be installed through Cargo or packaged as a versioned native archive. The complete supported-platform, checksum, state, upgrade, and uninstall contract is in the [installation and binary-packaging guide](docs/installation.md). The [CLI operator guide](docs/operator-guide.md) provides complete quota-free fixture, Codex subscription, paid API, dashboard, backup, and recovery workflows using the installed `garnish` command.
+
+Create and exercise the current native archive before distributing it. These commands make no provider request, consume no subscription or paid API quota, and publish nothing:
+
+Placeholders: none.
+
+```console
+./scripts/package-release
+./scripts/test-release-package
+```
+
+The accepted initial package targets are Apple Silicon macOS and x86-64 GNU/Linux, including x86-64 WSL2. Archives are checksummed but not signed or notarized. ADR 0015 records the release boundary.
+
 ## Phase 1 quick start
 
 Rust 1.97 or newer and Git are required. All normal tests use fake agents and consume no provider quota or API budget.

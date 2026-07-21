@@ -16,5 +16,6 @@
 | [0012](0012-controlled-api-patch-submission.md) | Controlled, exactly scoped API patch submission to an isolated worktree | Accepted |
 | [0013](0013-default-deny-mcp-registration.md) | Default-deny MCP registration before any execution boundary | Accepted |
 | [0014](0014-controlled-codex-subscription-patch-execution.md) | One-task, read-only Codex subscription execution with exact-scope patch application | Accepted |
+| [0015](0015-native-cli-release-archives.md) | Versioned native CLI archives with checksums and quota-free installed-binary acceptance | Accepted |
 
 ADRs describe decisions, not implementation completion. A changed decision is recorded by a new ADR that supersedes the old one.

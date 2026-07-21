@@ -50,3 +50,5 @@ jobs:
           -u GARNISH_CODEX_SMOKE_RECEIPT_DIR
           -u GARNISH_REAL_DOCKER_IMAGE -u GARNISH_REAL_PODMAN_IMAGE
           cargo test --locked --workspace
+      - name: Package and test installed binary without provider quota
+        run: ./scripts/test-release-package
