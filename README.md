@@ -10,7 +10,7 @@ Phase 3 is complete. Its schema-14 multi-agent capability routing, quota observa
 
 Phase 4 is in progress. Its network-free first slice adds project-scoped API budgets and atomic paid-usage reservations before any real OpenAI or Anthropic request is enabled; see [`docs/phase-4-plan.md`](docs/phase-4-plan.md).
 
-The narrower source-run CLI MVP is complete. Its implemented boundary, cross-platform fixture results, separately opted-in live evidence, and explicit deferrals are recorded in [`docs/cli-mvp-exit-report.md`](docs/cli-mvp-exit-report.md). This does not change the broader Phase 4 status.
+The historical narrow source-run CLI compatibility slice is complete. Its implemented boundary, cross-platform fixture results, separately opted-in live evidence, and explicit deferrals are recorded in [`docs/cli-mvp-exit-report.md`](docs/cli-mvp-exit-report.md). It is not the intended task-by-task product interface. The authoritative to-be project-supervisor and CLI contract is [`docs/cli-bible.md`](docs/cli-bible.md); this does not change the broader Phase 4 implementation status or claim those future capabilities are complete.
 
 ## Confirmed direction
 
@@ -36,9 +36,9 @@ Harness Garnish is not an API proxy, a provider-limit bypass, an autonomous merg
 - [MVP acceptance tests](docs/mvp-acceptance.md)
 - [Architecture decision records](docs/decisions/README.md)
 
-## Install and operate the CLI MVP
+## Install and operate the current compatibility build
 
-The source-run CLI MVP can now be installed through Cargo or packaged as a versioned native archive. The complete supported-platform, checksum, state, upgrade, and uninstall contract is in the [installation and binary-packaging guide](docs/installation.md). The [CLI operator guide](docs/operator-guide.md) provides complete quota-free fixture, Codex subscription, paid API, dashboard, backup, and recovery workflows using the installed `garnish` command.
+The current narrow CLI build can be installed through Cargo or packaged as a versioned native archive. The complete supported-platform, checksum, state, upgrade, and uninstall contract is in the [installation and binary-packaging guide](docs/installation.md). The [CLI operator guide](docs/operator-guide.md) documents the implemented compatibility workflows. It is retained for operating and testing the current build while the project-supervisor experience defined in the [CLI Bible](docs/cli-bible.md) is implemented under new acceptance boundaries.
 
 Create and exercise the current native archive before distributing it. These commands make no provider request, consume no subscription or paid API quota, and publish nothing:
 

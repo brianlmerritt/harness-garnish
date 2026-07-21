@@ -2,7 +2,7 @@
 
 ## Result
 
-The narrow source-run CLI MVP exited successfully on 2026-07-21 at Git revision `747d59864eb98ab75206f0f02191d2e6f81628a3` (`working on mvp`). SQLite schema 20, the final quota-free fixture suite, the Codex subscription patch path, the explicitly budgeted OpenAI/Anthropic paths, detached verification, review projection, read-only loopback dashboard, and default-deny MCP registration are implemented and evidenced within the boundary defined by [`cli-mvp.md`](cli-mvp.md).
+The narrow source-run CLI MVP exited successfully on 2026-07-21 at Git revision `747d59864eb98ab75206f0f02191d2e6f81628a3` (`working on mvp`). SQLite schema 20, the final quota-free fixture suite, the Codex subscription patch path, the explicitly budgeted OpenAI/Anthropic paths, detached verification, review projection, read-only loopback dashboard, and default-deny MCP registration are implemented and evidenced within the historical boundary now archived at [`archive/cli-mvp.md`](archive/cli-mvp.md). The authoritative future project-supervisor contract is [`cli-bible.md`](cli-bible.md); it does not retroactively alter this exit evidence.
 
 This result means a technically competent operator can build and use the MVP from its source checkout. It is not Phase 4 exit, production readiness, a packaged end-user release, browser mutation parity, executable MCP, or support for arbitrary coding-agent CLIs.
 

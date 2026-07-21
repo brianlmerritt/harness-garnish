@@ -31,6 +31,8 @@ garnish project list
 
 Registered source checkouts should be clean before task execution. Garnish creates isolated worktrees for implementation and detached worktrees for verification; it does not commit, merge, push, or deploy the accepted patch.
 
+The repository must have an existing commit because isolated worktrees require a valid `HEAD`. If worktree preparation fails because `HEAD` is missing or because project files outside `.harness-garnish/` are dirty, the task is recorded as `failed` before an implementer run exists. Fixing or committing the repository does not silently reactivate that durable task. The current MVP has no operator requeue command for this pre-run failure: retain the failed task as evidence and create a replacement task. `garnish recover` is for expired claims and interrupted runs and does not reset a terminal worktree-preparation failure; runtime retry settings apply only after supervised run evidence exists.
+
 ## Quota-free first task
 
 Use the deterministic fake adapter first. It exercises project state, quota routing, isolated patch creation, detached verification, and review without contacting a provider.
@@ -47,6 +49,17 @@ garnish task review "$TASK_ID"
 ```
 
 Before accepting the result, confirm that readiness reported `allowed: true`, the final task status is `review`, `verification.passed` is `true`, `handoff.changed_files` contains only `result.txt`, and `integration_authorized` is `false`. Inspect the exact file at `artifacts.patch_path`. The registered source HEAD and tracked project files remain unchanged until the operator deliberately integrates the reviewed patch. Garnish does create and update its bounded human-readable state beneath `.harness-garnish/`; those files are projections of canonical SQLite state, not integration of the task patch.
+
+For this quota-free fixture, no source integration is required. After inspecting and accepting the review evidence, mark the task complete:
+
+Placeholders: none if `TASK_ID` remains set from the preceding declared assignment.
+
+```console
+garnish task complete "$TASK_ID"
+garnish task show "$TASK_ID"
+```
+
+`task complete` records `user_accepted_review` and promotes any tasks whose dependencies are now satisfied. It does not apply the patch, commit, merge, push, or otherwise authorize integration. For a real implementation task, perform the separately governed manual integration first, then complete the reviewed task when its acceptance state is truthful.
 
 ## Codex subscription task
 
