@@ -1,4 +1,4 @@
-name: Phase 1 verification
+name: Harness Garnish verification
 
 on:
   push:
@@ -20,9 +20,33 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Command placeholder declarations
+        run: ./scripts/check-command-placeholders
       - name: Format
         run: cargo fmt --all -- --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: >-
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN
+          -u GARNISH_DATA_DIR
+          -u GARNISH_REAL_API_PROVIDER -u GARNISH_REAL_API_MODEL
+          -u GARNISH_REAL_API_SECRET_REFERENCE
+          -u GARNISH_ACKNOWLEDGE_PAID_API -u GARNISH_ACKNOWLEDGE_PAID_API_PATCH
+          -u GARNISH_API_SMOKE_RECEIPT_DIR
+          -u GARNISH_REAL_CODEX_REMAINING_PERCENT
+          -u GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION
+          -u GARNISH_CODEX_SMOKE_RECEIPT_DIR
+          -u GARNISH_REAL_DOCKER_IMAGE -u GARNISH_REAL_PODMAN_IMAGE
+          cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test without provider quota
-        run: cargo test --workspace
+        run: >-
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN
+          -u GARNISH_DATA_DIR
+          -u GARNISH_REAL_API_PROVIDER -u GARNISH_REAL_API_MODEL
+          -u GARNISH_REAL_API_SECRET_REFERENCE
+          -u GARNISH_ACKNOWLEDGE_PAID_API -u GARNISH_ACKNOWLEDGE_PAID_API_PATCH
+          -u GARNISH_API_SMOKE_RECEIPT_DIR
+          -u GARNISH_REAL_CODEX_REMAINING_PERCENT
+          -u GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION
+          -u GARNISH_CODEX_SMOKE_RECEIPT_DIR
+          -u GARNISH_REAL_DOCKER_IMAGE -u GARNISH_REAL_PODMAN_IMAGE
+          cargo test --locked --workspace

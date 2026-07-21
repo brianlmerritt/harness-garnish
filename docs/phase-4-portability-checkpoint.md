@@ -45,3 +45,9 @@ The script's terminal success is emitted only after format, strict Clippy, and t
 ## Conclusion
 
 P4-14 is established for the direct-transport intermediate scope: the normal macOS/Linux/WSL2 suites are fixture-only and quota-free. The fixed-endpoint Rustls client, explicit network opt-in, disabled redirects/proxies/client retries, bounded response validation, sensitive authorization headers, and paid-smoke denial gate are portable across all three platforms. This is not Phase 4 exit evidence. General scheduler activation, a separately opted-in paid provider smoke test, and controlled extensions remain incomplete.
+
+## Final CLI slice revalidation
+
+The portability script now includes the later API scheduler, isolated API patch, MCP registration, Codex subscription patch, review projection, and command-placeholder declaration fixtures. It explicitly removes every API and Codex live-test acknowledgement, provider credential selector, receipt-directory override, and real-container selector before lint and tests. This update has passed the equivalent macOS quota-free checks, but the script deliberately runs only on native Linux or WSL2.
+
+The 2026-07-20 Linux and WSL2 results above predate this final CLI slice. They must not be presented as evidence for the new Codex/CLI boundary. A fresh placeholder-free `./scripts/test-phase4-portability` run is required on each platform before this checkpoint can be extended to final-slice cross-platform conformance.

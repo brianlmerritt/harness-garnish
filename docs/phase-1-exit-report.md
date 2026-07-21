@@ -39,6 +39,8 @@ Local platform and toolchain on 2026-07-19:
 
 Commands and results:
 
+Placeholders: none; this block is captured test output, not an operator command.
+
 ```console
 cargo fmt --all -- --check
 # pass

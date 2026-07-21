@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+status=0
+while IFS= read -r document; do
+  if ! awk '
+    /^```console$/ {
+      if (last_nonempty !~ /^Placeholders:/) {
+        printf "%s:%d: console block has no immediately preceding Placeholders declaration\n", FILENAME, NR
+        failed = 1
+      }
+      next
+    }
+    NF { last_nonempty = $0 }
+    END { exit failed }
+  ' "$document"; then
+    status=1
+  fi
+done < <(rg -l '^```console$' README.md docs)
+
+if [[ "$status" -ne 0 ]]; then
+  exit "$status"
+fi
+
+echo 'command placeholder declarations: complete'
