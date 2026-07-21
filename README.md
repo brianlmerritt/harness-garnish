@@ -187,6 +187,30 @@ garnish --data-dir .garnish-state quota forecast --adapter codex --provider code
 
 The Codex subscription lane is intentionally one task per daemon invocation. It uses saved Codex CLI authentication in the host control process, but runs `codex exec` ephemerally with JSONL output and the built-in `:read-only` permission profile. User configuration, exec-policy rule files, MCP, apps, hooks, plugins, multi-agent operation, and web search are disabled. Repository content, including `AGENTS.md`, remains untrusted model input and cannot expand authority. Codex cannot write the repository: its sole accepted result is one bounded unified Git patch, which Garnish validates against the task's exact scope and applies only to an isolated worktree. A detached verifier must pass before the task reaches `review`. These choices follow the official [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode), [Codex permissions](https://learn.chatgpt.com/docs/permissions), and [Codex `AGENTS.md`](https://learn.chatgpt.com/docs/agent-configuration/agents-md) contracts.
 
+#### Codex subscription setup on Ubuntu Linux and WSL2
+
+Run the installation commands independently on each Linux or WSL2 host. The distribution `bubblewrap` package provides the preferred Codex Linux sandbox boundary. The official installer places the current Codex CLI in the user environment. These commands download software and may request `sudo`, but they do not authenticate or submit an agent task.
+
+Placeholders: none; these commands are for Ubuntu or another Debian-family distribution using `apt`.
+
+```console
+sudo apt update
+sudo apt install -y bubblewrap curl
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+codex --version
+```
+
+For subscription access, sign in with ChatGPT rather than an API key. Device authentication is the recommended flow for a remote Linux host or WSL2 terminal where a browser callback may not work. The command displays a URL and one-time code; follow those displayed instructions in a browser. It writes local Codex authentication state but does not submit an agent task.
+
+Placeholders: none; do not paste the displayed one-time code into this repository or chat.
+
+```console
+codex login --device-auth
+codex login status
+```
+
+On a graphical Linux session with a working browser callback, `codex login` is the official alternative to `codex login --device-auth`; use one login flow, not both. Authenticate each host independently and never copy, commit, or share `~/.codex/auth.json`. `codex login status` should report ChatGPT authentication for the subscription lane. Installation, login, version output, and login status are setup evidence only; they do not establish live Garnish execution.
+
 First make sure `codex` is installed and already signed in with the subscription account you intend to use. These two commands do not submit a task:
 
 Placeholders: none.
@@ -428,7 +452,7 @@ Placeholders: none.
 ./scripts/test-phase4-portability
 ```
 
-There are no placeholders and no additional packages or container images are required. The script removes OpenAI, Anthropic, and Codex live-test credentials, selectors, acknowledgements, receipt overrides, and real-container selectors from the test environment. It checks command-placeholder declarations, formatting, strict lint, and the complete fixture-only suite. It automatically distinguishes native Linux from WSL2 and rejects a WSL checkout under `/mnt/<drive>`. The earlier direct-transport boundary passed on both platforms on 2026-07-20; the final Codex/CLI slice requires a new run on each platform before cross-platform conformance can be claimed. The evidence boundary is in [`docs/phase-4-portability-checkpoint.md`](docs/phase-4-portability-checkpoint.md).
+There are no placeholders and no additional packages or container images are required. The script removes OpenAI, Anthropic, and Codex live-test credentials, selectors, acknowledgements, receipt overrides, and real-container selectors from the test environment. It checks command-placeholder declarations, formatting, strict lint, and the complete fixture-only suite. It automatically distinguishes native Linux from WSL2 and rejects a WSL checkout under `/mnt/<drive>`. The final Codex/CLI slice passed on native Linux and WSL2 on 2026-07-21; combined macOS, Linux, and WSL2 evidence is recorded in [`docs/phase-4-portability-checkpoint.md`](docs/phase-4-portability-checkpoint.md).
 
 ## Repository authority
 

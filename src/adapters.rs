@@ -91,6 +91,8 @@ pub fn codex_subscription_patch_invocation(
     if !cwd.is_absolute() {
         bail!("Codex subscription worktree must be an absolute path");
     }
+    let node = discover_executable("node");
+    let (executable, mut argv) = codex_subscription_launch_boundary(executable, node)?;
     let mut environment = BTreeMap::new();
     let home = env::var("HOME").context("Codex subscription execution requires HOME")?;
     if !Path::new(&home).is_absolute() {
@@ -113,9 +115,8 @@ pub fn codex_subscription_patch_invocation(
     {
         environment.insert("TMPDIR".into(), tmpdir);
     }
-    Ok(Invocation {
-        executable,
-        argv: [
+    argv.extend(
+        [
             "exec",
             "--ephemeral",
             "--json",
@@ -147,8 +148,11 @@ pub fn codex_subscription_patch_invocation(
             "-",
         ]
         .into_iter()
-        .map(OsString::from)
-        .collect(),
+        .map(OsString::from),
+    );
+    Ok(Invocation {
+        executable,
+        argv,
         cwd: cwd.to_path_buf(),
         environment,
         stdin: prompt.as_bytes().to_vec(),
@@ -156,6 +160,41 @@ pub fn codex_subscription_patch_invocation(
         timeout: Duration::from_secs(45 * 60),
         output_limit: 2 * 1024 * 1024,
     })
+}
+
+fn codex_subscription_launch_boundary(
+    executable: PathBuf,
+    node: Option<PathBuf>,
+) -> Result<(PathBuf, Vec<OsString>)> {
+    if !codex_uses_env_node_launcher(&executable)? {
+        return Ok((executable, Vec::new()));
+    }
+    let node = node.context(
+        "Codex uses an env-based Node launcher, but an executable node runtime was not found",
+    )?;
+    if !node.is_absolute() {
+        bail!("Codex Node launcher runtime must be an absolute path");
+    }
+    Ok((node, vec![executable.into_os_string()]))
+}
+
+fn codex_uses_env_node_launcher(executable: &Path) -> Result<bool> {
+    let mut prefix = [0_u8; 256];
+    let count = fs::File::open(executable)
+        .with_context(|| format!("opening Codex executable {}", executable.display()))?
+        .read(&mut prefix)
+        .with_context(|| format!("reading Codex executable {}", executable.display()))?;
+    let Ok(text) = std::str::from_utf8(&prefix[..count]) else {
+        return Ok(false);
+    };
+    let Some(shebang) = text.lines().next().and_then(|line| line.strip_prefix("#!")) else {
+        return Ok(false);
+    };
+    let mut fields = shebang.split_whitespace();
+    if !matches!(fields.next(), Some("/usr/bin/env" | "/bin/env")) {
+        return Ok(false);
+    }
+    Ok(fields.any(|field| field == "node"))
 }
 
 pub fn extract_codex_subscription_patch(stdout: &[u8]) -> Result<String> {
@@ -1916,8 +1955,11 @@ mod tests {
 
     #[test]
     fn codex_subscription_patch_boundary_is_read_only_ephemeral_and_scrubbed() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("codex");
+        fs::write(&executable, b"\x7fELF").unwrap();
         let invocation = codex_subscription_patch_invocation(
-            PathBuf::from("/fixture/codex"),
+            executable,
             Path::new("/fixture/worktree"),
             "return a patch",
         )
@@ -1946,6 +1988,31 @@ mod tests {
                 .any(|name| name.contains("KEY") || name.contains("TOKEN"))
         );
         assert_eq!(invocation.stdin, b"return a patch");
+    }
+
+    #[test]
+    fn codex_subscription_node_launcher_uses_an_exact_runtime_without_inheriting_path() {
+        let dir = tempdir().unwrap();
+        let executable = dir.path().join("codex.js");
+        fs::write(&executable, "#!/usr/bin/env node\n").unwrap();
+        let node = dir.path().join("node");
+        let (launch_executable, prefix) =
+            codex_subscription_launch_boundary(executable.clone(), Some(node.clone())).unwrap();
+        assert_eq!(launch_executable, node);
+        assert_eq!(prefix, vec![executable.clone().into_os_string()]);
+        assert!(
+            codex_subscription_launch_boundary(executable, None)
+                .unwrap_err()
+                .to_string()
+                .contains("executable node runtime was not found")
+        );
+
+        let standalone = dir.path().join("codex-standalone");
+        fs::write(&standalone, b"\x7fELF").unwrap();
+        let (launch_executable, prefix) =
+            codex_subscription_launch_boundary(standalone.clone(), None).unwrap();
+        assert_eq!(launch_executable, standalone);
+        assert!(prefix.is_empty());
     }
 
     #[test]
