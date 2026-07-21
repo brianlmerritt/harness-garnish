@@ -641,6 +641,74 @@ fn scheduler_daemon_api_patch_execution_requires_a_second_exact_acknowledgement(
 }
 
 #[test]
+fn api_smoke_receipts_are_private_redacted_and_machine_readable() {
+    let dir = tempdir().unwrap();
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/write-api-smoke-receipt");
+    for (kind, provider, model, expected_test, expected_tokens) in [
+        (
+            "response",
+            "openai",
+            "gpt-fixture-2026-01-01",
+            "response_only",
+            32,
+        ),
+        (
+            "patch",
+            "anthropic",
+            "claude-fixture-4-6",
+            "isolated_patch",
+            512,
+        ),
+    ] {
+        let output = Command::new(&script)
+            .args([kind, provider, model, dir.path().to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
+        assert!(output.stderr.is_empty());
+        let receipt = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().contains(provider))
+            .unwrap();
+        let bytes = fs::read(receipt.path()).unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["test"], expected_test);
+        assert_eq!(value["provider"], provider);
+        assert_eq!(value["model"], model);
+        assert_eq!(value["outcome"], "passed");
+        assert_eq!(value["requests"], 1);
+        assert_eq!(value["max_retries"], 0);
+        assert_eq!(value["max_output_tokens"], expected_tokens);
+        for canary in ["api-key", "prompt", "response content", "request-id"] {
+            assert!(!String::from_utf8_lossy(&bytes).contains(canary));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(receipt.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+
+    let denied = Command::new(script)
+        .args([
+            "response",
+            "openai",
+            "model\"-injection",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(2));
+}
+
+#[test]
 fn agent_status_reports_unknown_without_implicit_probe() {
     let dir = tempdir().unwrap();
     let output = cargo_bin_cmd!("garnish")

@@ -27,6 +27,11 @@ case "$GARNISH_REAL_API_PROVIDER" in
     ;;
 esac
 
+if [[ ! "$GARNISH_REAL_API_MODEL" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+  echo 'error: GARNISH_REAL_API_MODEL must be an exact model ID using only letters, digits, dot, underscore, colon, or hyphen' >&2
+  exit 2
+fi
+
 if [[ "$GARNISH_ACKNOWLEDGE_PAID_API" != 'I_ACCEPT_ONE_PAID_API_REQUEST' ]]; then
   echo 'error: GARNISH_ACKNOWLEDGE_PAID_API must equal I_ACCEPT_ONE_PAID_API_REQUEST' >&2
   exit 2
@@ -75,3 +80,7 @@ echo 'state: temporary local database; provider prompts and output are not persi
 
 cargo test --locked service::tests::real_paid_api_smoke_is_explicit_and_accounted \
   -- --ignored --exact --nocapture
+
+scripts/write-api-smoke-receipt \
+  response "$GARNISH_REAL_API_PROVIDER" "$GARNISH_REAL_API_MODEL" \
+  "${GARNISH_API_SMOKE_RECEIPT_DIR:-target/api-smoke-receipts}"

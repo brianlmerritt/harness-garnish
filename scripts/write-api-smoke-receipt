@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 4 ]]; then
+  echo 'usage: write-api-smoke-receipt response|patch openai|anthropic MODEL RECEIPT_DIR' >&2
+  exit 2
+fi
+
+test_kind="$1"
+provider="$2"
+model="$3"
+receipt_dir="$4"
+
+case "$test_kind" in
+  response)
+    receipt_test='response_only'
+    output_tokens=32
+    suffix='response'
+    ;;
+  patch)
+    receipt_test='isolated_patch'
+    output_tokens=512
+    suffix='patch'
+    ;;
+  *)
+    echo 'error: test kind must be response or patch' >&2
+    exit 2
+    ;;
+esac
+
+case "$provider" in
+  openai|anthropic) ;;
+  *)
+    echo 'error: provider must be openai or anthropic' >&2
+    exit 2
+    ;;
+esac
+
+if [[ ! "$model" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+  echo 'error: model must be an exact model ID using only letters, digits, dot, underscore, colon, or hyphen' >&2
+  exit 2
+fi
+
+mkdir -p "$receipt_dir"
+chmod 700 "$receipt_dir"
+receipt_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+receipt_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+receipt_path="$receipt_dir/$receipt_stamp-$$-$provider-$suffix.json"
+umask 077
+set -o noclobber
+
+if [[ "$test_kind" == 'patch' ]]; then
+  printf '{\n  "schema_version": 1,\n  "test": "%s",\n  "provider": "%s",\n  "model": "%s",\n  "outcome": "passed",\n  "requests": 1,\n  "max_retries": 0,\n  "max_output_tokens": %s,\n  "scope": ["result.txt"],\n  "verification": "passed in a separate detached worktree",\n  "source_checkout_changed": false,\n  "evidence": "exact ignored Cargo test exited successfully",\n  "recorded_at": "%s"\n}\n' \
+    "$receipt_test" "$provider" "$model" "$output_tokens" "$receipt_time" >"$receipt_path"
+else
+  printf '{\n  "schema_version": 1,\n  "test": "%s",\n  "provider": "%s",\n  "model": "%s",\n  "outcome": "passed",\n  "requests": 1,\n  "max_retries": 0,\n  "max_output_tokens": %s,\n  "evidence": "exact ignored Cargo test exited successfully",\n  "recorded_at": "%s"\n}\n' \
+    "$receipt_test" "$provider" "$model" "$output_tokens" "$receipt_time" >"$receipt_path"
+fi
+
+echo "redacted receipt: $receipt_path"

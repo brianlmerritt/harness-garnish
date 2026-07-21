@@ -196,6 +196,8 @@ This command can make multiple chargeable requests within the explicitly configu
 
 `scripts/test-real-api-smoke` is the separately bounded one-request transport diagnostic. Do not run it as part of normal testing: it makes exactly one API request and the provider may charge it. It disables redirects, proxy inheritance, and implicit HTTP retries; reserves one request with a 32-output-token ceiling; uses a temporary database; and configures no currency price evidence. OpenAI requests set `store: false`. A timeout remains an uncertain attempted request and must not be rerun automatically.
 
+After a successful exact test, the script writes a private redacted receipt under `target/api-smoke-receipts/`; the ignored `target/` tree is not committed. A failed or uncertain request produces no passing receipt. The receipt contains no credential, prompt, response content, raw request ID, or billing claim.
+
 The values `EXACT_MODEL_ID` and `YOUR_REAL_OPENAI_API_KEY` are placeholders below. Replace them with an exact provider model ID and the real credential. The credential stays in an environment variable and never enters a Garnish argument or repository file. These commands prepare an OpenAI smoke test but do not run it until the final script command:
 
 ```console
