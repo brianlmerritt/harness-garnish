@@ -4,6 +4,178 @@ use std::{fs, process::Command};
 use tempfile::tempdir;
 
 #[test]
+fn mcp_registration_is_default_deny_append_only_and_stable_json() {
+    let dir = tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    fs::create_dir(&repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let state = dir.path().join("state");
+    let add = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            state.to_str().unwrap(),
+            "project",
+            "add",
+            "--slug",
+            "fixture",
+            "--title",
+            "Fixture",
+            "--path",
+            repository.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let set = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            state.to_str().unwrap(),
+            "mcp",
+            "server-set",
+            "--project",
+            "fixture",
+            "--name",
+            "fixture.server",
+            "--executable",
+            "/fixture/mcp-server",
+            "--executable-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--arg=--stdio",
+            "--tool",
+            "read_record",
+            "--network-host",
+            "API.EXAMPLE.COM",
+            "--secret-reference",
+            "env:FIXTURE_TOKEN",
+            "--source",
+            "fixture manifest",
+            "--reason",
+            "register without execution",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let revision: Value = serde_json::from_slice(&set.stdout).unwrap();
+    assert_eq!(revision["enabled"], false);
+    assert_eq!(revision["transport"], "stdio");
+    assert_eq!(
+        revision["allowed_tools"],
+        serde_json::json!(["read_record"])
+    );
+    assert_eq!(
+        revision["network_hosts"],
+        serde_json::json!(["api.example.com"])
+    );
+
+    let denied = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            state.to_str().unwrap(),
+            "mcp",
+            "server-set",
+            "--project",
+            "fixture",
+            "--name",
+            "denied.server",
+            "--enabled",
+            "true",
+            "--executable",
+            "/fixture/mcp-server",
+            "--executable-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--source",
+            "fixture manifest",
+            "--reason",
+            "missing exact tool allowlist",
+        ])
+        .output()
+        .unwrap();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires at least one allowed tool"));
+
+    let revised = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            state.to_str().unwrap(),
+            "mcp",
+            "server-set",
+            "--project",
+            "fixture",
+            "--name",
+            "fixture.server",
+            "--enabled",
+            "true",
+            "--executable",
+            "/fixture/mcp-server",
+            "--executable-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--tool",
+            "read_record",
+            "--source",
+            "reviewed fixture manifest",
+            "--reason",
+            "enable administrative eligibility",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        revised.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revised.stderr)
+    );
+    let revised: Value = serde_json::from_slice(&revised.stdout).unwrap();
+    assert_eq!(revised["supersedes_id"], revision["id"]);
+
+    let status = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            state.to_str().unwrap(),
+            "mcp",
+            "server-status",
+            "--project",
+            "fixture",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let revisions: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(revisions.as_array().unwrap().len(), 1);
+    assert_eq!(revisions[0]["id"], revised["id"]);
+
+    let connection = rusqlite::Connection::open(state.join("state.db")).unwrap();
+    let payloads: Vec<String> = connection
+        .prepare("SELECT payload_json FROM events WHERE event_type = 'mcp.server_configured' ORDER BY sequence")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(payloads.len(), 2);
+    assert!(payloads[0].contains("\"secret_reference_count\":1"));
+    assert!(
+        !payloads
+            .iter()
+            .any(|payload| payload.contains("FIXTURE_TOKEN") || payload.contains("--stdio"))
+    );
+}
+
+#[test]
 fn api_budget_configuration_is_explicit_and_stable_json() {
     let dir = tempdir().unwrap();
     let period_start = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
@@ -778,7 +950,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 19);
+    assert_eq!(value["schema_version"], 20);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

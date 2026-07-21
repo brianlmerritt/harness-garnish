@@ -16,13 +16,13 @@ use crate::{
         ApiClaimReservationRequest, ApiDispatchAttempt, ApiModelPrice, ApiRequestPlan,
         ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord,
         CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ControlState,
-        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, NewApiBudget,
-        NewApiModelPrice, NewApiRequestPlan, NewTask, Project, ProjectLink, QuotaCollectionAttempt,
-        QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteCandidate,
-        RouteDecision, RouteTarget, RunCheckpoint, RunRecord, RunSummary, ScheduleEvaluation,
-        SchedulerApiClaim, SchedulerClaim, SchedulerClaimRejection, SchedulerDaemonConfig,
-        SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview, SchedulerTick, SchedulerWake,
-        Task, TaskStatus, UsageForecast,
+        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, McpServerRevision,
+        NewApiBudget, NewApiModelPrice, NewApiRequestPlan, NewMcpServerRevision, NewTask, Project,
+        ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample,
+        RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint,
+        RunRecord, RunSummary, ScheduleEvaluation, SchedulerApiClaim, SchedulerClaim,
+        SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
+        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -110,7 +110,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 19,
+            schema_version: 20,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -406,6 +406,34 @@ impl Garnish {
         let mut config = config.clone();
         config.project_id = project.id;
         self.db.configure_api_budget(&config)
+    }
+
+    pub fn configure_mcp_server(
+        &mut self,
+        config: &NewMcpServerRevision,
+    ) -> Result<McpServerRevision> {
+        let project = self.db.project(&config.project_id)?;
+        let mut config = config.clone();
+        config.project_id = project.id;
+        config.allowed_tools.sort();
+        config.allowed_tools.dedup();
+        config.network_hosts = config
+            .network_hosts
+            .into_iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect();
+        config.network_hosts.sort();
+        config.network_hosts.dedup();
+        config.secret_references.sort();
+        config.secret_references.dedup();
+        self.db.configure_mcp_server(&config)
+    }
+
+    pub fn mcp_servers(&self, project: Option<&str>) -> Result<Vec<McpServerRevision>> {
+        let project_id = project
+            .map(|value| self.db.project(value).map(|p| p.id))
+            .transpose()?;
+        self.db.list_latest_mcp_servers(project_id.as_deref())
     }
 
     pub fn api_budgets(&self, project: Option<&str>) -> Result<Vec<ApiBudget>> {

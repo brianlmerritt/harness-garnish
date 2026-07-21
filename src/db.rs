@@ -4,11 +4,11 @@ use crate::{
         ApiDispatchAttempt, ApiModelPrice, ApiRequestPlan, ApiReservationRequest, ApiSettlement,
         ApiSpend, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
         CheckpointAction, CircuitBreaker, ClaimedRunStart, ControlState, DayKind,
-        EmergencyStopResult, FailureCategory, LocalNotification, NewApiBudget, NewApiModelPrice,
-        NewApiRequestPlan, NewTask, Project, ProjectLink, QuotaCollectionAttempt, QuotaReservation,
-        QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, RouteDecision, RunCheckpoint,
-        RunRecord, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task,
-        TaskStatus,
+        EmergencyStopResult, FailureCategory, LocalNotification, McpServerRevision, NewApiBudget,
+        NewApiModelPrice, NewApiRequestPlan, NewMcpServerRevision, NewTask, Project, ProjectLink,
+        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan,
+        RetryState, RouteDecision, RunCheckpoint, RunRecord, SchedulerClaim,
+        SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
     },
     quota::QuotaObservation,
     schedule,
@@ -26,7 +26,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 
 pub struct Database {
     path: PathBuf,
@@ -497,6 +497,9 @@ impl Database {
         }
         if current < 19 {
             tx.execute_batch(MIGRATION_19)?;
+        }
+        if current < 20 {
+            tx.execute_batch(MIGRATION_20)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -2668,6 +2671,123 @@ impl Database {
         )?;
         tx.commit()?;
         self.api_budget(&id)
+    }
+
+    pub fn configure_mcp_server(
+        &mut self,
+        config: &NewMcpServerRevision,
+    ) -> Result<McpServerRevision> {
+        validate_mcp_server_config(config)?;
+        let now = Utc::now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let project_exists = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE id = ?1",
+                [&config.project_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if !project_exists {
+            bail!("project not found: {}", config.project_id);
+        }
+        let supersedes_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM mcp_server_revisions WHERE project_id = ?1 AND name = ?2
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![config.project_id, config.name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = Ulid::new().to_string();
+        tx.execute(
+            "INSERT INTO mcp_server_revisions(
+                id, project_id, name, enabled, transport, executable, executable_sha256,
+                argv_json, allowed_tools_json, network_hosts_json, secret_references_json,
+                startup_timeout_seconds, request_timeout_seconds, max_context_bytes,
+                max_output_bytes, source, reason, created_at, supersedes_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                       ?14, ?15, ?16, ?17, ?18, ?19)",
+            params![
+                id,
+                config.project_id,
+                config.name,
+                config.enabled,
+                config.transport,
+                config.executable,
+                config.executable_sha256,
+                to_json(&config.argv)?,
+                to_json(&config.allowed_tools)?,
+                to_json(&config.network_hosts)?,
+                to_json(&config.secret_references)?,
+                sql_u64(config.startup_timeout_seconds, "MCP startup timeout")?,
+                sql_u64(config.request_timeout_seconds, "MCP request timeout")?,
+                sql_u64(config.max_context_bytes, "MCP context limit")?,
+                sql_u64(config.max_output_bytes, "MCP output limit")?,
+                config.source,
+                config.reason,
+                now.to_rfc3339(),
+                supersedes_id,
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&config.project_id),
+            None,
+            None,
+            "mcp.server_configured",
+            "user",
+            &serde_json::json!({
+                "server_id": id, "name": config.name, "enabled": config.enabled,
+                "transport": config.transport, "executable_sha256": config.executable_sha256,
+                "allowed_tools": config.allowed_tools,
+                "network_host_count": config.network_hosts.len(),
+                "secret_reference_count": config.secret_references.len(),
+                "startup_timeout_seconds": config.startup_timeout_seconds,
+                "request_timeout_seconds": config.request_timeout_seconds,
+                "max_context_bytes": config.max_context_bytes,
+                "max_output_bytes": config.max_output_bytes, "source": config.source,
+                "reason": config.reason, "supersedes_id": supersedes_id,
+                "execution_available": false,
+            }),
+        )?;
+        tx.commit()?;
+        self.mcp_server(&id)
+    }
+
+    pub fn mcp_server(&self, id: &str) -> Result<McpServerRevision> {
+        self.conn
+            .query_row(
+                &format!("{MCP_SERVER_SELECT} WHERE id = ?1"),
+                [id],
+                map_mcp_server,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("MCP server revision not found: {id}"))
+    }
+
+    pub fn list_latest_mcp_servers(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<McpServerRevision>> {
+        let sql = if project_id.is_some() {
+            format!("{MCP_SERVER_SELECT} WHERE project_id = ?1 ORDER BY created_at DESC, id DESC")
+        } else {
+            format!("{MCP_SERVER_SELECT} ORDER BY created_at DESC, id DESC")
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = if let Some(project_id) = project_id {
+            stmt.query_map([project_id], map_mcp_server)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map([], map_mcp_server)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        rows.retain(|row| seen.insert((row.project_id.clone(), row.name.clone())));
+        Ok(rows)
     }
 
     pub fn latest_api_budget(
@@ -5508,6 +5628,98 @@ fn validate_sha256(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_mcp_server_config(config: &NewMcpServerRevision) -> Result<()> {
+    let valid_name = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    if !valid_name(&config.name) {
+        bail!("MCP server name must use 1..=128 ASCII letters, digits, '.', '_', or '-'");
+    }
+    if config.transport != "stdio" {
+        bail!("MCP transport must be stdio");
+    }
+    if !std::path::Path::new(&config.executable).is_absolute() {
+        bail!("MCP executable must be an absolute path");
+    }
+    if config.executable.contains(['\0', '\n', '\r']) {
+        bail!("MCP executable contains a forbidden character");
+    }
+    validate_sha256(&config.executable_sha256, "MCP executable digest")?;
+    if config
+        .executable_sha256
+        .bytes()
+        .any(|b| b.is_ascii_uppercase())
+    {
+        bail!("MCP executable digest must use lowercase hexadecimal");
+    }
+    if config.argv.len() > 64
+        || config
+            .argv
+            .iter()
+            .any(|v| v.is_empty() || v.len() > 4096 || v.contains(['\0', '\n', '\r']))
+    {
+        bail!(
+            "MCP argv permits at most 64 nonempty arguments of at most 4096 bytes without control newlines"
+        );
+    }
+    if config.enabled && config.allowed_tools.is_empty() {
+        bail!("enabled MCP server requires at least one allowed tool");
+    }
+    let mut unique = std::collections::BTreeSet::new();
+    for tool in &config.allowed_tools {
+        if !valid_name(tool) || !unique.insert(tool) {
+            bail!("MCP tools must be unique exact names using the server-name character set");
+        }
+    }
+    unique.clear();
+    for host in &config.network_hosts {
+        if host.is_empty()
+            || host.len() > 253
+            || host.contains("//")
+            || host.contains('/')
+            || host.contains('*')
+            || host.bytes().any(|b| {
+                !(b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+            })
+            || !unique.insert(host)
+        {
+            bail!(
+                "MCP network hosts must be unique lowercase exact hostnames without schemes, paths, or wildcards"
+            );
+        }
+    }
+    unique.clear();
+    for reference in &config.secret_references {
+        crate::secrets::SecretReference::parse(reference)?;
+        if !unique.insert(reference) {
+            bail!("MCP secret references must be unique");
+        }
+    }
+    if !(1..=60).contains(&config.startup_timeout_seconds) {
+        bail!("MCP startup timeout must be in 1..=60 seconds");
+    }
+    if !(1..=300).contains(&config.request_timeout_seconds) {
+        bail!("MCP request timeout must be in 1..=300 seconds");
+    }
+    if !(1..=8 * 1024 * 1024).contains(&config.max_context_bytes) {
+        bail!("MCP context limit must be in 1..=8388608 bytes");
+    }
+    if !(1..=8 * 1024 * 1024).contains(&config.max_output_bytes) {
+        bail!("MCP output limit must be in 1..=8388608 bytes");
+    }
+    if config.source.trim().is_empty() || config.source.len() > 500 {
+        bail!("MCP source must contain 1..=500 characters");
+    }
+    if config.reason.trim().is_empty() || config.reason.len() > 1000 {
+        bail!("MCP reason must contain 1..=1000 characters");
+    }
+    Ok(())
+}
+
 fn validate_api_names(label: &str, values: &[String], require_nonempty: bool) -> Result<()> {
     if require_nonempty && values.is_empty() {
         bail!("API budget requires at least one allowed {label}");
@@ -5716,6 +5928,37 @@ const API_BUDGET_SELECT: &str = "SELECT
     allowed_models_json, allowed_tools_json, allowed_roles_json, max_output_tokens,
     max_retries, max_concurrent_requests, reason, created_at, supersedes_id
  FROM api_budgets";
+
+const MCP_SERVER_SELECT: &str = "SELECT
+    id, project_id, name, enabled, transport, executable, executable_sha256,
+    argv_json, allowed_tools_json, network_hosts_json, secret_references_json,
+    startup_timeout_seconds, request_timeout_seconds, max_context_bytes,
+    max_output_bytes, source, reason, created_at, supersedes_id
+ FROM mcp_server_revisions";
+
+fn map_mcp_server(row: &rusqlite::Row<'_>) -> rusqlite::Result<McpServerRevision> {
+    Ok(McpServerRevision {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        name: row.get(2)?,
+        enabled: row.get(3)?,
+        transport: row.get(4)?,
+        executable: row.get(5)?,
+        executable_sha256: row.get(6)?,
+        argv: parse_json(row.get(7)?)?,
+        allowed_tools: parse_json(row.get(8)?)?,
+        network_hosts: parse_json(row.get(9)?)?,
+        secret_references: parse_json(row.get(10)?)?,
+        startup_timeout_seconds: nonnegative_u64(row, 11)?,
+        request_timeout_seconds: nonnegative_u64(row, 12)?,
+        max_context_bytes: nonnegative_u64(row, 13)?,
+        max_output_bytes: nonnegative_u64(row, 14)?,
+        source: row.get(15)?,
+        reason: row.get(16)?,
+        created_at: parse_time(row.get(17)?)?,
+        supersedes_id: row.get(18)?,
+    })
+}
 
 const API_RESERVATION_SELECT: &str = "SELECT
     id, budget_id, project_id, task_id, provider, account, model, role,
@@ -7192,6 +7435,32 @@ CREATE INDEX idx_api_dispatch_attempts_reservation
     ON api_dispatch_attempts(reservation_id, attempt_number);
 "#;
 
+const MIGRATION_20: &str = r#"
+CREATE TABLE mcp_server_revisions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name TEXT NOT NULL CHECK(length(name) BETWEEN 1 AND 128),
+    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+    transport TEXT NOT NULL CHECK(transport = 'stdio'),
+    executable TEXT NOT NULL CHECK(length(executable) > 0),
+    executable_sha256 TEXT NOT NULL CHECK(length(executable_sha256) = 64),
+    argv_json TEXT NOT NULL,
+    allowed_tools_json TEXT NOT NULL,
+    network_hosts_json TEXT NOT NULL,
+    secret_references_json TEXT NOT NULL,
+    startup_timeout_seconds INTEGER NOT NULL CHECK(startup_timeout_seconds BETWEEN 1 AND 60),
+    request_timeout_seconds INTEGER NOT NULL CHECK(request_timeout_seconds BETWEEN 1 AND 300),
+    max_context_bytes INTEGER NOT NULL CHECK(max_context_bytes BETWEEN 1 AND 8388608),
+    max_output_bytes INTEGER NOT NULL CHECK(max_output_bytes BETWEEN 1 AND 8388608),
+    source TEXT NOT NULL CHECK(length(source) BETWEEN 1 AND 500),
+    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 1000),
+    created_at TEXT NOT NULL,
+    supersedes_id TEXT REFERENCES mcp_server_revisions(id)
+);
+CREATE INDEX idx_mcp_server_revisions_latest
+    ON mcp_server_revisions(project_id, name, created_at DESC, id DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7232,6 +7501,74 @@ mod tests {
             fake_write_path: None,
             fake_write_content: None,
         }
+    }
+
+    fn new_mcp_server(project_id: &str) -> NewMcpServerRevision {
+        NewMcpServerRevision {
+            project_id: project_id.into(),
+            name: "fixture.server".into(),
+            enabled: true,
+            transport: "stdio".into(),
+            executable: "/fixture/mcp-server".into(),
+            executable_sha256: "a".repeat(64),
+            argv: vec!["--stdio".into()],
+            allowed_tools: vec!["read_record".into()],
+            network_hosts: vec!["api.example.com".into()],
+            secret_references: vec!["env:FIXTURE_TOKEN".into()],
+            startup_timeout_seconds: 10,
+            request_timeout_seconds: 60,
+            max_context_bytes: 1_048_576,
+            max_output_bytes: 1_048_576,
+            source: "fixture manifest".into(),
+            reason: "test bounded registration".into(),
+        }
+    }
+
+    #[test]
+    fn mcp_registration_validation_fails_closed_without_launching() {
+        let (dir, mut db) = database();
+        let root = dir.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let project = db.add_project("one", "One", &root).unwrap();
+
+        let valid = new_mcp_server(&project.id);
+        let revision = db.configure_mcp_server(&valid).unwrap();
+        assert!(revision.enabled);
+
+        let mut invalid = valid.clone();
+        invalid.executable = "relative-server".into();
+        assert!(
+            db.configure_mcp_server(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
+
+        let mut invalid = valid.clone();
+        invalid.executable_sha256 = "A".repeat(64);
+        assert!(
+            db.configure_mcp_server(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("lowercase")
+        );
+
+        let mut invalid = valid.clone();
+        invalid.network_hosts = vec!["*.example.com".into()];
+        assert!(
+            db.configure_mcp_server(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("without schemes")
+        );
+
+        let mut invalid = valid;
+        invalid.secret_references = vec!["literal-secret".into()];
+        assert!(db.configure_mcp_server(&invalid).is_err());
+        assert_eq!(
+            db.list_latest_mcp_servers(Some(&project.id)).unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -7688,7 +8025,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 19);
+        assert_eq!(migrated.schema_version(), 20);
         assert!(migrated.list_latest_api_budgets(None).unwrap().is_empty());
         assert!(migrated.list_api_reservations(None).unwrap().is_empty());
         assert!(migrated.list_api_spend(None).unwrap().is_empty());
@@ -7730,7 +8067,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 19);
+        assert_eq!(migrated.schema_version(), 20);
         assert!(migrated.list_api_model_prices().unwrap().is_empty());
         let column_count: i64 = migrated
             .conn
@@ -7784,7 +8121,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 19);
+        assert_eq!(migrated.schema_version(), 20);
         let column_count: i64 = migrated
             .conn
             .query_row(
@@ -7847,7 +8184,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 19);
+        assert_eq!(migrated.schema_version(), 20);
         let plan_table: bool = migrated
             .conn
             .query_row(
@@ -7897,7 +8234,7 @@ mod tests {
         drop(connection);
 
         let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 19);
+        assert_eq!(migrated.schema_version(), 20);
         let attempt_table: bool = migrated
             .conn
             .query_row(
@@ -7922,6 +8259,41 @@ mod tests {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn schema_nineteen_migration_adds_mcp_registration_with_backup() {
+        let dir = tempdir().unwrap();
+        let database_path = dir.path().join("state.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection.pragma_update(None, "user_version", 19).unwrap();
+        drop(connection);
+
+        let migrated = Database::open(&database_path).unwrap();
+        assert_eq!(migrated.schema_version(), 20);
+        let table_exists: bool = migrated.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mcp_server_revisions')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(table_exists);
+        let backup = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("v19") && name.ends_with("backup.db"))
+            })
+            .expect("schema-19 backup");
+        let backup_connection = Connection::open(backup).unwrap();
+        let integrity: String = backup_connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let backup_version: i64 = backup_connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, 19);
     }
 
     #[test]

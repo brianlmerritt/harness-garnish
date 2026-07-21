@@ -81,6 +81,10 @@ Required fields:
 
 `task_id`, `depends_on_task_id`, `kind`, `created_at` with a unique pair and no self-edge. Adding an edge performs cycle detection in the same transaction.
 
+### `mcp_server_revisions`
+
+Append-only project/name trust configuration: enabled state, `stdio` transport, absolute executable path and pinned SHA-256, argv JSON, exact tool/host/protected-secret-reference grants, bounded startup/request timeouts, context/output byte ceilings, source, reason, timestamp, and `supersedes_id`. The latest project/name revision is authoritative. No row authorizes execution by itself; Schema 20 has no MCP launch or tool-call path.
+
 ### `calendar_profiles` and `calendar_exceptions`
 
 `calendar_profiles`: `id`, `slug`, `timezone`, `weekly_pattern`, `created_at`, `updated_at`, `version`. `weekly_pattern` contains seven `W`/`O` characters ordered Monday through Sunday and defaults to `WWWWWOO`.

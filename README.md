@@ -155,9 +155,20 @@ garnish --data-dir .garnish-state quota forecast --adapter codex --provider code
 
 `quota record-usage` is currently a collector/operator ingestion contract, not an instruction to estimate percentages by hand. Its required `--evidence-id` must be a stable real run or collector identifier; `--source` must name the real evidence source. Provider-reported, collector-measured, and explicit user-reported confidence are distinct from untrusted agent output.
 
+### Phase 4 controlled MCP registration
+
+Schema 20 can record an MCP server trust revision but cannot launch one. Registration is default-disabled and quota-free. The command requires a project, exact server name, absolute executable path, lowercase SHA-256, source, and reason; use `--help` for the optional exact tool, host, protected secret-reference, argv, timeout, and byte-limit fields.
+
+```console
+cargo run --locked -- --data-dir .garnish-state mcp server-set --help
+cargo run --locked -- --data-dir .garnish-state mcp server-status
+```
+
+Setting `--enabled true` records administrative eligibility and requires at least one `--tool`; it does not execute the server. There is intentionally no launch, discovery, install, or tool-call command in this slice. ADR 0013 defines the boundary.
+
 ### Phase 4 API budget control plane
 
-Schema 19 keeps paid OpenAI/Anthropic API budgets separate from subscription quotas, adds append-only model-price evidence, per-task exact request plans, and durable bounded dispatch-attempt evidence. Configuration, fixture execution, and the read commands below cannot make a provider request or spend credit. Live scheduler execution requires a separate command-line activation described below.
+Schema 20 retains the Schema 19 paid OpenAI/Anthropic API controls while adding only the non-executing MCP registration state described above. API budgets remain separate from subscription quotas, with append-only model-price evidence, per-task exact request plans, and durable bounded dispatch-attempt evidence. Configuration, fixture execution, and the read commands below cannot make a provider request or spend credit. Live scheduler execution requires a separate command-line activation described below.
 
 ```console
 cargo run --locked -- --data-dir .garnish-state api budget-status

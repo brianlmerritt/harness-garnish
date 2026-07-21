@@ -570,6 +570,49 @@ pub struct NewApiRequestPlan {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerRevision {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub transport: String,
+    pub executable: String,
+    pub executable_sha256: String,
+    pub argv: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub network_hosts: Vec<String>,
+    pub secret_references: Vec<String>,
+    pub startup_timeout_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub max_context_bytes: u64,
+    pub max_output_bytes: u64,
+    pub source: String,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+    pub supersedes_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewMcpServerRevision {
+    pub project_id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub transport: String,
+    pub executable: String,
+    pub executable_sha256: String,
+    pub argv: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub network_hosts: Vec<String>,
+    pub secret_references: Vec<String>,
+    pub startup_timeout_seconds: u64,
+    pub request_timeout_seconds: u64,
+    pub max_context_bytes: u64,
+    pub max_output_bytes: u64,
+    pub source: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiSettlement {
     pub reservation_id: String,

@@ -5,8 +5,8 @@ use harness_garnish::{
     Garnish,
     adapters::AgentKind,
     domain::{
-        DayAffinity, DayKind, NewApiBudget, NewApiModelPrice, NewApiRequestPlan, NewTask,
-        RouteTarget, SchedulerDaemonConfig,
+        DayAffinity, DayKind, NewApiBudget, NewApiModelPrice, NewApiRequestPlan,
+        NewMcpServerRevision, NewTask, RouteTarget, SchedulerDaemonConfig,
     },
     web_ui::{UiServerConfig, serve_ui},
 };
@@ -54,6 +54,10 @@ enum Command {
     Api {
         #[command(subcommand)]
         command: ApiCommand,
+    },
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
     Schedule {
         #[command(subcommand)]
@@ -287,6 +291,54 @@ enum ApiCommand {
         #[arg(long)]
         task: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    ServerSet(Box<McpServerSet>),
+    ServerStatus {
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct McpServerSet {
+    #[arg(long)]
+    project: String,
+    #[arg(long)]
+    name: String,
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    enabled: bool,
+    #[arg(long, default_value = "stdio")]
+    transport: String,
+    #[arg(long)]
+    executable: String,
+    #[arg(long)]
+    executable_sha256: String,
+    #[arg(long = "arg")]
+    argv: Vec<String>,
+    #[arg(long = "tool")]
+    allowed_tools: Vec<String>,
+    #[arg(long = "network-host")]
+    network_hosts: Vec<String>,
+    #[arg(
+        long = "secret-reference",
+        help = "Non-secret env:NAME, keychain:SERVICE/ACCOUNT, or file:/absolute/path reference"
+    )]
+    secret_references: Vec<String>,
+    #[arg(long, default_value_t = 10)]
+    startup_timeout_seconds: u64,
+    #[arg(long, default_value_t = 60)]
+    request_timeout_seconds: u64,
+    #[arg(long, default_value_t = 1_048_576)]
+    max_context_bytes: u64,
+    #[arg(long, default_value_t = 1_048_576)]
+    max_output_bytes: u64,
+    #[arg(long)]
+    source: String,
+    #[arg(long)]
+    reason: String,
 }
 
 #[derive(Args)]
@@ -1032,6 +1084,31 @@ fn run() -> Result<()> {
             }
             ApiCommand::PlanStatus { task } => {
                 print_json(&garnish.api_request_plans(task.as_deref())?)
+            }
+        },
+        Command::Mcp { command } => match command {
+            McpCommand::ServerSet(args) => {
+                print_json(&garnish.configure_mcp_server(&NewMcpServerRevision {
+                    project_id: args.project,
+                    name: args.name,
+                    enabled: args.enabled,
+                    transport: args.transport,
+                    executable: args.executable,
+                    executable_sha256: args.executable_sha256,
+                    argv: args.argv,
+                    allowed_tools: args.allowed_tools,
+                    network_hosts: args.network_hosts,
+                    secret_references: args.secret_references,
+                    startup_timeout_seconds: args.startup_timeout_seconds,
+                    request_timeout_seconds: args.request_timeout_seconds,
+                    max_context_bytes: args.max_context_bytes,
+                    max_output_bytes: args.max_output_bytes,
+                    source: args.source,
+                    reason: args.reason,
+                })?)
+            }
+            McpCommand::ServerStatus { project } => {
+                print_json(&garnish.mcp_servers(project.as_deref())?)
             }
         },
         Command::Schedule { command } => match command {
