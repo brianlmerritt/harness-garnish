@@ -78,6 +78,163 @@ pub struct Invocation {
     pub output_limit: usize,
 }
 
+pub const CODEX_SUBSCRIPTION_ACKNOWLEDGEMENT: &str = "I_ACCEPT_ONE_CODEX_SUBSCRIPTION_TASK";
+
+pub fn codex_subscription_patch_invocation(
+    executable: PathBuf,
+    cwd: &Path,
+    prompt: &str,
+) -> Result<Invocation> {
+    if !executable.is_absolute() {
+        bail!("Codex subscription executable must be an absolute path");
+    }
+    if !cwd.is_absolute() {
+        bail!("Codex subscription worktree must be an absolute path");
+    }
+    let mut environment = BTreeMap::new();
+    let home = env::var("HOME").context("Codex subscription execution requires HOME")?;
+    if !Path::new(&home).is_absolute() {
+        bail!("Codex subscription HOME must be an absolute path");
+    }
+    environment.insert("HOME".into(), home.clone());
+    let codex_home = env::var("CODEX_HOME").unwrap_or_else(|_| format!("{home}/.codex"));
+    if !Path::new(&codex_home).is_absolute() {
+        bail!("Codex subscription CODEX_HOME must be an absolute path");
+    }
+    environment.insert("CODEX_HOME".into(), codex_home);
+    environment.insert(
+        "PATH".into(),
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
+    );
+    environment.insert("LANG".into(), "C.UTF-8".into());
+    environment.insert("LC_ALL".into(), "C.UTF-8".into());
+    if let Ok(tmpdir) = env::var("TMPDIR")
+        && Path::new(&tmpdir).is_absolute()
+    {
+        environment.insert("TMPDIR".into(), tmpdir);
+    }
+    Ok(Invocation {
+        executable,
+        argv: [
+            "exec",
+            "--ephemeral",
+            "--json",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
+            "--cd",
+            cwd.to_str().context("Codex worktree path is not UTF-8")?,
+            "--config",
+            "approval_policy=\"never\"",
+            "--config",
+            "default_permissions=\":read-only\"",
+            "--config",
+            "mcp_servers={}",
+            "--config",
+            "features.apps=false",
+            "--config",
+            "features.hooks=false",
+            "--config",
+            "features.multi_agent=false",
+            "--config",
+            "features.plugins=false",
+            "--config",
+            "features.remote_plugin=false",
+            "--config",
+            "web_search=\"disabled\"",
+            "--config",
+            "shell_environment_policy.inherit=\"none\"",
+            "-",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        cwd: cwd.to_path_buf(),
+        environment,
+        stdin: prompt.as_bytes().to_vec(),
+        structured_protocol: Some("codex-jsonl-patch-v1".into()),
+        timeout: Duration::from_secs(45 * 60),
+        output_limit: 2 * 1024 * 1024,
+    })
+}
+
+pub fn extract_codex_subscription_patch(stdout: &[u8]) -> Result<String> {
+    if stdout.len() > 2 * 1024 * 1024 {
+        bail!("Codex JSONL output exceeds the 2 MiB boundary");
+    }
+    let mut thread_started = 0_u8;
+    let mut turn_started = 0_u8;
+    let mut turn_completed = 0_u8;
+    let mut agent_messages = Vec::new();
+    for line in stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let value: serde_json::Value =
+            serde_json::from_slice(line).context("Codex emitted malformed JSONL")?;
+        let event_type = value
+            .get("type")
+            .and_then(|value| value.as_str())
+            .context("Codex JSONL event has no type")?;
+        match event_type {
+            "thread.started" => thread_started = thread_started.saturating_add(1),
+            "turn.started" => turn_started = turn_started.saturating_add(1),
+            "turn.completed" => turn_completed = turn_completed.saturating_add(1),
+            "turn.failed" | "error" => bail!("Codex reported a terminal failure"),
+            "item.completed" => {
+                let item = value
+                    .get("item")
+                    .and_then(|value| value.as_object())
+                    .context("Codex completed item is malformed")?;
+                match item.get("type").and_then(|value| value.as_str()) {
+                    Some("agent_message") => {
+                        let text = item
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .context("Codex agent message has no text")?;
+                        agent_messages.push(text.to_owned());
+                    }
+                    Some("mcp_tool_call" | "web_search") => {
+                        bail!("Codex used a capability disabled by the subscription boundary")
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if thread_started != 1 || turn_started != 1 || turn_completed != 1 {
+        bail!("Codex JSONL lifecycle is incomplete or ambiguous");
+    }
+    let message = agent_messages
+        .last()
+        .context("Codex returned no final agent message")?;
+    let patch = normalize_codex_patch_message(message);
+    if patch.is_empty() || !patch.starts_with("diff --git ") {
+        bail!("Codex final message is not one unified Git patch");
+    }
+    if agent_messages[..agent_messages.len() - 1]
+        .iter()
+        .map(|message| normalize_codex_patch_message(message))
+        .any(|message| message.starts_with("diff --git "))
+    {
+        bail!("Codex returned more than one patch-bearing agent message");
+    }
+    if patch.len() > 1024 * 1024 || patch.contains('\0') {
+        bail!("Codex patch exceeds the 1 MiB text boundary");
+    }
+    Ok(format!("{patch}\n"))
+}
+
+fn normalize_codex_patch_message(message: &str) -> &str {
+    let message = message.trim();
+    message
+        .strip_prefix("```diff\n")
+        .and_then(|value| value.strip_suffix("\n```"))
+        .unwrap_or(message)
+        .trim()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
     Codex,
@@ -1755,6 +1912,84 @@ mod tests {
                     .any(|arg| arg == "$(touch /tmp/nope)")
             );
         }
+    }
+
+    #[test]
+    fn codex_subscription_patch_boundary_is_read_only_ephemeral_and_scrubbed() {
+        let invocation = codex_subscription_patch_invocation(
+            PathBuf::from("/fixture/codex"),
+            Path::new("/fixture/worktree"),
+            "return a patch",
+        )
+        .unwrap();
+        let argv = invocation
+            .argv
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair == ["--config", "default_permissions=\":read-only\""])
+        );
+        assert!(argv.contains(&"--ephemeral".into()));
+        assert!(argv.contains(&"--ignore-user-config".into()));
+        assert!(argv.contains(&"--ignore-rules".into()));
+        assert!(argv.contains(&"mcp_servers={}".into()));
+        assert!(argv.contains(&"features.hooks=false".into()));
+        assert!(argv.contains(&"features.multi_agent=false".into()));
+        assert!(argv.contains(&"features.plugins=false".into()));
+        assert!(argv.contains(&"features.remote_plugin=false".into()));
+        assert!(
+            !invocation
+                .environment
+                .keys()
+                .any(|name| name.contains("KEY") || name.contains("TOKEN"))
+        );
+        assert_eq!(invocation.stdin, b"return a patch");
+    }
+
+    #[test]
+    fn codex_subscription_jsonl_accepts_progress_then_one_final_patch_and_rejects_ambiguity() {
+        let accepted = br#"{"type":"thread.started","thread_id":"fixture"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"progress","type":"agent_message","text":"Inspecting the exact requested scope."}}
+{"type":"item.completed","item":{"id":"one","type":"agent_message","text":"diff --git a/result.txt b/result.txt\nnew file mode 100644\nindex 0000000..e69de29\n"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}
+"#;
+        assert!(
+            extract_codex_subscription_patch(accepted)
+                .unwrap()
+                .starts_with("diff --git")
+        );
+
+        let extension = br#"{"type":"thread.started"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"mcp_tool_call"}}
+{"type":"turn.completed"}
+"#;
+        assert!(extract_codex_subscription_patch(extension).is_err());
+
+        let incomplete = br#"{"type":"thread.started"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"diff --git a/a b/a"}}
+"#;
+        assert!(extract_codex_subscription_patch(incomplete).is_err());
+
+        let ambiguous = br#"{"type":"thread.started"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"diff --git a/a b/a"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"diff --git a/b b/b"}}
+{"type":"turn.completed"}
+"#;
+        assert!(extract_codex_subscription_patch(ambiguous).is_err());
+
+        let patch_then_trailing_prose = br#"{"type":"thread.started"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"diff --git a/a b/a"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Finished."}}
+{"type":"turn.completed"}
+"#;
+        assert!(extract_codex_subscription_patch(patch_then_trailing_prose).is_err());
     }
 
     #[test]

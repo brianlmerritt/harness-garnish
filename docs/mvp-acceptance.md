@@ -129,7 +129,7 @@ Unsupported or unavailable runtimes must produce a healthy diagnostic with actio
 
 Real tests are opt-in and individually labelled:
 
-- `real-codex`: bounded no-write or fixture-repository task using structured JSONL;
+- `real-codex`: `scripts/test-real-codex-subscription-smoke` runs exactly one acknowledged fixture-repository patch task using ephemeral JSONL and read-only Codex permissions; it must prove exact scope, detached verification, unchanged source checkout, redacted artifacts, and no automatic retry;
 - `real-claude`: bounded print/stream-JSON task with explicit tool and permission policy;
 - `real-antigravity`: bounded print task with explicit timeout and captured text;
 - `real-aoe`: authenticated loopback session lifecycle against a pinned supported AoE;

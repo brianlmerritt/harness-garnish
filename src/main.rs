@@ -157,6 +157,10 @@ enum TaskCommand {
     Show {
         id: String,
     },
+    Review {
+        id: String,
+    },
+    Readiness(TaskRoute),
     Dependency {
         id: String,
         #[arg(long)]
@@ -721,11 +725,26 @@ struct SchedulerDaemonArgs {
         help = "Stop cleanly after this many ticks (primarily for diagnostics)"
     )]
     max_ticks: Option<usize>,
+    #[arg(long, help = "Execute claimed work with the quota-free fake adapter")]
+    execute_fake: bool,
     #[arg(
         long,
-        help = "Execute claimed work with the quota-free fake adapter (real agents remain disabled)"
+        help = "Execute exactly pinned Codex subscription claims through the read-only patch boundary"
     )]
-    execute_fake: bool,
+    execute_codex: bool,
+    #[arg(
+        long,
+        value_name = "ACKNOWLEDGEMENT",
+        requires = "execute_codex",
+        help = "Required literal acknowledgement for one-at-a-time Codex subscription task execution"
+    )]
+    acknowledge_codex: Option<String>,
+    #[arg(
+        long,
+        requires = "execute_codex",
+        help = "Optional exact Codex executable path; otherwise the supported executable is discovered"
+    )]
+    codex_executable: Option<PathBuf>,
     #[arg(
         long,
         help = "Execute only explicitly pinned, fully planned paid API claims; requires --acknowledge-paid-api"
@@ -931,6 +950,13 @@ fn run() -> Result<()> {
             }
             TaskCommand::List { project } => print_json(&garnish.tasks(project.as_deref())?),
             TaskCommand::Show { id } => print_json(&garnish.task(&id)?),
+            TaskCommand::Review { id } => print_json(&garnish.task_review(&id)?),
+            TaskCommand::Readiness(args) => print_json(&garnish.task_readiness(
+                &args.id,
+                &args.adapter,
+                &args.provider,
+                &args.account,
+            )?),
             TaskCommand::Dependency { id, depends_on } => {
                 print_json(&garnish.add_dependency(&id, &depends_on)?)
             }
@@ -1165,6 +1191,9 @@ fn run() -> Result<()> {
                     claim_ttl: StdDuration::from_secs(args.claim_ttl_seconds),
                     max_ticks: args.max_ticks,
                     execute_fake_claims: args.execute_fake,
+                    execute_codex_claims: args.execute_codex,
+                    codex_subscription_acknowledgement: args.acknowledge_codex,
+                    codex_executable: args.codex_executable,
                     execute_api_claims: args.execute_api,
                     paid_api_acknowledgement: args.acknowledge_paid_api,
                     execute_api_patches: args.execute_api_patches,

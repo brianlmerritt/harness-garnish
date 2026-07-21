@@ -1,7 +1,9 @@
 use crate::{
     adapters::{
-        AgentKind, FakeSandbox, Invocation, ProbeResult, SandboxAttestation, probe_aoe,
-        probe_docker, probe_podman, run_invocation_with_tick, safe_write,
+        AgentKind, CODEX_SUBSCRIPTION_ACKNOWLEDGEMENT, FakeSandbox, Invocation, ProbeResult,
+        SandboxAttestation, codex_subscription_patch_invocation, discover_executable,
+        extract_codex_subscription_patch, probe_aoe, probe_docker, probe_podman,
+        run_invocation_with_tick, safe_write,
     },
     api_providers::{
         ApiFailureKind, ApiOutputItem, ApiProviderResponse, ApiRequestSpec, ApiTerminalStatus,
@@ -36,7 +38,7 @@ use crate::{
     },
     schedule,
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1151,6 +1153,65 @@ impl Garnish {
         self.db.run_records_for_task(task_id)
     }
 
+    pub fn task_review(&self, task_id: &str) -> Result<serde_json::Value> {
+        let task = self.db.task(task_id)?;
+        let run = self
+            .db
+            .run_records_for_task(task_id)?
+            .into_iter()
+            .rev()
+            .find(|run| {
+                if run.role != "implementer" {
+                    return false;
+                }
+                let directory = self.data_dir.join("runs").join(&run.id);
+                [
+                    "manifest.json",
+                    "verification.json",
+                    "handoff.json",
+                    "changes.patch",
+                ]
+                .into_iter()
+                .all(|name| directory.join(name).is_file())
+            })
+            .ok_or_else(|| anyhow::anyhow!("task has no reviewable implementer run"))?;
+        let directory = self.data_dir.join("runs").join(&run.id);
+        let bounded_json = |name: &str| -> Result<serde_json::Value> {
+            let path = directory.join(name);
+            let bytes = fs::read(&path)
+                .with_context(|| format!("reading review artifact {}", path.display()))?;
+            if bytes.len() > 2 * 1024 * 1024 {
+                bail!("review artifact exceeds the 2 MiB display boundary");
+            }
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing review artifact {}", path.display()))
+        };
+        let patch_path = directory.join("changes.patch");
+        let patch = fs::read(&patch_path)
+            .with_context(|| format!("reading review patch {}", patch_path.display()))?;
+        if patch.len() > 1024 * 1024 {
+            bail!("review patch exceeds the 1 MiB boundary");
+        }
+        Ok(serde_json::json!({
+            "task": task,
+            "run": run,
+            "manifest": bounded_json("manifest.json")?,
+            "verification": bounded_json("verification.json")?,
+            "handoff": bounded_json("handoff.json")?,
+            "artifacts": {
+                "directory": directory,
+                "patch_path": patch_path,
+                "patch_bytes": patch.len(),
+                "patch_sha256": hex::encode(Sha256::digest(&patch)),
+                "manifest_path": directory.join("manifest.json"),
+                "verification_path": directory.join("verification.json"),
+                "handoff_path": directory.join("handoff.json"),
+            },
+            "integration_authorized": false,
+            "next_action": "review the patch and verification; integrate manually under project policy",
+        }))
+    }
+
     pub fn checkpoint_run_at(
         &mut self,
         run_id: &str,
@@ -1231,7 +1292,7 @@ impl Garnish {
             &owner,
             generation,
             now,
-            std::time::Duration::from_secs(task.checkpoint_seconds.max(1)),
+            supervision_lease_ttl(task.checkpoint_seconds),
             action,
             reason_code,
             next_checkpoint_at,
@@ -1255,30 +1316,27 @@ impl Garnish {
     ) -> Result<SupervisedInvocationResult> {
         let (task_id, _, _) = self.db.run_lease_context(run_id)?;
         let task = self.db.task(&task_id)?;
-        let mut checkpoint_due =
-            std::time::Instant::now() + std::time::Duration::from_secs(task.checkpoint_seconds);
-        let outcome = run_invocation_with_tick(
-            invocation,
-            cancelled,
-            std::time::Duration::from_secs(1),
-            || {
-                let cancellation_requested = self.db.run_cancellation_requested(run_id)?;
-                if !cancellation_requested && std::time::Instant::now() < checkpoint_due {
-                    return Ok(false);
-                }
-                let checkpoint = self.checkpoint_run_at(run_id, provider, account, Utc::now())?;
-                let interval = checkpoint
-                    .next_checkpoint_at
-                    .map(|next| (next - checkpoint.evaluated_at).num_seconds().max(1) as u64)
-                    .unwrap_or(task.checkpoint_seconds.max(1));
-                checkpoint_due =
-                    std::time::Instant::now() + std::time::Duration::from_secs(interval);
-                Ok(matches!(
-                    checkpoint.action,
-                    CheckpointAction::Pause | CheckpointAction::Cancel
-                ))
-            },
-        )?;
+        let checkpoint_interval = std::time::Duration::from_secs(task.checkpoint_seconds.max(1));
+        let tick_interval =
+            std::cmp::min(std::time::Duration::from_secs(1), checkpoint_interval / 4);
+        let mut checkpoint_due = std::time::Instant::now() + checkpoint_interval / 2;
+        let outcome = run_invocation_with_tick(invocation, cancelled, tick_interval, || {
+            let cancellation_requested = self.db.run_cancellation_requested(run_id)?;
+            if !cancellation_requested && std::time::Instant::now() < checkpoint_due {
+                return Ok(false);
+            }
+            let checkpoint = self.checkpoint_run_at(run_id, provider, account, Utc::now())?;
+            let interval = checkpoint
+                .next_checkpoint_at
+                .map(|next| (next - checkpoint.evaluated_at).num_seconds().max(1) as u64)
+                .unwrap_or(task.checkpoint_seconds.max(1));
+            checkpoint_due =
+                std::time::Instant::now() + std::time::Duration::from_secs(interval) / 2;
+            Ok(matches!(
+                checkpoint.action,
+                CheckpointAction::Pause | CheckpointAction::Cancel
+            ))
+        })?;
         let failure_category = match outcome.classification {
             ExitClassification::Success => None,
             ExitClassification::Failed => Some(FailureCategory::ProcessFailed),
@@ -1350,6 +1408,25 @@ impl Garnish {
         now: DateTime<Utc>,
     ) -> Result<RouteDecision> {
         self.route_task_at_mode(task_id, adapter, provider, account, now, true, true)
+    }
+
+    pub fn task_readiness(
+        &mut self,
+        task_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+    ) -> Result<RouteDecision> {
+        let (decision, _) = self.route_task_candidates_at(
+            task_id,
+            &[RouteTarget {
+                adapter: adapter.into(),
+                provider: provider.into(),
+                account: account.into(),
+            }],
+            Utc::now(),
+        )?;
+        Ok(decision)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1868,6 +1945,24 @@ impl Garnish {
         } else {
             config.route_candidates.clone()
         };
+        if config.execute_codex_claims {
+            if config.max_active_claims != 1 {
+                bail!("codex.single_task_boundary: --execute-codex requires --max-active 1");
+            }
+            if route_targets.len() != 1
+                || route_targets[0].adapter != "codex"
+                || route_targets[0].provider != "codex"
+            {
+                bail!(
+                    "codex.route_missing: --execute-codex requires exactly one codex:codex:ACCOUNT route candidate"
+                );
+            }
+            if config.execute_api_claims {
+                bail!(
+                    "codex.execution_mode_conflict: Codex subscription and paid API execution require separate daemon invocations"
+                );
+            }
+        }
         if config.execute_api_claims {
             if api_transport.is_none() {
                 bail!(
@@ -1946,7 +2041,11 @@ impl Garnish {
                     )?;
                     ticks += 1;
                     claims_created += tick.claims.len();
-                    if config.execute_fake_claims || config.execute_api_claims {
+                    let mut codex_task_completed = false;
+                    if config.execute_fake_claims
+                        || config.execute_codex_claims
+                        || config.execute_api_claims
+                    {
                         for claim in &tick.claims {
                             let route_decision_id =
                                 claim.route_decision_id.as_deref().ok_or_else(|| {
@@ -1977,6 +2076,17 @@ impl Garnish {
                                     tick_at,
                                 )?;
                                 runs_completed += 1;
+                            } else if selected_adapter == "codex" && config.execute_codex_claims {
+                                self.run_scheduler_codex_claim(
+                                    claim,
+                                    &config.instance_id,
+                                    leader.generation,
+                                    route,
+                                    config.codex_executable.as_deref(),
+                                    tick_at,
+                                )?;
+                                runs_completed += 1;
+                                codex_task_completed = true;
                             } else if selected_adapter == "api" && config.execute_api_claims {
                                 let transport = api_transport.as_deref_mut().ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -1994,6 +2104,10 @@ impl Garnish {
                                 runs_completed += 1;
                             }
                         }
+                    }
+                    if codex_task_completed {
+                        shutdown_reason = "codex_task_completed".to_owned();
+                        break;
                     }
                     if config.max_ticks.is_some_and(|limit| ticks >= limit) {
                         shutdown_reason = "max_ticks".to_owned();
@@ -2090,6 +2204,34 @@ impl Garnish {
                 decision.selected_account = None;
                 decision.reason_code = "api.explicit_selection_required".into();
                 decision.reason = "api.explicit_selection_required: every paid API scheduler candidate requires an exact task pin and cannot be selected as fallback".into();
+                decision.candidates[0].allowed = false;
+                decision.candidates[0].reason_code = decision.reason_code.clone();
+                decision.candidates[0].filter_reason = decision.reason.clone();
+            }
+            let exact_codex_pin = pin.as_ref().is_some_and(|pin| {
+                pin.adapter == "codex"
+                    && pin.provider == target.provider
+                    && pin.account == target.account
+            });
+            if target.adapter == "codex" && !exact_codex_pin {
+                decision.allowed = false;
+                decision.selected_adapter = None;
+                decision.selected_provider = None;
+                decision.selected_account = None;
+                decision.reason_code = "codex.explicit_selection_required".into();
+                decision.reason = "codex.explicit_selection_required: every Codex subscription scheduler candidate requires an exact task pin and cannot be selected as fallback".into();
+                decision.candidates[0].allowed = false;
+                decision.candidates[0].reason_code = decision.reason_code.clone();
+                decision.candidates[0].filter_reason = decision.reason.clone();
+            }
+            if target.adapter == "codex" && target.provider != "codex" {
+                decision.allowed = false;
+                decision.selected_adapter = None;
+                decision.selected_provider = None;
+                decision.selected_account = None;
+                decision.reason_code = "codex.provider_denied".into();
+                decision.reason =
+                    "codex.provider_denied: subscription execution requires provider codex".into();
                 decision.candidates[0].allowed = false;
                 decision.candidates[0].reason_code = decision.reason_code.clone();
                 decision.candidates[0].filter_reason = decision.reason.clone();
@@ -2785,7 +2927,7 @@ impl Garnish {
             &worktree.branch,
             &worktree.base_commit,
             now,
-            std::time::Duration::from_secs(task.checkpoint_seconds),
+            supervision_lease_ttl(task.checkpoint_seconds),
         )?;
         self.finish_agent_run(
             task,
@@ -2797,6 +2939,229 @@ impl Garnish {
             sandbox,
             true,
             vec!["fake backend attestation is deterministic test evidence".into()],
+        )
+    }
+
+    fn run_scheduler_codex_claim(
+        &mut self,
+        claim: &SchedulerClaim,
+        instance_id: &str,
+        leader_generation: i64,
+        route: RouteDecision,
+        executable_override: Option<&Path>,
+        now: DateTime<Utc>,
+    ) -> Result<RunSummary> {
+        if claim.route_decision_id.as_deref() != Some(route.id.as_str())
+            || route.selected_adapter.as_deref() != Some("codex")
+        {
+            bail!("codex.route_mismatch: scheduler claim does not select Codex");
+        }
+        let provider = route
+            .selected_provider
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("codex.route_mismatch: route has no provider"))?;
+        let account = route
+            .selected_account
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("codex.route_mismatch: route has no account"))?;
+        if provider != "codex" {
+            bail!("codex.route_mismatch: subscription execution requires provider codex");
+        }
+        let task = self.db.task(&claim.task_id)?;
+        if task.status != TaskStatus::Leased {
+            bail!(
+                "Codex scheduler claim task must be leased; current status is {}",
+                task.status
+            );
+        }
+        if task.risk_class != 1 {
+            bail!("codex.patch_risk_mismatch: Codex subscription patch tasks require risk class 1");
+        }
+        let allowed_patch_paths = validated_patch_scope(&task)?;
+        let project = self.db.project(&task.project_id)?;
+        let worktree_destination = self
+            .data_dir
+            .join("worktrees")
+            .join(&project.slug)
+            .join(&task.id);
+        let worktree = git::create_or_reuse_task_worktree(
+            Path::new(&project.root_path),
+            &worktree_destination,
+            &task.id,
+        )?;
+        match self.policy.authorize_isolated_patch(task.risk_class, true) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::RequireApproval => {
+                bail!("Codex subscription patch requires approval before claim consumption")
+            }
+            PolicyDecision::Deny(reason) => {
+                bail!("policy denied Codex subscription patch: {reason}")
+            }
+        }
+        let executable = executable_override
+            .map(Path::to_path_buf)
+            .or_else(|| discover_executable("codex"))
+            .ok_or_else(|| anyhow::anyhow!("codex executable not found"))?;
+        let prompt = render_codex_subscription_patch_prompt(&task)?;
+        let invocation =
+            codex_subscription_patch_invocation(executable, Path::new(&worktree.path), &prompt)?;
+        let sandbox = codex_subscription_attestation(Path::new(&worktree.path));
+        let run_id = Ulid::new().to_string();
+        self.db.begin_claimed_run(
+            &claim.id,
+            instance_id,
+            leader_generation,
+            &run_id,
+            "codex",
+            &worktree.path,
+            &worktree.branch,
+            &worktree.base_commit,
+            now,
+            supervision_lease_ttl(task.checkpoint_seconds),
+        )?;
+        self.db.append_run_event(
+            &task.id,
+            &run_id,
+            "codex.subscription_started",
+            "control_plane",
+            &serde_json::json!({
+                "protocol": "codex-exec-jsonl-patch-v1",
+                "permission_profile": ":read-only",
+                "ephemeral": true,
+                "allowed_patch_paths": allowed_patch_paths,
+            }),
+        )?;
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let checkpoint_interval = std::time::Duration::from_secs(task.checkpoint_seconds.max(1));
+        let tick_interval =
+            std::cmp::min(std::time::Duration::from_secs(1), checkpoint_interval / 4);
+        let mut checkpoint_due = std::time::Instant::now() + checkpoint_interval / 2;
+        let outcome = run_invocation_with_tick(&invocation, cancelled, tick_interval, || {
+            let cancellation_requested = self.db.run_cancellation_requested(&run_id)?;
+            if !cancellation_requested && std::time::Instant::now() < checkpoint_due {
+                return Ok(false);
+            }
+            let checkpoint = self.checkpoint_run_at(&run_id, provider, account, Utc::now())?;
+            let interval = checkpoint
+                .next_checkpoint_at
+                .map(|next| (next - checkpoint.evaluated_at).num_seconds().max(1) as u64)
+                .unwrap_or(task.checkpoint_seconds.max(1));
+            checkpoint_due =
+                std::time::Instant::now() + std::time::Duration::from_secs(interval) / 2;
+            Ok(matches!(
+                checkpoint.action,
+                CheckpointAction::Pause | CheckpointAction::Cancel
+            ))
+        })?;
+        let stdout_hash = hex::encode(Sha256::digest(&outcome.stdout));
+        let stderr_hash = hex::encode(Sha256::digest(&outcome.stderr));
+        self.db.append_run_event(
+            &task.id,
+            &run_id,
+            "codex.subscription_process_completed",
+            "supervisor",
+            &serde_json::json!({
+                "classification": outcome.classification,
+                "exit_code": outcome.exit_code,
+                "stdout_bytes": outcome.stdout.len(),
+                "stderr_bytes": outcome.stderr.len(),
+                "stdout_sha256": stdout_hash,
+                "stderr_sha256": stderr_hash,
+                "stdout_truncated": outcome.stdout_truncated,
+                "stderr_truncated": outcome.stderr_truncated,
+            }),
+        )?;
+        if outcome.classification != ExitClassification::Success
+            || outcome.stdout_truncated
+            || outcome.stderr_truncated
+        {
+            let failure = match outcome.classification {
+                ExitClassification::TimedOut => FailureCategory::TimedOut,
+                ExitClassification::Cancelled => FailureCategory::Cancelled,
+                ExitClassification::Signalled => FailureCategory::Signalled,
+                _ => FailureCategory::ProcessFailed,
+            };
+            let redacted = serde_json::json!({
+                "classification": outcome.classification,
+                "exit_code": outcome.exit_code,
+                "stdout_sha256": stdout_hash,
+                "stderr_sha256": stderr_hash,
+                "output_redacted": true,
+            });
+            let termination = outcome
+                .termination
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?;
+            self.db.record_process_outcome(
+                &run_id,
+                Some(failure),
+                outcome.exit_code,
+                &redacted,
+                termination.as_ref(),
+                Utc::now(),
+            )?;
+            bail!(
+                "codex.execution_uncertain: Codex process did not complete cleanly and will not be retried automatically"
+            );
+        }
+        let postprocess = (|| -> Result<(String, Vec<String>)> {
+            let patch = extract_codex_subscription_patch(&outcome.stdout)?;
+            git::apply_untrusted_patch(Path::new(&worktree.path), patch.as_bytes())?;
+            let changed_files = git::changed_files(Path::new(&worktree.path))?;
+            validate_applied_patch_paths(
+                Path::new(&worktree.path),
+                &changed_files,
+                &allowed_patch_paths,
+            )?;
+            Ok((patch, changed_files))
+        })();
+        let (patch, changed_files) = match postprocess {
+            Ok(result) => result,
+            Err(error) => {
+                let redacted = serde_json::json!({
+                    "classification": "invalid_output",
+                    "reason_code": "codex.patch_rejected",
+                    "stdout_sha256": stdout_hash,
+                    "stderr_sha256": stderr_hash,
+                    "output_redacted": true,
+                });
+                self.db.record_process_outcome(
+                    &run_id,
+                    Some(FailureCategory::ProcessFailed),
+                    outcome.exit_code,
+                    &redacted,
+                    None,
+                    Utc::now(),
+                )?;
+                return Err(error.context("codex.patch_rejected"));
+            }
+        };
+        self.db.append_run_event(
+            &task.id,
+            &run_id,
+            "codex.subscription_patch_applied",
+            "control_plane",
+            &serde_json::json!({
+                "patch_bytes": patch.len(),
+                "patch_sha256": hex::encode(Sha256::digest(patch.as_bytes())),
+                "changed_files": changed_files,
+            }),
+        )?;
+        self.finish_agent_run(
+            task,
+            project,
+            "codex",
+            route,
+            worktree,
+            run_id,
+            sandbox,
+            false,
+            vec![
+                "Codex subscription authentication remained in the host control process".into(),
+                "Codex commands used the built-in read-only permission profile".into(),
+                "the control plane applied one validated exact-scope patch".into(),
+            ],
         )
     }
 
@@ -2904,7 +3269,7 @@ impl Garnish {
             &worktree.branch,
             &worktree.base_commit,
             now,
-            std::time::Duration::from_secs(task.checkpoint_seconds),
+            supervision_lease_ttl(task.checkpoint_seconds),
         )?;
         self.db.append_run_event(
             &task.id,
@@ -3582,6 +3947,11 @@ fn fallback_forecast_percent(estimated_seconds: u64, uncertainty_percent: u8) ->
     (baseline * (1.0 + f64::from(uncertainty_percent) / 100.0)).clamp(1.0, 50.0)
 }
 
+fn supervision_lease_ttl(checkpoint_seconds: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(checkpoint_seconds.max(1))
+        .saturating_add(std::time::Duration::from_secs(5))
+}
+
 fn task_route_pin(task: &Task) -> Result<Option<RouteTarget>> {
     match (
         task.pinned_adapter.as_ref(),
@@ -3723,7 +4093,68 @@ fn direct_api_attestation(provider: &str, worktree: &Path, patch_mode: bool) -> 
     }
 }
 
+fn codex_subscription_attestation(_worktree: &Path) -> SandboxAttestation {
+    SandboxAttestation {
+        backend: "host-codex-read-only-patch".into(),
+        secure_container: false,
+        image: "not-applicable".into(),
+        writable_mounts: vec![],
+        network: "Codex control traffic only; sandboxed commands have no network grant".into(),
+        user: "current-host-user".into(),
+        container_socket_mounted: false,
+        host_home_mounted: true,
+        cpu_limit: "host-process".into(),
+        memory_limit: "2 MiB captured output boundary".into(),
+        pids_limit: 0,
+        rootless: None,
+        user_namespace: None,
+        effective_capabilities: Some(vec![
+            "codex.exec.jsonl".into(),
+            "codex.permissions.read-only".into(),
+            "garnish.exact-scope-patch-application".into(),
+        ]),
+        capability_evidence_source: Some("Codex CLI contract plus Garnish process boundary".into()),
+        inherited_proxy_environment: vec![],
+        reasons: vec![
+            "this is not a secure-container attestation".into(),
+            "Codex receives no direct repository write authority".into(),
+            "saved subscription authentication is used only by the host Codex control process"
+                .into(),
+            "Garnish validates and applies the returned patch to the isolated worktree".into(),
+        ],
+    }
+}
+
+fn render_codex_subscription_patch_prompt(task: &Task) -> Result<String> {
+    let scope = validated_patch_scope(task)?;
+    Ok(format!(
+        "You are proposing one bounded repository patch.\n\nGoal:\n{}\n\nAcceptance criteria:\n{}\n\nExact writable scope:\n{}\n\nInspect the repository and return exactly one standard UTF-8 unified Git patch as the final message. Do not wrap it in prose. Do not use MCP, apps, web search, or network access. Do not attempt to modify files directly. The patch must change only the exact scope paths above. If no safe patch is possible, fail the turn instead of returning prose.",
+        task.goal,
+        task.acceptance
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        scope
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ))
+}
+
 fn validate_api_runtime_config(config: &SchedulerDaemonConfig) -> Result<()> {
+    if config.execute_codex_claims {
+        if config.codex_subscription_acknowledgement.as_deref()
+            != Some(CODEX_SUBSCRIPTION_ACKNOWLEDGEMENT)
+        {
+            bail!(
+                "codex.execution_acknowledgement_required: --execute-codex requires the exact Codex subscription acknowledgement"
+            );
+        }
+    } else if config.codex_subscription_acknowledgement.is_some() {
+        bail!("codex.execution_disabled: Codex acknowledgement is invalid without --execute-codex");
+    }
     if config.execute_api_claims {
         if config.paid_api_acknowledgement.as_deref() != Some(PAID_API_DAEMON_ACKNOWLEDGEMENT) {
             bail!(
@@ -4910,6 +5341,151 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[ignore = "real-codex-subscription: requires the explicit scripts/test-real-codex-subscription-smoke opt-in"]
+    fn real_codex_subscription_patch_smoke_is_explicit_scoped_and_verified() {
+        const ACKNOWLEDGEMENT: &str = "I_ACCEPT_ONE_CODEX_SUBSCRIPTION_TASK";
+        assert_eq!(
+            std::env::var("GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION").as_deref(),
+            Ok(ACKNOWLEDGEMENT),
+            "the Codex subscription acknowledgement is missing or incorrect"
+        );
+        let remaining_percent: f64 = std::env::var("GARNISH_REAL_CODEX_REMAINING_PERCENT")
+            .expect("GARNISH_REAL_CODEX_REMAINING_PERCENT is required")
+            .parse()
+            .expect("GARNISH_REAL_CODEX_REMAINING_PERCENT must be numeric");
+        assert!((0.0..=100.0).contains(&remaining_percent));
+
+        let probe = AgentKind::Codex.probe();
+        assert_eq!(
+            probe.health, "healthy",
+            "Codex CLI is unavailable or unsupported: {:?}",
+            probe.failure
+        );
+        let executable = PathBuf::from(
+            probe
+                .executable
+                .clone()
+                .expect("a healthy Codex probe must identify its executable"),
+        );
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("source");
+        fixture_repo(&source);
+        let data_dir = directory.path().join("data");
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish
+            .add_project("real-codex-smoke", "Real Codex smoke", &source)
+            .unwrap();
+        let mut new_task = task(project.id);
+        new_task.title = "Create the exact scoped Codex smoke-test file".into();
+        new_task.goal = "Create result.txt containing exactly one line: done".into();
+        new_task.acceptance = vec!["result.txt contains exactly done followed by a newline".into()];
+        new_task.verification_argv = vec![
+            "grep".into(),
+            "-qx".into(),
+            "done".into(),
+            "result.txt".into(),
+        ];
+        new_task.scope = vec!["result.txt".into()];
+        new_task.non_scope = vec!["all other paths".into(), "Git integration".into()];
+        new_task.fake_write_path = None;
+        new_task.fake_write_content = None;
+        let work = garnish.add_task(&new_task).unwrap();
+        garnish
+            .set_task_route_pin(
+                &work.id,
+                "codex",
+                "codex",
+                "smoke",
+                "explicit one-task Codex subscription smoke",
+            )
+            .unwrap();
+        garnish
+            .set_quota(
+                "codex",
+                "smoke",
+                "operator_observed",
+                Some(remaining_percent),
+                20.0,
+                None,
+                "explicit pre-smoke operator observation",
+                None,
+            )
+            .unwrap();
+        let now = Utc::now();
+        garnish
+            .db
+            .record_agent_capability_probe(&AgentCapabilityProbe {
+                id: Ulid::new().to_string(),
+                adapter: "codex".into(),
+                executable: probe.executable,
+                version: probe.version,
+                health: probe.health,
+                capabilities: probe.capabilities,
+                failure: probe.failure,
+                probed_at: now,
+                valid_until: now + Duration::minutes(5),
+            })
+            .unwrap();
+        let readiness = garnish
+            .task_readiness(&work.id, "codex", "codex", "smoke")
+            .unwrap();
+        assert!(
+            readiness.allowed,
+            "Codex smoke readiness was denied: {}",
+            readiness.reason
+        );
+        let config = SchedulerDaemonConfig {
+            instance_id: "real-codex-smoke".into(),
+            hostname: "local".into(),
+            adapter: "codex".into(),
+            provider: "codex".into(),
+            account: "smoke".into(),
+            route_candidates: vec![],
+            max_active_claims: 1,
+            max_active_per_adapter: 1,
+            max_active_per_account: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            leader_ttl: std::time::Duration::from_secs(30),
+            claim_ttl: std::time::Duration::from_secs(300),
+            max_ticks: Some(1),
+            execute_fake_claims: false,
+            execute_codex_claims: true,
+            codex_subscription_acknowledgement: Some(ACKNOWLEDGEMENT.into()),
+            codex_executable: Some(executable),
+            execute_api_claims: false,
+            paid_api_acknowledgement: None,
+            execute_api_patches: false,
+            api_patch_acknowledgement: None,
+        };
+        let summary = garnish
+            .run_scheduler_daemon_with(&config, &AtomicBool::new(false), None, Utc::now, |_| {})
+            .unwrap();
+        assert_eq!(summary.claims_created, 1);
+        assert_eq!(summary.runs_completed, 1);
+        assert_eq!(summary.shutdown_reason, "codex_task_completed");
+        assert_eq!(garnish.task(&work.id).unwrap().status, TaskStatus::Review);
+        assert_eq!(
+            fs::read_to_string(
+                data_dir
+                    .join("worktrees/real-codex-smoke")
+                    .join(&work.id)
+                    .join("result.txt")
+            )
+            .unwrap(),
+            "done\n"
+        );
+        assert!(!source.join("result.txt").exists());
+        let review = garnish.task_review(&work.id).unwrap();
+        assert_eq!(review["verification"]["passed"], true);
+        assert_eq!(
+            review["handoff"]["changed_files"],
+            serde_json::json!(["result.txt"])
+        );
+        assert_eq!(review["integration_authorized"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[ignore = "real-paid-api-patch: requires the explicit scripts/test-real-api-patch-smoke opt-in"]
     fn real_paid_api_patch_smoke_is_explicit_scoped_and_verified() {
         use std::time::Duration as StdDuration;
@@ -5008,6 +5584,9 @@ mod tests {
             claim_ttl: StdDuration::from_secs(300),
             max_ticks: Some(1),
             execute_fake_claims: false,
+            execute_codex_claims: false,
+            codex_subscription_acknowledgement: None,
+            codex_executable: None,
             execute_api_claims: true,
             paid_api_acknowledgement: Some(PAID_API_DAEMON_ACKNOWLEDGEMENT.into()),
             execute_api_patches: true,
@@ -6970,6 +7549,9 @@ mod tests {
             claim_ttl: std::time::Duration::from_secs(10),
             max_ticks: Some(2),
             execute_fake_claims: false,
+            execute_codex_claims: false,
+            codex_subscription_acknowledgement: None,
+            codex_executable: None,
             execute_api_claims: false,
             paid_api_acknowledgement: None,
             execute_api_patches: false,
@@ -7034,6 +7616,9 @@ mod tests {
             claim_ttl: std::time::Duration::from_secs(10),
             max_ticks: Some(1),
             execute_fake_claims: true,
+            execute_codex_claims: false,
+            codex_subscription_acknowledgement: None,
+            codex_executable: None,
             execute_api_claims: false,
             paid_api_acknowledgement: None,
             execute_api_patches: false,
@@ -7066,6 +7651,158 @@ mod tests {
                 .join(&task.id)
                 .join("result.txt")
                 .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_executes_exactly_pinned_codex_subscription_patch_with_fake_cli() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn collect(path: &Path, output: &mut Vec<Vec<u8>>) {
+            if path.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    collect(&entry.unwrap().path(), output);
+                }
+            } else if path.is_file() {
+                output.push(fs::read(path).unwrap());
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let data_dir = dir.path().join("data");
+        let executable = dir.path().join("codex-fixture");
+        let patch = "diff --git a/result.txt b/result.txt\nnew file mode 100644\n--- /dev/null\n+++ b/result.txt\n@@ -0,0 +1 @@\n+done\n";
+        let lines = [
+            serde_json::json!({"type":"thread.started","thread_id":"fixture"}),
+            serde_json::json!({"type":"turn.started"}),
+            serde_json::json!({"type":"item.completed","item":{"type":"reasoning","text":"auth-secret-canary"}}),
+            serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":patch}}),
+            serde_json::json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}),
+        ];
+        let quoted = lines
+            .iter()
+            .map(|line| format!("'{line}'"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nsleep 2\nprintf '%s\\n' {quoted}\nprintf '%s\\n' 'auth-secret-canary' >&2\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let mut codex_task = task(project.id);
+        codex_task.checkpoint_seconds = 1;
+        let work = garnish.add_task(&codex_task).unwrap();
+        garnish
+            .set_task_route_pin(
+                &work.id,
+                "codex",
+                "codex",
+                "default",
+                "explicit subscription execution",
+            )
+            .unwrap();
+        garnish
+            .set_quota(
+                "codex",
+                "default",
+                "five_hour",
+                Some(90.0),
+                20.0,
+                None,
+                "fixture",
+                None,
+            )
+            .unwrap();
+        let now = Utc::now();
+        garnish
+            .db
+            .record_agent_capability_probe(&AgentCapabilityProbe {
+                id: "codex-fixture-probe".into(),
+                adapter: "codex".into(),
+                executable: Some(executable.to_string_lossy().into_owned()),
+                version: Some("codex-cli 0.144.6".into()),
+                health: "healthy".into(),
+                capabilities: vec!["agent.headless".into()],
+                failure: None,
+                probed_at: now,
+                valid_until: now + Duration::minutes(5),
+            })
+            .unwrap();
+        let readiness = garnish
+            .task_readiness(&work.id, "codex", "codex", "default")
+            .unwrap();
+        assert!(readiness.allowed);
+        assert_eq!(readiness.selected_adapter.as_deref(), Some("codex"));
+        let config = SchedulerDaemonConfig {
+            instance_id: "codex-fixture-daemon".into(),
+            hostname: "fixture".into(),
+            adapter: "codex".into(),
+            provider: "codex".into(),
+            account: "default".into(),
+            route_candidates: vec![],
+            max_active_claims: 1,
+            max_active_per_adapter: 1,
+            max_active_per_account: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            leader_ttl: std::time::Duration::from_secs(10),
+            claim_ttl: std::time::Duration::from_secs(120),
+            max_ticks: Some(1),
+            execute_fake_claims: false,
+            execute_codex_claims: true,
+            codex_subscription_acknowledgement: Some(CODEX_SUBSCRIPTION_ACKNOWLEDGEMENT.into()),
+            codex_executable: Some(executable),
+            execute_api_claims: false,
+            paid_api_acknowledgement: None,
+            execute_api_patches: false,
+            api_patch_acknowledgement: None,
+        };
+        let shutdown = AtomicBool::new(false);
+        let summary = garnish
+            .run_scheduler_daemon_with(&config, &shutdown, None, Utc::now, |_| {})
+            .unwrap();
+        assert_eq!(summary.runs_completed, 1);
+        assert_eq!(summary.shutdown_reason, "codex_task_completed");
+        assert_eq!(garnish.task(&work.id).unwrap().status, TaskStatus::Review);
+        assert!(!source.join("result.txt").exists());
+        let run = garnish
+            .run_records(&work.id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.role == "implementer")
+            .unwrap();
+        let events = garnish.db.events_for_run(&run.id).unwrap();
+        assert!(events.iter().any(|event| {
+            event["type"] == "run.checkpointed" && event["actor"] == "supervisor"
+        }));
+        assert_eq!(
+            fs::read_to_string(Path::new(&run.worktree_path).join("result.txt")).unwrap(),
+            "done\n"
+        );
+        let review = garnish.task_review(&work.id).unwrap();
+        assert_eq!(review["run"]["adapter"], "codex");
+        assert_eq!(review["verification"]["passed"], true);
+        assert_eq!(review["integration_authorized"], false);
+        assert_eq!(
+            review["handoff"]["changed_files"],
+            serde_json::json!(["result.txt"])
+        );
+        let mut artifacts = Vec::new();
+        collect(&data_dir, &mut artifacts);
+        assert!(
+            artifacts
+                .iter()
+                .all(|bytes| { !String::from_utf8_lossy(bytes).contains("auth-secret-canary") })
         );
     }
 
@@ -7230,6 +7967,9 @@ mod tests {
             claim_ttl: std::time::Duration::from_secs(10),
             max_ticks: Some(1),
             execute_fake_claims: false,
+            execute_codex_claims: false,
+            codex_subscription_acknowledgement: None,
+            codex_executable: None,
             execute_api_claims: true,
             paid_api_acknowledgement: Some(PAID_API_DAEMON_ACKNOWLEDGEMENT.into()),
             execute_api_patches: false,
@@ -7594,6 +8334,9 @@ mod tests {
                 claim_ttl: std::time::Duration::from_secs(10),
                 max_ticks: Some(1),
                 execute_fake_claims: false,
+                execute_codex_claims: false,
+                codex_subscription_acknowledgement: None,
+                codex_executable: None,
                 execute_api_claims: true,
                 paid_api_acknowledgement: Some(PAID_API_DAEMON_ACKNOWLEDGEMENT.into()),
                 execute_api_patches: true,
@@ -7629,6 +8372,10 @@ mod tests {
                 .join("result.txt");
             assert_eq!(fs::read_to_string(result).unwrap(), "done\n");
             assert!(!source.join("result.txt").exists());
+            let review = garnish.task_review(&task.id).unwrap();
+            assert_eq!(review["run"]["adapter"], "api");
+            assert_eq!(review["verification"]["passed"], true);
+            assert_eq!(review["integration_authorized"], false);
             let implementer = garnish
                 .db
                 .run_records_for_task(&task.id)
@@ -7705,6 +8452,9 @@ mod tests {
             claim_ttl: std::time::Duration::from_secs(10),
             max_ticks: Some(1),
             execute_fake_claims: false,
+            execute_codex_claims: false,
+            codex_subscription_acknowledgement: None,
+            codex_executable: None,
             execute_api_claims: true,
             paid_api_acknowledgement: Some("NOT_ACCEPTED".into()),
             execute_api_patches: false,

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 2 ]]; then
+  echo 'usage: write-codex-smoke-receipt CODEX_VERSION RECEIPT_DIR' >&2
+  exit 2
+fi
+
+codex_version="$1"
+receipt_dir="$2"
+if [[ ! "$codex_version" =~ ^codex-cli[[:space:]][0-9]+[.][0-9]+[.][0-9]+([+-][A-Za-z0-9.-]+)?$ ]]; then
+  echo 'error: unexpected Codex CLI version shape' >&2
+  exit 2
+fi
+
+mkdir -p "$receipt_dir"
+chmod 700 "$receipt_dir"
+receipt_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+receipt_stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+receipt_path="$receipt_dir/$receipt_stamp-$$-codex-subscription-patch.json"
+umask 077
+set -o noclobber
+
+printf '{\n  "schema_version": 1,\n  "test": "codex_subscription_patch",\n  "codex_version": "%s",\n  "outcome": "passed",\n  "subscription_tasks": 1,\n  "max_retries": 0,\n  "scope": ["result.txt"],\n  "permission_profile": ":read-only",\n  "verification": "passed in a separate detached worktree",\n  "source_checkout_changed": false,\n  "raw_model_output_persisted": false,\n  "evidence": "exact ignored Cargo test exited successfully",\n  "recorded_at": "%s"\n}\n' \
+  "$codex_version" "$receipt_time" >"$receipt_path"
+
+echo "redacted receipt: $receipt_path"

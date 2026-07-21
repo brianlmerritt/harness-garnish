@@ -55,7 +55,7 @@ garnish --data-dir .garnish-state quota set --provider fake --account test --sur
 garnish --data-dir .garnish-state task add --project example --title "Bounded change" --goal "Create result.txt" --accept "result.txt contains done" --verify-argv '["grep","-q","done","result.txt"]' --scope result.txt --non-scope "remote Git" --fake-write-path result.txt --fake-write-content done
 ```
 
-`task run` is deliberately limited to deterministic fake adapters in the normal path. Real Codex, Claude Code, Antigravity, AoE, and runtime smoke tests remain individually opt-in and are never part of default CI.
+`task run` is deliberately limited to deterministic fake adapters. Codex subscription execution and paid API execution use separate, explicitly acknowledged scheduler paths described below. Claude Code, Antigravity, AoE, and all real external smoke tests remain disabled in normal tests and default CI.
 
 ### Day-aware scheduling
 
@@ -96,7 +96,7 @@ The continuous daemon owns and renews both the leader lease and its task claims.
 garnish --data-dir .garnish-state scheduler daemon --instance local-1 --hostname my-mac
 ```
 
-By default the daemon only arbitrates and holds eligible work. `--execute-fake` additionally exercises the quota-free fake claim-to-run path: the route, claim, single-use action key, run, run lease, and project lock are bound durably before fake execution begins. Real agents remain opt-in while their secure-container execution path is connected. `--max-ticks` provides a bounded diagnostic run.
+By default the daemon only arbitrates and holds eligible work. `--execute-fake` additionally exercises the quota-free fake claim-to-run path: the route, claim, single-use action key, run, run lease, and project lock are bound durably before fake execution begins. Codex subscription and API execution remain separate opt-in paths. `--max-ticks` provides a bounded diagnostic run.
 
 ```console
 garnish --data-dir .garnish-state scheduler daemon --instance local-1 --hostname my-mac --execute-fake --max-ticks 1
@@ -127,9 +127,9 @@ A missing or unsupported CLI is recorded as evidence rather than treated as heal
 Schema 9 makes task pins durable and lets scheduler ticks/daemons consider multiple route identities. Pin changes always require a reason:
 
 ```console
-garnish --data-dir .garnish-state task pin TASK_ID --adapter codex --provider openai --account primary --reason "preserve session continuity"
+garnish --data-dir .garnish-state task pin TASK_ID --adapter codex --provider codex --account default --reason "use the explicitly selected Codex subscription"
 garnish --data-dir .garnish-state task unpin TASK_ID --reason "continuity no longer required"
-garnish --data-dir .garnish-state scheduler tick --instance local-1 --generation 1 --candidate codex:openai:primary --candidate claude:anthropic:max
+garnish --data-dir .garnish-state scheduler tick --instance local-1 --generation 1 --candidate codex:codex:default
 ```
 
 `TASK_ID` is a placeholder for the ID returned by `task add`. Candidate values are real configured identities, not fallback API permissions. A pin cannot bypass capability, health, policy, quota, or concurrency gates.
@@ -154,6 +154,58 @@ garnish --data-dir .garnish-state quota forecast --adapter codex --provider code
 ```
 
 `quota record-usage` is currently a collector/operator ingestion contract, not an instruction to estimate percentages by hand. Its required `--evidence-id` must be a stable real run or collector identifier; `--source` must name the real evidence source. Provider-reported, collector-measured, and explicit user-reported confidence are distinct from untrusted agent output.
+
+### CLI MVP: one Codex subscription patch
+
+The Codex subscription lane is intentionally one task per daemon invocation. It uses saved Codex CLI authentication in the host control process, but runs `codex exec` ephemerally with JSONL output and the built-in `:read-only` permission profile. User configuration, exec-policy rule files, MCP, apps, hooks, plugins, multi-agent operation, and web search are disabled. Repository content, including `AGENTS.md`, remains untrusted model input and cannot expand authority. Codex cannot write the repository: its sole accepted result is one bounded unified Git patch, which Garnish validates against the task's exact scope and applies only to an isolated worktree. A detached verifier must pass before the task reaches `review`. These choices follow the official [Codex non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode), [Codex permissions](https://learn.chatgpt.com/docs/permissions), and [Codex `AGENTS.md`](https://learn.chatgpt.com/docs/agent-configuration/agents-md) contracts.
+
+First make sure `codex` is installed and already signed in with the subscription account you intend to use. These two commands do not submit a task:
+
+```console
+codex --version
+garnish --data-dir .garnish-state agent refresh --valid-seconds 300
+```
+
+Next provide quota evidence. Prefer the CodexBar refresh documented above because it expires after its configured validity window. For an operator-controlled initial test, the following manual value is explicit evidence supplied by you; replace `90` with the percentage you actually observed:
+
+```console
+garnish --data-dir .garnish-state quota set --provider codex --account default --surface five_hour --remaining-percent 90 --reserve-percent 20 --source "manual pre-test observation"
+```
+
+A manual observation is durable until you replace it and therefore does not prove freshness by itself. Re-check the real account immediately before the run, use CodexBar whenever available, and do not reuse an old manual percentage as evidence for a later task.
+
+Create a risk-class 1 task with an exact file scope and deterministic verification command. `TASK_ID` below means the `id` field printed by `task add`; set it to that exact value, without the angle brackets:
+
+```console
+garnish --data-dir .garnish-state task add --project example --title "Create result" --goal "Create result.txt containing exactly done" --accept "result.txt contains done" --verify-argv '["grep","-qx","done","result.txt"]' --scope result.txt --non-scope "all other files; Git integration" --risk-class 1
+TASK_ID='paste-the-id-returned-by-task-add-here'
+garnish --data-dir .garnish-state task pin "$TASK_ID" --adapter codex --provider codex --account default --reason "explicit one-task subscription test"
+garnish --data-dir .garnish-state task readiness "$TASK_ID" --adapter codex --provider codex --account default
+```
+
+Read the `task readiness` JSON before continuing. This uses the scheduler's real exact-candidate, durable probe, policy, schedule, pin, and quota filters without creating a claim. `allowed` must be `true`, and the selected adapter/provider/account must be `codex`, `codex`, and `default`. The next command can consume Codex subscription quota. It accepts at most one claimed task, makes no automatic paid-API fallback, stops after that Codex task, and never retries a timeout or other uncertain process result automatically:
+
+```console
+garnish --data-dir .garnish-state scheduler daemon --instance codex-local --candidate codex:codex:default --execute-codex --acknowledge-codex I_ACCEPT_ONE_CODEX_SUBSCRIPTION_TASK
+```
+
+After it returns successfully, inspect the stable review bundle. This does not commit, merge, or modify the source checkout:
+
+```console
+garnish --data-dir .garnish-state task review "$TASK_ID"
+```
+
+Confirm `task.status` is `review`, `verification.passed` is `true`, `handoff.changed_files` contains only the declared scope, and `integration_authorized` is `false`. Review the file named by `artifacts.patch_path`; Git integration remains your decision. If the daemon reports a timeout, cancellation, truncated output, malformed JSONL, or rejected patch, treat that attempt as uncertain or failed and do not immediately rerun it.
+
+For the first live validation, use the dedicated smoke instead of creating Garnish state by hand. It creates a temporary Git repository and temporary database, runs exactly one subscription task against exact `result.txt` scope, verifies in a detached worktree, and proves the registered source checkout stayed unchanged. Set the first variable to the numeric percentage you actually observe immediately before the test. The example uses `90` only for the case where the observed value is 90; placeholder words such as `CURRENT_PERCENTAGE` are intentionally rejected:
+
+```console
+export GARNISH_REAL_CODEX_REMAINING_PERCENT='90'
+export GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION='I_ACCEPT_ONE_CODEX_SUBSCRIPTION_TASK'
+./scripts/test-real-codex-subscription-smoke
+```
+
+Only the final script command submits the Codex task. It can consume subscription quota, has a 45-minute process ceiling, persists no raw JSONL/reasoning/stderr, has no automatic retry, and cannot fall back to a paid API. A timeout or interrupted result is uncertain: stop and inspect before considering another run. A successful run writes a private redacted receipt under `target/codex-smoke-receipts/`; it contains no authentication, prompt, model output, or quota percentage.
 
 ### Phase 4 controlled MCP registration
 
@@ -202,6 +254,8 @@ garnish --data-dir .garnish-state scheduler daemon --instance paid-patch-local -
 ```
 
 This command can make multiple chargeable requests within the explicitly configured task and project budgets. The second acknowledgement is session-scoped and does not authorize risk classes 2 or 3, general tool execution, source-checkout writes, or automatic integration. ADR 0012 records the exact boundary.
+
+Codex subscription and API execution are deliberately separate daemon modes; neither can authorize or fall back to the other. After a successful API implementation task, use `garnish --data-dir .garnish-state task review TASK_ID` exactly as for Codex. Confirm the verifier passed, inspect `artifacts.patch_path`, and integrate manually only after reviewing the exact changed files.
 
 ### Explicit paid API smoke test
 

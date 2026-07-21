@@ -773,6 +773,43 @@ fn scheduler_daemon_paid_api_execution_requires_exact_acknowledgement() {
 }
 
 #[test]
+fn scheduler_daemon_codex_execution_requires_exact_acknowledgement() {
+    let dir = tempdir().unwrap();
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "scheduler",
+            "daemon",
+            "--instance",
+            "cli-codex-denied",
+            "--candidate",
+            "codex:codex:default",
+            "--execute-codex",
+            "--poll-milliseconds",
+            "1",
+            "--leader-ttl-seconds",
+            "2",
+            "--claim-ttl-seconds",
+            "2",
+            "--max-ticks",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["ok"], false);
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("codex.execution_acknowledgement_required")
+    );
+}
+
+#[test]
 fn scheduler_daemon_api_patch_execution_requires_a_second_exact_acknowledgement() {
     let dir = tempdir().unwrap();
     let output = cargo_bin_cmd!("garnish")
@@ -875,6 +912,48 @@ fn api_smoke_receipts_are_private_redacted_and_machine_readable() {
             "model\"-injection",
             dir.path().to_str().unwrap(),
         ])
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(2));
+}
+
+#[test]
+fn codex_smoke_receipt_is_private_redacted_and_machine_readable() {
+    let dir = tempdir().unwrap();
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/write-codex-smoke-receipt");
+    let output = Command::new(&script)
+        .args(["codex-cli 0.144.2", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let receipt = fs::read_dir(dir.path()).unwrap().next().unwrap().unwrap();
+    let bytes = fs::read(receipt.path()).unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["test"], "codex_subscription_patch");
+    assert_eq!(value["codex_version"], "codex-cli 0.144.2");
+    assert_eq!(value["outcome"], "passed");
+    assert_eq!(value["subscription_tasks"], 1);
+    assert_eq!(value["max_retries"], 0);
+    assert_eq!(value["scope"], serde_json::json!(["result.txt"]));
+    assert_eq!(value["source_checkout_changed"], false);
+    assert_eq!(value["raw_model_output_persisted"], false);
+    for canary in ["auth.json", "reasoning", "stderr content", "prompt"] {
+        assert!(!String::from_utf8_lossy(&bytes).contains(canary));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(receipt.metadata().unwrap().permissions().mode() & 0o077, 0);
+    }
+
+    let denied = Command::new(script)
+        .args(["codex-cli 0.144.2\"", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
     assert_eq!(denied.status.code(), Some(2));

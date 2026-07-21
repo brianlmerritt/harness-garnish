@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION:-}" != 'I_ACCEPT_ONE_CODEX_SUBSCRIPTION_TASK' ]]; then
+  echo 'error: GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION must equal I_ACCEPT_ONE_CODEX_SUBSCRIPTION_TASK' >&2
+  exit 2
+fi
+
+if [[ ! "${GARNISH_REAL_CODEX_REMAINING_PERCENT:-}" =~ ^([0-9]{1,2}([.][0-9]+)?|100([.]0+)?)$ ]]; then
+  echo 'error: GARNISH_REAL_CODEX_REMAINING_PERCENT must be the currently observed number from 0 through 100' >&2
+  exit 2
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  echo 'error: codex is not available on PATH' >&2
+  exit 2
+fi
+
+echo 'REAL CODEX SUBSCRIPTION PATCH SMOKE TEST'
+echo "Codex CLI: $(codex --version)"
+echo "operator-observed remaining quota: ${GARNISH_REAL_CODEX_REMAINING_PERCENT}%"
+echo 'subscription use: exactly one acknowledged Codex task; no automatic retry or paid-API fallback'
+echo 'timeout: 45 minutes; a timeout or interrupted result is uncertain and must not be rerun automatically'
+echo 'filesystem: temporary Git repository and Garnish state only; registered source checkout must remain unchanged'
+echo 'authority: read-only Codex commands; one final UTF-8 patch; exact result.txt scope'
+echo 'extensions: user config, exec-policy rules, MCP, apps, hooks, plugins, multi-agent, and web search disabled'
+echo 'retention: raw Codex JSONL, reasoning, and stderr are not persisted; process hashes and review evidence are retained only in temporary state'
+echo 'verification: a separate detached worktree must confirm result.txt contains exactly done'
+
+codex_version="$(codex --version)"
+cargo test --locked service::tests::real_codex_subscription_patch_smoke_is_explicit_scoped_and_verified \
+  -- --ignored --exact --nocapture
+
+scripts/write-codex-smoke-receipt "$codex_version" \
+  "${GARNISH_CODEX_SMOKE_RECEIPT_DIR:-target/codex-smoke-receipts}"

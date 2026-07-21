@@ -109,6 +109,8 @@ trait AgentAdapter {
 
 The executable probe is authoritative for the installed version. Documentation informs expectations but cannot override the probe. Exact argv templates belong in compatibility fixtures, not this architecture document.
 
+The CLI MVP's Codex subscription mode is narrower than the general adapter contract. ADR 0014 requires ephemeral JSONL, built-in read-only permissions, disabled extensions and inherited environment, and no durable raw JSONL or stderr content. Bounded non-patch progress messages are permitted, but the last agent message must be the sole patch-bearing message. Garnish records only bounded process metadata and patch/review evidence for that mode.
+
 ### Failure categories
 
 At minimum: executable missing, unsupported version, authentication required, quota/rate limited, permission required, policy denied, malformed output, parser drift, timeout, cancelled, process crash, sandbox failure, network denied, context limit, provider unavailable, and agent-reported failure. Unknown output remains available as quarantined/raw evidence.
