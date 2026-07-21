@@ -3785,6 +3785,17 @@ impl Database {
             .ok_or_else(|| anyhow!("API budget reservation not found: {id}"))
     }
 
+    pub fn api_reservation_for_claim(&self, claim_id: &str) -> Result<ApiBudgetReservation> {
+        self.conn
+            .query_row(
+                &format!("{API_RESERVATION_SELECT} WHERE claim_id = ?1"),
+                [claim_id],
+                map_api_reservation,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("API budget reservation not found for claim: {claim_id}"))
+    }
+
     pub fn record_route(&mut self, decision: &RouteDecision) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(

@@ -564,6 +564,43 @@ fn scheduler_daemon_can_run_one_diagnostic_tick_and_stop_cleanly() {
 }
 
 #[test]
+fn scheduler_daemon_paid_api_execution_requires_exact_acknowledgement() {
+    let dir = tempdir().unwrap();
+    let output = cargo_bin_cmd!("garnish")
+        .args([
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+            "scheduler",
+            "daemon",
+            "--instance",
+            "cli-api-denied",
+            "--candidate",
+            "api:openai:paid",
+            "--execute-api",
+            "--poll-milliseconds",
+            "1",
+            "--leader-ttl-seconds",
+            "2",
+            "--claim-ttl-seconds",
+            "2",
+            "--max-ticks",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["ok"], false);
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("api.execution_acknowledgement_required")
+    );
+}
+
+#[test]
 fn agent_status_reports_unknown_without_implicit_probe() {
     let dir = tempdir().unwrap();
     let output = cargo_bin_cmd!("garnish")

@@ -1,10 +1,11 @@
 use crate::{
     adapters::{
-        AgentKind, FakeSandbox, Invocation, ProbeResult, probe_aoe, probe_docker, probe_podman,
-        run_invocation_with_tick, safe_write,
+        AgentKind, FakeSandbox, Invocation, ProbeResult, SandboxAttestation, probe_aoe,
+        probe_docker, probe_podman, run_invocation_with_tick, safe_write,
     },
     api_providers::{
-        ApiFailureKind, ApiProviderResponse, ApiRequestSpec, ApiTransport, PreparedApiRequest,
+        ApiFailureKind, ApiProviderResponse, ApiRequestSpec, ApiTerminalStatus, ApiTransport,
+        LiveApiTransport, LiveApiTransportConfig, PreparedApiRequest,
         api_request_conservative_content_token_bound, api_request_conservative_input_token_bound,
         api_request_content_digest, api_request_digest, parse_api_transport_response,
         prepare_api_request,
@@ -47,6 +48,7 @@ use std::{
 use ulid::Ulid;
 
 const API_TASK_TEMPLATE_VERSION: &str = "task-v1";
+pub const PAID_API_DAEMON_ACKNOWLEDGEMENT: &str = "I_ACCEPT_PAID_API_TASK_EXECUTION";
 
 pub struct Garnish {
     data_dir: PathBuf,
@@ -481,15 +483,26 @@ impl Garnish {
         account: &str,
         now: DateTime<Utc>,
     ) -> Result<(ApiRequestPlan, ApiRequestSpec, ApiBudget)> {
+        self.planned_api_request_for_version_at(task, task.version, provider, account, now)
+    }
+
+    fn planned_api_request_for_version_at(
+        &self,
+        task: &Task,
+        request_task_version: i64,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(ApiRequestPlan, ApiRequestSpec, ApiBudget)> {
         let plan = self.db.latest_api_request_plan(&task.id)?;
         if !plan.enabled {
             bail!("api.request_plan_disabled: the latest request plan is disabled");
         }
-        if plan.task_version != task.version {
+        if plan.task_version != request_task_version {
             bail!(
-                "api.request_plan_stale: plan task version {} differs from canonical version {}",
+                "api.request_plan_stale: plan task version {} differs from request version {}",
                 plan.task_version,
-                task.version
+                request_task_version
             );
         }
         if plan.template_version != API_TASK_TEMPLATE_VERSION {
@@ -507,8 +520,10 @@ impl Garnish {
         if plan.max_retries > budget.max_retries {
             bail!("api.retry_limit: request plan exceeds the project retry ceiling");
         }
+        let mut request_task = task.clone();
+        request_task.version = request_task_version;
         let spec = render_task_api_request(
-            task,
+            &request_task,
             provider,
             &plan.model,
             plan.max_output_tokens,
@@ -698,7 +713,7 @@ impl Garnish {
         self.db.claim_api_dispatch(reservation_id, now)
     }
 
-    pub fn execute_reserved_api_request<T: ApiTransport>(
+    pub fn execute_reserved_api_request<T: ApiTransport + ?Sized>(
         &mut self,
         reservation_id: &str,
         spec: &ApiRequestSpec,
@@ -1757,13 +1772,32 @@ impl Garnish {
         config: &SchedulerDaemonConfig,
         shutdown: &AtomicBool,
     ) -> Result<SchedulerDaemonSummary> {
-        self.run_scheduler_daemon_with(config, shutdown, Utc::now, std::thread::sleep)
+        if config.execute_api_claims {
+            if config.paid_api_acknowledgement.as_deref() != Some(PAID_API_DAEMON_ACKNOWLEDGEMENT) {
+                bail!(
+                    "api.execution_acknowledgement_required: --execute-api requires the exact paid API acknowledgement"
+                );
+            }
+            let mut transport = LiveApiTransport::new(LiveApiTransportConfig {
+                network_enabled: true,
+                ..LiveApiTransportConfig::default()
+            })?;
+            return self.run_scheduler_daemon_with(
+                config,
+                shutdown,
+                Some(&mut transport),
+                Utc::now,
+                std::thread::sleep,
+            );
+        }
+        self.run_scheduler_daemon_with(config, shutdown, None, Utc::now, std::thread::sleep)
     }
 
     fn run_scheduler_daemon_with<N, S>(
         &mut self,
         config: &SchedulerDaemonConfig,
         shutdown: &AtomicBool,
+        mut api_transport: Option<&mut dyn ApiTransport>,
         mut now: N,
         mut sleep: S,
     ) -> Result<SchedulerDaemonSummary>
@@ -1801,6 +1835,37 @@ impl Garnish {
         } else {
             config.route_candidates.clone()
         };
+        if config.execute_api_claims {
+            if config.paid_api_acknowledgement.as_deref() != Some(PAID_API_DAEMON_ACKNOWLEDGEMENT) {
+                bail!(
+                    "api.execution_acknowledgement_required: --execute-api requires the exact paid API acknowledgement"
+                );
+            }
+            if api_transport.is_none() {
+                bail!(
+                    "api.transport_unavailable: paid API execution requires an explicit transport"
+                );
+            }
+            let mut found_api_target = false;
+            for target in &route_targets {
+                if target.adapter != "api" {
+                    continue;
+                }
+                found_api_target = true;
+                match target.provider.as_str() {
+                    "openai" => self.policy.openai_api_enabled = true,
+                    "anthropic" => self.policy.anthropic_api_enabled = true,
+                    _ => bail!("api.provider_denied: unsupported API provider"),
+                }
+            }
+            if !found_api_target {
+                bail!("api.route_missing: --execute-api requires an api route candidate");
+            }
+        } else if config.paid_api_acknowledgement.is_some() {
+            bail!(
+                "api.execution_disabled: paid API acknowledgement is invalid without --execute-api"
+            );
+        }
 
         let started_at = now();
         self.register_scheduler(
@@ -1851,7 +1916,7 @@ impl Garnish {
                 )?;
                 ticks += 1;
                 claims_created += tick.claims.len();
-                if config.execute_fake_claims {
+                if config.execute_fake_claims || config.execute_api_claims {
                     for claim in &tick.claims {
                         let route_decision_id =
                             claim.route_decision_id.as_deref().ok_or_else(|| {
@@ -1871,20 +1936,32 @@ impl Garnish {
                         let selected_adapter = route.selected_adapter.clone().ok_or_else(|| {
                             anyhow::anyhow!("allowed route has no selected adapter")
                         })?;
-                        if !selected_adapter.starts_with("fake") {
-                            bail!(
-                                "--execute-fake cannot execute selected real adapter {selected_adapter}"
-                            );
+                        if selected_adapter.starts_with("fake") && config.execute_fake_claims {
+                            self.run_scheduler_claim(
+                                claim,
+                                &config.instance_id,
+                                leader.generation,
+                                &selected_adapter,
+                                route,
+                                tick_at,
+                            )?;
+                            runs_completed += 1;
+                        } else if selected_adapter == "api" && config.execute_api_claims {
+                            let transport = api_transport.as_deref_mut().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "api.transport_unavailable: paid API execution requires an explicit transport"
+                                )
+                            })?;
+                            self.run_scheduler_api_claim(
+                                claim,
+                                &config.instance_id,
+                                leader.generation,
+                                route,
+                                transport,
+                                tick_at,
+                            )?;
+                            runs_completed += 1;
                         }
-                        self.run_scheduler_claim(
-                            claim,
-                            &config.instance_id,
-                            leader.generation,
-                            &selected_adapter,
-                            route,
-                            tick_at,
-                        )?;
-                        runs_completed += 1;
                     }
                 }
                 if config.max_ticks.is_some_and(|limit| ticks >= limit) {
@@ -1966,21 +2043,22 @@ impl Garnish {
         }
 
         let pin = task_route_pin(&task)?;
-        let mixed_paid_and_subscription = targets.iter().any(|target| target.adapter == "api")
-            && targets.iter().any(|target| target.adapter != "api");
-        if mixed_paid_and_subscription && pin.as_ref().is_none_or(|pin| pin.adapter != "api") {
-            for (target, decision) in &mut preliminary {
-                if target.adapter == "api" {
-                    decision.allowed = false;
-                    decision.selected_adapter = None;
-                    decision.selected_provider = None;
-                    decision.selected_account = None;
-                    decision.reason_code = "api.explicit_selection_required".into();
-                    decision.reason = "api.explicit_selection_required: a paid API candidate cannot be selected as fallback from a subscription route".into();
-                    decision.candidates[0].allowed = false;
-                    decision.candidates[0].reason_code = decision.reason_code.clone();
-                    decision.candidates[0].filter_reason = decision.reason.clone();
-                }
+        for (target, decision) in &mut preliminary {
+            let exact_api_pin = pin.as_ref().is_some_and(|pin| {
+                pin.adapter == "api"
+                    && pin.provider == target.provider
+                    && pin.account == target.account
+            });
+            if target.adapter == "api" && !exact_api_pin {
+                decision.allowed = false;
+                decision.selected_adapter = None;
+                decision.selected_provider = None;
+                decision.selected_account = None;
+                decision.reason_code = "api.explicit_selection_required".into();
+                decision.reason = "api.explicit_selection_required: every paid API scheduler candidate requires an exact task pin and cannot be selected as fallback".into();
+                decision.candidates[0].allowed = false;
+                decision.candidates[0].reason_code = decision.reason_code.clone();
+                decision.candidates[0].filter_reason = decision.reason.clone();
             }
         }
 
@@ -2001,6 +2079,17 @@ impl Garnish {
                 decision.candidates[0].allowed = false;
                 decision.candidates[0].reason_code = reason_code.into();
                 decision.candidates[0].filter_reason = reason;
+            }
+            if target.adapter == "api" && decision.allowed && task.risk_class != 0 {
+                decision.allowed = false;
+                decision.selected_adapter = None;
+                decision.selected_provider = None;
+                decision.selected_account = None;
+                decision.reason_code = "api.execution_tools_unavailable".into();
+                decision.reason = "api.execution_tools_unavailable: direct API scheduler execution is response-only and permits only risk-class 0 tasks".into();
+                decision.candidates[0].allowed = false;
+                decision.candidates[0].reason_code = decision.reason_code.clone();
+                decision.candidates[0].filter_reason = decision.reason.clone();
             }
         }
 
@@ -2344,12 +2433,26 @@ impl Garnish {
             })?;
             let claim_result = if selected_target.adapter == "api" {
                 (|| -> Result<SchedulerClaim> {
+                    if task.pinned_adapter.as_deref() != Some("api")
+                        || task.pinned_provider.as_deref()
+                            != Some(selected_target.provider.as_str())
+                        || task.pinned_account.as_deref() != Some(selected_target.account.as_str())
+                    {
+                        bail!(
+                            "api.explicit_selection_required: task must be pinned to this paid API identity"
+                        );
+                    }
                     let (plan, spec, budget) = self.planned_api_request_at(
                         &task,
                         &selected_target.provider,
                         &selected_target.account,
                         now,
                     )?;
+                    if plan.role != "implementer" {
+                        bail!(
+                            "api.role_denied: scheduler task execution requires the implementer role"
+                        );
+                    }
                     let reserved_currency_micros = match budget.currency.as_deref() {
                         Some(currency) => {
                             let price = self.db.effective_api_model_price(
@@ -2560,7 +2663,17 @@ impl Garnish {
             &worktree.base_commit,
             checkpoint_due,
         )?;
-        self.finish_fake_run(task, project, adapter, route, worktree, run_id)
+        self.finish_agent_run(
+            task,
+            project,
+            adapter,
+            route,
+            worktree,
+            run_id,
+            sandbox,
+            true,
+            vec!["fake backend attestation is deterministic test evidence".into()],
+        )
     }
 
     fn run_scheduler_claim(
@@ -2635,10 +2748,230 @@ impl Garnish {
             now,
             std::time::Duration::from_secs(task.checkpoint_seconds),
         )?;
-        self.finish_fake_run(task, project, adapter, route, worktree, run_id)
+        self.finish_agent_run(
+            task,
+            project,
+            adapter,
+            route,
+            worktree,
+            run_id,
+            sandbox,
+            true,
+            vec!["fake backend attestation is deterministic test evidence".into()],
+        )
     }
 
-    fn finish_fake_run(
+    fn run_scheduler_api_claim<T: ApiTransport + ?Sized>(
+        &mut self,
+        claim: &SchedulerClaim,
+        instance_id: &str,
+        leader_generation: i64,
+        route: RouteDecision,
+        transport: &mut T,
+        now: DateTime<Utc>,
+    ) -> Result<RunSummary> {
+        if claim.route_decision_id.as_deref() != Some(route.id.as_str()) {
+            bail!("scheduler claim and route decision do not match");
+        }
+        if route.selected_adapter.as_deref() != Some("api") {
+            bail!("api.route_mismatch: scheduler route does not select the API adapter");
+        }
+        let provider = route
+            .selected_provider
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("api.route_mismatch: API route has no provider"))?;
+        let account = route
+            .selected_account
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("api.route_mismatch: API route has no account"))?;
+        let task = self.db.task(&claim.task_id)?;
+        if task.status != TaskStatus::Leased {
+            bail!(
+                "scheduler claim task must be leased; current status is {}",
+                task.status
+            );
+        }
+        if task.risk_class != 0 {
+            bail!(
+                "api.execution_tools_unavailable: direct API scheduler execution is response-only and permits only risk-class 0 tasks"
+            );
+        }
+        let (plan, spec, _) = self.planned_api_request_for_version_at(
+            &task,
+            claim.task_version,
+            provider,
+            account,
+            now,
+        )?;
+        if plan.role != "implementer" {
+            bail!("api.role_denied: scheduler task execution requires the implementer role");
+        }
+        let reservation = self.db.api_reservation_for_claim(&claim.id)?;
+        if reservation.task_id != task.id
+            || reservation.provider != provider
+            || reservation.account != account
+            || reservation.model != plan.model
+            || reservation.role != plan.role
+            || reservation.request_digest != plan.request_digest
+        {
+            bail!("api.claim_reservation_mismatch: scheduler claim and request plan differ");
+        }
+        let project = self.db.project(&task.project_id)?;
+        let worktree_destination = self
+            .data_dir
+            .join("worktrees")
+            .join(&project.slug)
+            .join(&task.id);
+        let worktree = match git::create_or_reuse_task_worktree(
+            Path::new(&project.root_path),
+            &worktree_destination,
+            &task.id,
+        ) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                self.db.transition_task(
+                    &task.id,
+                    TaskStatus::Leased,
+                    TaskStatus::Failed,
+                    "worktree_failed",
+                )?;
+                return Err(error);
+            }
+        };
+        let sandbox = direct_api_attestation(provider);
+        match self
+            .policy
+            .authorize(task.risk_class, sandbox.secure_container)
+        {
+            PolicyDecision::Allow => {}
+            PolicyDecision::RequireApproval => bail!(
+                "task risk class {} requires approval before claim consumption",
+                task.risk_class
+            ),
+            PolicyDecision::Deny(reason) => bail!("policy denied task: {reason}"),
+        }
+        let run_id = Ulid::new().to_string();
+        self.db.begin_claimed_run(
+            &claim.id,
+            instance_id,
+            leader_generation,
+            &run_id,
+            "api",
+            &worktree.path,
+            &worktree.branch,
+            &worktree.base_commit,
+            now,
+            std::time::Duration::from_secs(task.checkpoint_seconds),
+        )?;
+        self.db.append_run_event(
+            &task.id,
+            &run_id,
+            "api.execution_started",
+            "control_plane",
+            &serde_json::json!({
+                "reservation_id": reservation.id,
+                "provider": provider,
+                "account": account,
+                "model": plan.model,
+                "plan_id": plan.id,
+                "reserved_attempts": reservation.reserved_requests,
+            }),
+        )?;
+
+        let execution =
+            match self.execute_reserved_api_request(&reservation.id, &spec, transport, now) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    let error_message = error.to_string();
+                    let reason_code = api_error_reason_code(&error_message);
+                    if let Err(finish_error) =
+                        self.fail_scheduler_api_run(&task, &run_id, reason_code, now)
+                    {
+                        return Err(error.context(format!(
+                            "also failed to terminalise API run: {finish_error:#}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
+        self.db.append_run_event(
+            &task.id,
+            &run_id,
+            "api.execution_completed",
+            "control_plane",
+            &serde_json::json!({
+                "provider": execution.response.provider,
+                "model": execution.response.model,
+                "terminal_status": execution.response.terminal_status,
+                "output_item_count": execution.response.output.len(),
+                "attempt_count": execution.attempts.len(),
+                "spend_id": execution.spend.id,
+                "input_tokens": execution.spend.input_tokens,
+                "cached_input_tokens": execution.spend.cached_input_tokens,
+                "cache_creation_input_tokens": execution.spend.cache_creation_input_tokens,
+                "output_tokens": execution.spend.output_tokens,
+                "cost_micros": execution.spend.cost_micros,
+                "currency": execution.spend.currency,
+            }),
+        )?;
+        if execution.response.terminal_status != ApiTerminalStatus::Completed {
+            self.fail_scheduler_api_run(&task, &run_id, "api.non_completed_response", now)?;
+            bail!(
+                "api.non_completed_response: provider returned {:?}",
+                execution.response.terminal_status
+            );
+        }
+        self.finish_agent_run(
+            task,
+            project,
+            "api",
+            route,
+            worktree,
+            run_id,
+            sandbox,
+            false,
+            vec![
+                "direct API response content is not persisted or applied to the worktree".into(),
+                "independent verification evaluates the unchanged isolated worktree".into(),
+            ],
+        )
+    }
+
+    fn fail_scheduler_api_run(
+        &mut self,
+        task: &Task,
+        run_id: &str,
+        reason_code: &str,
+        _now: DateTime<Utc>,
+    ) -> Result<()> {
+        self.db.append_run_event(
+            &task.id,
+            run_id,
+            "api.execution_failed",
+            "control_plane",
+            &serde_json::json!({"reason_code": reason_code}),
+        )?;
+        self.db.transition_task(
+            &task.id,
+            TaskStatus::Running,
+            TaskStatus::Failed,
+            reason_code,
+        )?;
+        self.db.finish_run(run_id, "failed", None, 1)?;
+        self.db.enqueue_notification(
+            "failure",
+            "error",
+            Some(&task.id),
+            Some(run_id),
+            "Paid API task failed",
+            &format!("{} failed with {}.", task.title, reason_code),
+            Utc::now(),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_agent_run(
         &mut self,
         task: Task,
         project: Project,
@@ -2646,8 +2979,10 @@ impl Garnish {
         route: RouteDecision,
         worktree: crate::git::Worktree,
         run_id: String,
+        sandbox: SandboxAttestation,
+        apply_fake_effects: bool,
+        assumptions: Vec<String>,
     ) -> Result<RunSummary> {
-        let sandbox = FakeSandbox::attest(Path::new(&worktree.path));
         let evidence = RunEvidence::create(&self.data_dir, &run_id)?;
         let manifest = RunManifest {
             schema_version: 1,
@@ -2666,7 +3001,10 @@ impl Garnish {
         evidence.write_manifest(&manifest)?;
         evidence.write_route(&route)?;
 
-        if let (Some(relative), Some(content)) = (&task.fake_write_path, &task.fake_write_content) {
+        if apply_fake_effects
+            && let (Some(relative), Some(content)) =
+                (&task.fake_write_path, &task.fake_write_content)
+        {
             let target = safe_write(
                 Path::new(&worktree.path),
                 Path::new(relative),
@@ -2811,7 +3149,7 @@ impl Garnish {
                     verifier_target.account
                 ),
             ],
-            assumptions: vec!["fake backend attestation is deterministic test evidence".into()],
+            assumptions,
             blocker: (!verification.passed).then(|| "verification failed".into()),
             artifacts: vec![
                 evidence.patch_path.to_string_lossy().into_owned(),
@@ -3225,6 +3563,32 @@ fn evaluate_adapter_capabilities(adapter: &str, required: &[String]) -> (bool, S
 
 fn api_adapter_capabilities() -> Vec<String> {
     vec!["agent.headless".into(), "agent.tool_policy".into()]
+}
+
+fn direct_api_attestation(provider: &str) -> SandboxAttestation {
+    SandboxAttestation {
+        backend: "host-direct-api".into(),
+        secure_container: false,
+        image: "not-applicable".into(),
+        writable_mounts: vec![],
+        network: format!("fixed-https:{provider}"),
+        user: "current-host-user".into(),
+        container_socket_mounted: false,
+        host_home_mounted: true,
+        cpu_limit: "host-process".into(),
+        memory_limit: "bounded-request-and-response".into(),
+        pids_limit: 1,
+        rootless: None,
+        user_namespace: None,
+        effective_capabilities: None,
+        capability_evidence_source: Some("compiled-direct-transport".into()),
+        inherited_proxy_environment: vec![],
+        reasons: vec![
+            "provider receives only the bounded request; no worktree or repository tool is exposed"
+                .into(),
+            "response content is not persisted or applied to the isolated worktree".into(),
+        ],
+    }
 }
 
 fn api_error_reason_code(message: &str) -> &str {
@@ -4398,6 +4762,20 @@ mod tests {
         let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
         let task = garnish.add_task(&task(project.id.clone())).unwrap();
         enable_fixture_api_route(&mut garnish, &project.id, now);
+        let (unpinned, selected) = garnish
+            .route_task_candidates_at(
+                &task.id,
+                &[RouteTarget {
+                    adapter: "api".into(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                }],
+                now,
+            )
+            .unwrap();
+        assert!(!unpinned.allowed);
+        assert!(selected.is_none());
+        assert_eq!(unpinned.reason_code, "api.explicit_selection_required");
         garnish
             .set_task_route_pin(&task.id, "api", "openai", "paid", "explicit paid API route")
             .unwrap();
@@ -4466,7 +4844,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_uses_current_request_plan_and_reserves_every_retry_attempt_atomically() {
+    fn response_only_api_scheduler_denies_write_risk_before_claim() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("source");
         fixture_repo(&source);
@@ -4474,6 +4852,63 @@ mod tests {
         let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
         let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
         let task = garnish.add_task(&task(project.id.clone())).unwrap();
+        enable_fixture_api_route(&mut garnish, &project.id, now);
+        garnish
+            .set_task_route_pin(&task.id, "api", "openai", "paid", "explicit paid API route")
+            .unwrap();
+        garnish
+            .configure_api_request_plan_at(
+                &NewApiRequestPlan {
+                    task_id: task.id.clone(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                    enabled: true,
+                    model: "model-fixture".into(),
+                    role: "implementer".into(),
+                    max_input_tokens: 10_000,
+                    max_output_tokens: 50,
+                    max_retries: 0,
+                    stream: false,
+                    reason: "write-risk denial fixture".into(),
+                },
+                now,
+            )
+            .unwrap();
+
+        let (decision, selected) = garnish
+            .route_task_candidates_at(
+                &task.id,
+                &[RouteTarget {
+                    adapter: "api".into(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                }],
+                now,
+            )
+            .unwrap();
+        assert!(!decision.allowed);
+        assert!(selected.is_none());
+        assert_eq!(decision.reason_code, "api.execution_tools_unavailable");
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Ready);
+        assert!(
+            garnish
+                .api_reservations(Some("fixture"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scheduler_uses_current_request_plan_and_reserves_every_retry_attempt_atomically() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let mut api_task = task(project.id.clone());
+        api_task.risk_class = 0;
+        let task = garnish.add_task(&api_task).unwrap();
         enable_fixture_api_route(&mut garnish, &project.id, now);
         garnish
             .configure_api_budget(&NewApiBudget {
@@ -6121,6 +6556,8 @@ mod tests {
             claim_ttl: std::time::Duration::from_secs(10),
             max_ticks: Some(2),
             execute_fake_claims: false,
+            execute_api_claims: false,
+            paid_api_acknowledgement: None,
         };
         let shutdown = AtomicBool::new(false);
         let mut instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
@@ -6128,6 +6565,7 @@ mod tests {
             .run_scheduler_daemon_with(
                 &config,
                 &shutdown,
+                None,
                 || {
                     let current = instant;
                     instant += Duration::seconds(1);
@@ -6180,6 +6618,8 @@ mod tests {
             claim_ttl: std::time::Duration::from_secs(10),
             max_ticks: Some(1),
             execute_fake_claims: true,
+            execute_api_claims: false,
+            paid_api_acknowledgement: None,
         };
         let shutdown = AtomicBool::new(false);
         let mut instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
@@ -6187,6 +6627,7 @@ mod tests {
             .run_scheduler_daemon_with(
                 &config,
                 &shutdown,
+                None,
                 || {
                     let current = instant;
                     instant += Duration::seconds(1);
@@ -6208,6 +6649,388 @@ mod tests {
                 .join("result.txt")
                 .exists()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_executes_only_an_explicitly_pinned_planned_api_task_with_fake_transport() {
+        use crate::api_providers::ApiTransportResponse;
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        struct SchedulerApiTransport {
+            sends: usize,
+            uncertain: bool,
+        }
+
+        impl ApiTransport for SchedulerApiTransport {
+            fn send(&mut self, request: &PreparedApiRequest) -> Result<ApiTransportResponse> {
+                self.sends += 1;
+                request.with_sensitive_parts(|endpoint, _, _, _, secret, body| {
+                    assert_eq!(endpoint, "https://api.openai.com/v1/responses");
+                    assert_eq!(secret, b"scheduler-api-secret-canary");
+                    let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+                    assert_eq!(body["model"], "model-fixture");
+                    assert_eq!(body["store"], false);
+                });
+                if self.uncertain {
+                    bail!("scheduler-transport-error-canary");
+                }
+                ApiTransportResponse::new(
+                    200,
+                    "scheduler-provider-request-canary".into(),
+                    br#"{
+                        "id":"scheduler-response-id-canary",
+                        "object":"response",
+                        "status":"completed",
+                        "model":"model-fixture",
+                        "output":[{"type":"message","status":"completed","role":"assistant",
+                          "content":[{"type":"output_text","text":"scheduler-output-canary","annotations":[]}]}],
+                        "usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10}
+                    }"#
+                    .to_vec(),
+                    false,
+                )
+            }
+        }
+
+        fn collect_file_bytes(path: &Path, output: &mut Vec<Vec<u8>>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    collect_file_bytes(&entry.path(), output);
+                } else if file_type.is_file() {
+                    output.push(fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fixture_repo(&source);
+        let secret_path = dir.path().join("scheduler-provider-key");
+        let mut secret_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&secret_path)
+            .unwrap();
+        writeln!(secret_file, "scheduler-api-secret-canary").unwrap();
+        drop(secret_file);
+
+        let now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 20, 12, 0, 0).unwrap();
+        let data_dir = dir.path().join("data");
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let project = garnish.add_project("fixture", "Fixture", &source).unwrap();
+        let mut new_task = task(project.id.clone());
+        new_task.title = "Verify an API-only result".into();
+        new_task.goal = "Return a bounded provider result without repository writes".into();
+        new_task.acceptance = vec!["the isolated worktree remains unchanged".into()];
+        new_task.verification_argv = vec!["git".into(), "diff".into(), "--quiet".into()];
+        new_task.risk_class = 0;
+        new_task.fake_write_path = None;
+        new_task.fake_write_content = None;
+        let task = garnish.add_task(&new_task).unwrap();
+        garnish
+            .configure_api_budget(&NewApiBudget {
+                project_id: project.id.clone(),
+                provider: "openai".into(),
+                account: "paid".into(),
+                enabled: true,
+                secret_reference: format!("file:{}", secret_path.display()),
+                currency: Some("USD".into()),
+                currency_limit_micros: Some(1_000_000),
+                token_limit: Some(100_000),
+                request_limit: Some(10),
+                period_start: now - Duration::minutes(1),
+                period_end: now + Duration::days(1),
+                allowed_models: vec!["model-fixture".into()],
+                allowed_tools: vec![],
+                allowed_roles: vec!["implementer".into()],
+                max_output_tokens: 100,
+                max_retries: 0,
+                max_concurrent_requests: 1,
+                reason: "explicit scheduler API fixture".into(),
+            })
+            .unwrap();
+        garnish
+            .configure_api_model_price(&NewApiModelPrice {
+                provider: "openai".into(),
+                account: "paid".into(),
+                model: "model-fixture".into(),
+                currency: "USD".into(),
+                input_micros_per_million: 1_000_000,
+                cached_input_micros_per_million: 500_000,
+                cache_creation_input_micros_per_million: 1_500_000,
+                output_micros_per_million: 2_000_000,
+                effective_from: now - Duration::minutes(1),
+                effective_to: Some(now + Duration::days(1)),
+                source: "fixture price evidence".into(),
+                reason: "explicit scheduler API fixture".into(),
+            })
+            .unwrap();
+        garnish
+            .set_task_route_pin(
+                &task.id,
+                "api",
+                "openai",
+                "paid",
+                "explicit paid API execution",
+            )
+            .unwrap();
+        garnish
+            .configure_api_request_plan_at(
+                &NewApiRequestPlan {
+                    task_id: task.id.clone(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                    enabled: true,
+                    model: "model-fixture".into(),
+                    role: "implementer".into(),
+                    max_input_tokens: 10_000,
+                    max_output_tokens: 50,
+                    max_retries: 0,
+                    stream: false,
+                    reason: "exact paid scheduler request".into(),
+                },
+                now,
+            )
+            .unwrap();
+
+        let config = SchedulerDaemonConfig {
+            instance_id: "daemon-api-executor".into(),
+            hostname: "fixture".into(),
+            adapter: "api".into(),
+            provider: "openai".into(),
+            account: "paid".into(),
+            route_candidates: vec![],
+            max_active_claims: 1,
+            max_active_per_adapter: 1,
+            max_active_per_account: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            leader_ttl: std::time::Duration::from_secs(10),
+            claim_ttl: std::time::Duration::from_secs(10),
+            max_ticks: Some(1),
+            execute_fake_claims: false,
+            execute_api_claims: true,
+            paid_api_acknowledgement: Some(PAID_API_DAEMON_ACKNOWLEDGEMENT.into()),
+        };
+        let shutdown = AtomicBool::new(false);
+        let mut transport = SchedulerApiTransport {
+            sends: 0,
+            uncertain: false,
+        };
+        let mut instant = now;
+        let summary = garnish
+            .run_scheduler_daemon_with(
+                &config,
+                &shutdown,
+                Some(&mut transport),
+                || {
+                    let current = instant;
+                    instant += Duration::seconds(1);
+                    current
+                },
+                |_| {},
+            )
+            .unwrap();
+
+        assert_eq!(transport.sends, 1);
+        assert_eq!(summary.claims_created, 1);
+        assert_eq!(summary.runs_completed, 1);
+        assert!(summary.released_task_ids.is_empty());
+        assert_eq!(garnish.task(&task.id).unwrap().status, TaskStatus::Review);
+        let runs = garnish.db.run_records_for_task(&task.id).unwrap();
+        assert_eq!(runs.len(), 2);
+        let implementer = runs.iter().find(|run| run.adapter == "api").unwrap();
+        assert!(runs.iter().any(|run| run.role == "verifier"));
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                data_dir
+                    .join("runs")
+                    .join(&implementer.id)
+                    .join("manifest.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["sandbox"]["backend"], "host-direct-api");
+        assert_eq!(manifest["sandbox"]["secure_container"], false);
+        assert_eq!(manifest["sandbox"]["host_home_mounted"], true);
+        assert_eq!(
+            manifest["sandbox"]["writable_mounts"],
+            serde_json::json!([])
+        );
+        let reservations = garnish.api_reservations(Some("fixture")).unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].status, "settled");
+        assert_eq!(garnish.api_spend(Some("fixture")).unwrap().len(), 1);
+        assert!(
+            Command::new("git")
+                .args(["diff", "--quiet", "HEAD", "--", "README.md"])
+                .current_dir(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!source.join("result.txt").exists());
+
+        let mut uncertain_task = new_task;
+        uncertain_task.title = "Retain uncertain API dispatch".into();
+        uncertain_task.goal = "Prove an uncertain dispatch cannot replay".into();
+        let uncertain_task = garnish.add_task(&uncertain_task).unwrap();
+        garnish
+            .set_task_route_pin(
+                &uncertain_task.id,
+                "api",
+                "openai",
+                "paid",
+                "explicit uncertain API fixture",
+            )
+            .unwrap();
+        let uncertain_at = now + Duration::seconds(10);
+        garnish
+            .configure_api_request_plan_at(
+                &NewApiRequestPlan {
+                    task_id: uncertain_task.id.clone(),
+                    provider: "openai".into(),
+                    account: "paid".into(),
+                    enabled: true,
+                    model: "model-fixture".into(),
+                    role: "implementer".into(),
+                    max_input_tokens: 10_000,
+                    max_output_tokens: 50,
+                    max_retries: 0,
+                    stream: false,
+                    reason: "exact uncertain scheduler request".into(),
+                },
+                uncertain_at,
+            )
+            .unwrap();
+        let mut uncertain_config = config.clone();
+        uncertain_config.instance_id = "daemon-api-uncertain".into();
+        let mut uncertain_transport = SchedulerApiTransport {
+            sends: 0,
+            uncertain: true,
+        };
+        let mut uncertain_instant = uncertain_at;
+        let error = garnish
+            .run_scheduler_daemon_with(
+                &uncertain_config,
+                &shutdown,
+                Some(&mut uncertain_transport),
+                || {
+                    let current = uncertain_instant;
+                    uncertain_instant += Duration::seconds(1);
+                    current
+                },
+                |_| {},
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("api.transport_uncertain"));
+        assert!(
+            !error
+                .to_string()
+                .contains("scheduler-transport-error-canary")
+        );
+        assert_eq!(uncertain_transport.sends, 1);
+        assert_eq!(
+            garnish.task(&uncertain_task.id).unwrap().status,
+            TaskStatus::Failed
+        );
+        let uncertain_reservation = garnish
+            .api_reservations(Some("fixture"))
+            .unwrap()
+            .into_iter()
+            .find(|reservation| reservation.task_id == uncertain_task.id)
+            .unwrap();
+        assert_eq!(uncertain_reservation.status, "dispatched");
+
+        drop(garnish);
+        let mut garnish = Garnish::open(&data_dir).unwrap();
+        let mut restart_config = config;
+        restart_config.instance_id = "daemon-api-restart".into();
+        let mut restart_transport = SchedulerApiTransport {
+            sends: 0,
+            uncertain: false,
+        };
+        let mut restart_instant = uncertain_at + Duration::seconds(10);
+        let restart = garnish
+            .run_scheduler_daemon_with(
+                &restart_config,
+                &shutdown,
+                Some(&mut restart_transport),
+                || {
+                    let current = restart_instant;
+                    restart_instant += Duration::seconds(1);
+                    current
+                },
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(restart.claims_created, 0);
+        assert_eq!(restart_transport.sends, 0);
+        assert_eq!(
+            garnish
+                .api_reservations(Some("fixture"))
+                .unwrap()
+                .into_iter()
+                .find(|reservation| reservation.task_id == uncertain_task.id)
+                .unwrap()
+                .status,
+            "dispatched"
+        );
+
+        let mut artifacts = Vec::new();
+        collect_file_bytes(&data_dir, &mut artifacts);
+        for canary in [
+            "scheduler-api-secret-canary",
+            "scheduler-provider-request-canary",
+            "scheduler-response-id-canary",
+            "scheduler-output-canary",
+            "scheduler-transport-error-canary",
+        ] {
+            assert!(
+                artifacts
+                    .iter()
+                    .all(|artifact| !String::from_utf8_lossy(artifact).contains(canary)),
+                "sensitive API material entered a durable artifact: {canary}"
+            );
+        }
+    }
+
+    #[test]
+    fn paid_api_daemon_requires_exact_runtime_acknowledgement_before_claiming() {
+        let dir = tempdir().unwrap();
+        let mut garnish = Garnish::open(dir.path().join("data")).unwrap();
+        let config = SchedulerDaemonConfig {
+            instance_id: "daemon-api-denied".into(),
+            hostname: "fixture".into(),
+            adapter: "api".into(),
+            provider: "openai".into(),
+            account: "paid".into(),
+            route_candidates: vec![],
+            max_active_claims: 1,
+            max_active_per_adapter: 1,
+            max_active_per_account: 1,
+            poll_interval: std::time::Duration::from_secs(1),
+            leader_ttl: std::time::Duration::from_secs(10),
+            claim_ttl: std::time::Duration::from_secs(10),
+            max_ticks: Some(1),
+            execute_fake_claims: false,
+            execute_api_claims: true,
+            paid_api_acknowledgement: Some("NOT_ACCEPTED".into()),
+        };
+        let shutdown = AtomicBool::new(false);
+        let error = garnish
+            .run_scheduler_daemon_with(&config, &shutdown, None, Utc::now, |_| unreachable!())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("api.execution_acknowledgement_required")
+        );
+        assert!(garnish.scheduler_wakes().unwrap().is_empty());
     }
 
     #[cfg(unix)]

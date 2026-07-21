@@ -1,6 +1,6 @@
 # ADR 0010: Direct API transport without hidden replay
 
-- Status: accepted
+- Status: accepted; the scheduler activation boundary is superseded by ADR 0011
 - Date: 2026-07-20
 
 ## Context

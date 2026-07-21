@@ -674,6 +674,18 @@ struct SchedulerDaemonArgs {
         help = "Execute claimed work with the quota-free fake adapter (real agents remain disabled)"
     )]
     execute_fake: bool,
+    #[arg(
+        long,
+        help = "Execute only explicitly pinned, fully planned paid API claims; requires --acknowledge-paid-api"
+    )]
+    execute_api: bool,
+    #[arg(
+        long,
+        value_name = "ACKNOWLEDGEMENT",
+        requires = "execute_api",
+        help = "Required literal acknowledgement for paid daemon execution"
+    )]
+    acknowledge_paid_api: Option<String>,
 }
 
 #[derive(Args)]
@@ -1063,6 +1075,8 @@ fn run() -> Result<()> {
                     claim_ttl: StdDuration::from_secs(args.claim_ttl_seconds),
                     max_ticks: args.max_ticks,
                     execute_fake_claims: args.execute_fake,
+                    execute_api_claims: args.execute_api,
+                    paid_api_acknowledgement: args.acknowledge_paid_api,
                 };
                 print_json(&garnish.run_scheduler_daemon(&config, &SCHEDULER_SHUTDOWN)?)
             }

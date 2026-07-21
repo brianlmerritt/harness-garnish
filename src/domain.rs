@@ -938,6 +938,8 @@ pub struct SchedulerDaemonConfig {
     pub claim_ttl: std::time::Duration,
     pub max_ticks: Option<usize>,
     pub execute_fake_claims: bool,
+    pub execute_api_claims: bool,
+    pub paid_api_acknowledgement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
