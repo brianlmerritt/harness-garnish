@@ -28,6 +28,6 @@ The first WSL2 attempt exited locally with status 127 in 0.55 seconds because th
 
 ## Evidence boundary
 
-The macOS private receipt was inspected locally; the native-Linux and WSL2 terminal evidence reported their private receipt paths after the exact ignored test passed. The quota-free suite passed 159 tests with 5 explicitly external tests ignored on macOS, native Linux, and WSL2 before the launcher regression. After the exact-runtime fix, the macOS suite passed 160 tests with the same 5 ignored tests, and the focused WSL2 Codex regression passed 4 tests with the real smoke ignored. Formatting, strict Clippy, shell syntax, and diff checks passed. Normal and focused suites removed live acknowledgements and made no provider request.
+The macOS private receipt was inspected locally; the native-Linux and WSL2 terminal evidence reported their private receipt paths after the exact ignored test passed. The quota-free suite passed 159 tests with 5 explicitly external tests ignored on macOS, native Linux, and WSL2 before the launcher regression. After the exact-runtime fix, the full suite passed 160 tests with the same 5 ignored tests on all three platforms. Formatting, strict Clippy, shell syntax, and command-placeholder checks passed. Normal suites removed live acknowledgements and made no provider request.
 
 This is machine evidence for the narrow Codex 0.144.6 subscription patch boundary on macOS, native Linux, and WSL2. It is not proof of broader model quality, production readiness, executable MCP safety, or Phase 4 exit.

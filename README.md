@@ -10,6 +10,8 @@ Phase 3 is complete. Its schema-14 multi-agent capability routing, quota observa
 
 Phase 4 is in progress. Its network-free first slice adds project-scoped API budgets and atomic paid-usage reservations before any real OpenAI or Anthropic request is enabled; see [`docs/phase-4-plan.md`](docs/phase-4-plan.md).
 
+The narrower source-run CLI MVP is complete. Its implemented boundary, cross-platform fixture results, separately opted-in live evidence, and explicit deferrals are recorded in [`docs/cli-mvp-exit-report.md`](docs/cli-mvp-exit-report.md). This does not change the broader Phase 4 status.
+
 ## Confirmed direction
 
 - `garnish` will be a small Rust control plane with SQLite as canonical state.

@@ -24,6 +24,7 @@ These documents contain the design baseline and phased implementation evidence. 
 | [Phase 4 live API checkpoint](phase-4-live-api-checkpoint.md) | Operator-reported one-request response and isolated-patch smoke results for OpenAI and Anthropic |
 | [Phase 4 live Codex checkpoint](phase-4-live-codex-checkpoint.md) | Codex 0.144.6 compatibility regression and passing one-task subscription patch evidence |
 | [CLI MVP boundary](cli-mvp.md) | Included Codex subscription/API workflows, review handoff, acceptance evidence, and explicit deferrals |
+| [CLI MVP exit report](cli-mvp-exit-report.md) | Final source-run CLI acceptance, platform/live evidence, security boundary, and deferred release work |
 | [ADRs](decisions/README.md) | Decisions that constrain implementation |
 
 Every material change to these boundaries requires an ADR amendment or a superseding ADR. Documentation may describe a future capability only when it is clearly labelled as planned.

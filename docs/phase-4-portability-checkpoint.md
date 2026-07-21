@@ -50,14 +50,16 @@ P4-14 is established for the direct-transport intermediate scope: the normal mac
 
 The portability script now includes the later API scheduler, isolated API patch, MCP registration, Codex subscription patch, review projection, and command-placeholder declaration fixtures. It explicitly removes every API and Codex live-test acknowledgement, provider credential selector, receipt-directory override, and real-container selector before lint and tests. This update has passed the equivalent macOS quota-free checks, but the script deliberately runs only on native Linux or WSL2.
 
+The final revalidation corresponds to the clean committed CLI tree at local revision `747d59864eb98ab75206f0f02191d2e6f81628a3`. The supplied native-Linux and WSL2 transcripts contain the final 149-test library inventory, including the exact-runtime Node launcher regression, plus the complete CLI and vertical-slice suites.
+
 Fresh native-Linux and WSL2 runs now extend the checkpoint to the final CLI slice:
 
 | Platform | Kernel | Rust/Cargo | Tests | External tests | Result |
 | --- | --- | --- | ---: | ---: | --- |
-| Native Linux | Linux 6.8.0-107-generic x86_64 GNU/Linux | 1.97.1 / 1.97.1 | 159 passed | 5 ignored | `Phase 4 quota-free portability checkpoint passed on linux` |
-| WSL2 | Linux 6.6.87.2-microsoft-standard-WSL2 x86_64 GNU/Linux | 1.97.1 / 1.97.1 | 159 passed | 5 ignored | `Phase 4 quota-free portability checkpoint passed on wsl2` |
+| Native Linux | Linux 6.8.0-107-generic x86_64 GNU/Linux | 1.97.1 / 1.97.1 | 160 passed | 5 ignored | `Phase 4 quota-free portability checkpoint passed on linux` |
+| WSL2 | Linux 6.6.87.2-microsoft-standard-WSL2 x86_64 GNU/Linux | 1.97.1 / 1.97.1 | 160 passed | 5 ignored | `Phase 4 quota-free portability checkpoint passed on wsl2` |
 
-Both runs passed strict Clippy, formatting, the command-placeholder declaration check, all library and CLI fixtures, and the MVP vertical slice. They made no provider request and consumed no subscription quota or paid API credit. Together with the equivalent macOS result, this establishes quota-free cross-platform fixture conformance for the final Codex/CLI slice. Live Codex execution is separate evidence and is now recorded in [`phase-4-live-codex-checkpoint.md`](phase-4-live-codex-checkpoint.md).
+Both runs passed strict Clippy, formatting, the command-placeholder declaration check, 144 non-live library tests, the main CLI parser test, 14 CLI integration tests, and the MVP vertical slice. They made no provider request and consumed no subscription quota or paid API credit. Together with the equivalent 160-test macOS result, this establishes quota-free cross-platform fixture conformance for the final Codex/CLI slice. Live Codex execution is separate evidence and is now recorded in [`phase-4-live-codex-checkpoint.md`](phase-4-live-codex-checkpoint.md).
 
 ## Codex authentication readiness
 
