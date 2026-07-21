@@ -414,6 +414,10 @@ Deliver:
 
 Exit evidence: documentation consistency checks and executable CLI/parser fixtures for the agreed command surface. No provider or container action is required.
 
+The frozen TB-0 artifacts are the [CLI/JSON contract](tb0-command-contract.md), [state-machine contracts](tb0-state-contracts.md), [current gap matrix](tb0-gap-matrix.md), [schema migration plan](tb0-schema-migration.md), [acceptance plan](tb0-acceptance.md), machine-readable [`garnish.cli/v1alpha1` contract](contracts/tb0-cli-v1.json), and [ADR 0017](decisions/0017-tb0-cli-contract.md).
+
+TB-0 machine evidence and its exact non-implementation boundary are recorded in the [TB-0 exit report](tb0-exit-report.md).
+
 ### TB-1 — Project-oriented supervisor with fake execution
 
 Deliver:
@@ -490,19 +494,19 @@ Deliver:
 
 Exit evidence: clean-install packaged acceptance on every claimed platform, multi-project soak/recovery tests, accessibility/security review of the UI, and no reliance on development-only commands.
 
-## 19. Decisions still requiring explicit resolution
+## 19. Decisions resolved for the first project-supervisor MVP
 
-TB-0 must close these questions before dependent implementation:
+TB-0 resolves the earlier open questions as follows:
 
-- the first supported project backlog source and how planning-agent proposals become internal tasks;
-- exact names and grammar for normal versus advanced command families;
-- platform-specific subscription credential projection for Codex and Claude, including refresh behaviour;
-- the initial Codex structured approval interface (ACP, app-server, or another versioned boundary);
-- Linux/WSL2 keyring support and headless fallback policy;
-- default cleanup/retention durations for failed dirty worktrees and evidence;
-- native desktop notification implementations and quiet-hour interaction with calendars;
-- whether optional working-hour windows are required for the first project-supervisor MVP;
-- project integration defaults after verified work is ready;
-- the boundary between AoE supervision and Garnish-owned container construction.
+- The first backlog is Garnish-local user objectives; TB-1 creates one deterministic implementation task per objective. Agent planning/import remain later boundaries.
+- The exact normal/advanced names, operands, JSON schemas, and exit codes are frozen in `garnish.cli/v1alpha1`.
+- Subscription auth must be a Garnish-owned provider-specific broker/profile isolated from coding shells. Host user auth is not copied into containers; unsupported platforms/routes remain ineligible or use an honestly labelled fallback.
+- Codex first targets a version-pinned structured app-server adapter; Claude targets version-pinned stream JSON plus permission-prompt integration. Prompt scraping is forbidden.
+- Secret backend order is macOS Keychain, usable Linux Secret Service, then explicit mode-`0600` protected file for headless Linux/WSL2.
+- Cleanup and evidence retention defaults are fixed in the TB-0 command contract, with quarantine rather than deletion for unexpected state.
+- Initial notifications use the durable local inbox and best-effort native desktop delivery. Quiet hours delay non-critical delivery only.
+- Working-hour windows are excluded from the first project-supervisor MVP; day classes and safe-boundary checkpoints are sufficient.
+- Integration defaults to review plus explicit `project apply`; no commit, branch switch, push, PR, merge, or deployment is implied.
+- Garnish owns container construction, attestation, authority, and cleanup. AoE may supervise lifecycle only behind a versioned adapter.
 
-Until resolved, these are visible design decisions—not gaps to fill through silent implementation assumptions.
+If provider-specific subscription authentication cannot satisfy the isolated broker/profile requirement, that adapter remains blocked for the secure-container phase rather than weakening the boundary silently.

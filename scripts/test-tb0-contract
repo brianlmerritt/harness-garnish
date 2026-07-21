@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repository_root"
+
+quota_free_env=(
+  env
+  -u OPENAI_API_KEY
+  -u ANTHROPIC_API_KEY
+  -u ANTHROPIC_AUTH_TOKEN
+  -u GARNISH_DATA_DIR
+  -u GARNISH_REAL_API_PROVIDER
+  -u GARNISH_REAL_API_MODEL
+  -u GARNISH_REAL_API_SECRET_REFERENCE
+  -u GARNISH_ACKNOWLEDGE_PAID_API
+  -u GARNISH_ACKNOWLEDGE_PAID_API_PATCH
+  -u GARNISH_API_SMOKE_RECEIPT_DIR
+  -u GARNISH_REAL_CODEX_REMAINING_PERCENT
+  -u GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION
+  -u GARNISH_CODEX_SMOKE_RECEIPT_DIR
+  -u GARNISH_REAL_DOCKER_IMAGE
+  -u GARNISH_REAL_PODMAN_IMAGE
+)
+
+echo "TB-0 CONTRACT ACCEPTANCE"
+echo "provider credentials and live-test acknowledgements: removed from test processes"
+echo "external network/provider/container/keyring/notification use: none"
+echo "local loopback: existing deterministic AoE and web UI fixtures only"
+echo "registered source checkout and persistent Garnish state: unchanged; temporary fixtures only"
+
+./scripts/check-command-placeholders
+cargo fmt --all -- --check
+"${quota_free_env[@]}" cargo test --test tb0_cli_contract --locked
+"${quota_free_env[@]}" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+"${quota_free_env[@]}" cargo test --workspace --locked
+
+echo "TB-0 contract acceptance passed"

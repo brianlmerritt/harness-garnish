@@ -18,5 +18,6 @@
 | [0014](0014-controlled-codex-subscription-patch-execution.md) | One-task, read-only Codex subscription execution with exact-scope patch application | Accepted implementation boundary; target product-interface role superseded by 0016 |
 | [0015](0015-native-cli-release-archives.md) | Versioned native CLI archives with checksums and quota-free installed-binary acceptance | Accepted |
 | [0016](0016-project-supervisor-cli.md) | Project-supervisor CLI and project-first operating model | Accepted |
+| [0017](0017-tb0-cli-contract.md) | Freeze the project-supervisor CLI, compatibility, integration, and execution contract before implementation | Accepted |
 
 ADRs describe decisions, not implementation completion. A changed decision is recorded by a new ADR that supersedes the old one.

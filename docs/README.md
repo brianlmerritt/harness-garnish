@@ -26,6 +26,12 @@ These documents contain the design baseline and phased implementation evidence. 
 | [CLI Bible](cli-bible.md) | Authoritative to-be project-supervisor product, command, settings, calendar, routing, approval, notification, secret, sandbox, lifecycle, and phased-delivery contract |
 | [Archived narrow CLI MVP boundary](archive/cli-mvp.md) | Historical implemented Codex subscription/API task-oriented compatibility boundary and evidence context; not the intended product interface |
 | [CLI MVP exit report](cli-mvp-exit-report.md) | Final source-run CLI acceptance, platform/live evidence, security boundary, and deferred release work |
+| [TB-0 CLI and JSON contract](tb0-command-contract.md) | Exact normal/advanced grammar, stable JSON/exit semantics, project review/apply, agent boundaries, and retention defaults |
+| [TB-0 state-machine contracts](tb0-state-contracts.md) | Project, objective, run, calendar, settings, approval, notification, secret, sandbox, cleanup, handoff, and review transitions |
+| [TB-0 gap matrix](tb0-gap-matrix.md) | Disposition of every current command family and source service relative to the project-supervisor design |
+| [TB-0 schema migration](tb0-schema-migration.md) | Staged schema-20 migration, inert activation, data mapping, rollback, and fixture requirements |
+| [TB-0 acceptance](tb0-acceptance.md) | Quota-free machine evidence required before TB-1 runtime work begins |
+| [TB-0 exit report](tb0-exit-report.md) | Passing contract/parser, formatting, strict Clippy, full quota-free regression, and precise residual implementation boundary |
 | [Installation and packaging](installation.md) | Source installation, native archives, checksums, state, upgrades, uninstall, and release limitations |
 | [CLI operator guide](operator-guide.md) | Task-oriented fixture, Codex subscription, paid API, dashboard, backup, and recovery workflows |
 | [Distributable CLI MVP exit report](cli-package-exit-report.md) | Clean-tree macOS, native-Linux, and WSL2 native archive acceptance and residual release scope |

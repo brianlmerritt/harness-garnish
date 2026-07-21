@@ -12,6 +12,8 @@ Phase 4 is in progress. Its network-free first slice adds project-scoped API bud
 
 The historical narrow source-run CLI compatibility slice is complete. Its implemented boundary, cross-platform fixture results, separately opted-in live evidence, and explicit deferrals are recorded in [`docs/cli-mvp-exit-report.md`](docs/cli-mvp-exit-report.md). It is not the intended task-by-task product interface. The authoritative to-be project-supervisor and CLI contract is [`docs/cli-bible.md`](docs/cli-bible.md); this does not change the broader Phase 4 implementation status or claim those future capabilities are complete.
 
+The TB-0 pivot contract phase has exited with a frozen [CLI and JSON contract](docs/tb0-command-contract.md), [state-machine contracts](docs/tb0-state-contracts.md), [current gap matrix](docs/tb0-gap-matrix.md), [schema migration plan](docs/tb0-schema-migration.md), and [passing quota-free evidence](docs/tb0-exit-report.md). These specify the target and protect the compatibility build; they do not yet implement the project-supervisor runtime.
+
 ## Confirmed direction
 
 - `garnish` will be a small Rust control plane with SQLite as canonical state.
