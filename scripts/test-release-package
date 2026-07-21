@@ -10,6 +10,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+acceptance_step="startup"
+report_error() {
+  local status="$?"
+  trap - ERR
+  printf 'error: packaged CLI acceptance failed during %s (exit=%s)\n' \
+    "$acceptance_step" "$status" >&2
+  exit "$status"
+}
+trap report_error ERR
+
 quota_free_env=(
   env
   -u OPENAI_API_KEY
@@ -27,17 +37,28 @@ quota_free_env=(
   -u GARNISH_CODEX_SMOKE_RECEIPT_DIR
   -u GARNISH_REAL_DOCKER_IMAGE
   -u GARNISH_REAL_PODMAN_IMAGE
+  GIT_CONFIG_NOSYSTEM=1
+  GIT_CONFIG_GLOBAL=/dev/null
+)
+
+fixture_git=(
+  env
+  GIT_CONFIG_NOSYSTEM=1
+  GIT_CONFIG_GLOBAL=/dev/null
+  git
 )
 
 echo "PACKAGED CLI ACCEPTANCE TEST"
 echo "provider credentials and live-test acknowledgements: removed from the package and test processes"
 echo "network/provider use: none; deterministic fake task only"
 
+acceptance_step="native release packaging"
 GARNISH_RELEASE_OUTPUT_DIR="$test_root/packages" \
 GARNISH_PACKAGE_ALLOW_DIRTY='I_ACCEPT_TESTING_AN_UNCOMMITTED_PACKAGE' \
   "${quota_free_env[@]}" ./scripts/package-release
 
 first_archive_checksum="$(awk 'NR == 1 {print $1}' "$test_root/packages/SHA256SUMS")"
+acceptance_step="repeated-package determinism check"
 GARNISH_RELEASE_OUTPUT_DIR="$test_root/packages" \
 GARNISH_PACKAGE_ALLOW_DIRTY='I_ACCEPT_TESTING_AN_UNCOMMITTED_PACKAGE' \
   "${quota_free_env[@]}" ./scripts/package-release >/dev/null
@@ -47,6 +68,7 @@ if [[ -z "$first_archive_checksum" || "$first_archive_checksum" != "$second_arch
   exit 1
 fi
 
+acceptance_step="archive discovery"
 mapfile_compatible_archives=()
 while IFS= read -r archive; do
   mapfile_compatible_archives+=("$archive")
@@ -58,6 +80,7 @@ if [[ "${#mapfile_compatible_archives[@]}" != "1" ]]; then
 fi
 archive_path="${mapfile_compatible_archives[0]}"
 
+acceptance_step="archive checksum verification"
 (
   cd "$test_root/packages"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -67,6 +90,7 @@ archive_path="${mapfile_compatible_archives[0]}"
   fi
 )
 
+acceptance_step="archive extraction and content validation"
 mkdir -p "$test_root/extracted"
 tar -xzf "$archive_path" -C "$test_root/extracted"
 package_root="$(find "$test_root/extracted" -mindepth 1 -maxdepth 1 -type d -print)"
@@ -85,21 +109,30 @@ packaged_binary="$package_root/bin/garnish"
 [[ -f "$package_root/docs/operator-guide.md" ]]
 [[ -z "$(find "$package_root" -type l -print -quit)" ]]
 
+acceptance_step="packaged executable version and help checks"
 package_version="$(tr -d '\r\n' < "$package_root/VERSION")"
 "${quota_free_env[@]}" "$packaged_binary" --version | grep -Fx "garnish $package_version"
 "${quota_free_env[@]}" "$packaged_binary" --help | grep -F 'Harness Garnish local control plane'
 
+acceptance_step="hermetic temporary Git fixture setup"
+echo "fixture: initializing hermetic temporary Git repository"
 fixture_repository="$test_root/repository"
 fixture_state="$test_root/state"
-git init -q --initial-branch=main "$fixture_repository"
-git -C "$fixture_repository" config user.email fixture@example.invalid
-git -C "$fixture_repository" config user.name Fixture
+"${fixture_git[@]}" init -q --template= --initial-branch=main "$fixture_repository"
+"${fixture_git[@]}" -C "$fixture_repository" config user.email fixture@example.invalid
+"${fixture_git[@]}" -C "$fixture_repository" config user.name Fixture
+"${fixture_git[@]}" -C "$fixture_repository" config commit.gpgsign false
+"${fixture_git[@]}" -C "$fixture_repository" config core.hooksPath /dev/null
+"${fixture_git[@]}" -C "$fixture_repository" config core.autocrlf false
+"${fixture_git[@]}" -C "$fixture_repository" config core.fsmonitor false
 printf 'fixture\n' > "$fixture_repository/README.md"
-git -C "$fixture_repository" add README.md
-git -C "$fixture_repository" commit -q -m fixture
-source_head="$(git -C "$fixture_repository" rev-parse HEAD)"
-source_status="$(git -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)"
+"${fixture_git[@]}" -C "$fixture_repository" add README.md
+"${fixture_git[@]}" -C "$fixture_repository" commit -q -m fixture
+source_head="$("${fixture_git[@]}" -C "$fixture_repository" rev-parse HEAD)"
+source_status="$("${fixture_git[@]}" -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)"
 
+acceptance_step="packaged binary fixture initialization"
+echo "fixture: initializing packaged Garnish state"
 "${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" init >/dev/null
 "${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
   project add --slug package-test --title 'Package test' --path "$fixture_repository" >/dev/null
@@ -117,10 +150,13 @@ if [[ -z "$task_id" ]]; then
   exit 1
 fi
 
+acceptance_step="packaged binary readiness decision"
 readiness_json="$("${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
   task readiness "$task_id" --adapter fake --provider fake --account test)"
 printf '%s\n' "$readiness_json" | grep -F '"allowed": true' >/dev/null
 
+acceptance_step="packaged binary implementation and detached review"
+echo "fixture: executing quota-free packaged task and detached verifier"
 "${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" \
   task run "$task_id" --adapter fake --provider fake --account test >/dev/null
 review_json="$("${quota_free_env[@]}" "$packaged_binary" --data-dir "$fixture_state" task review "$task_id")"
@@ -129,8 +165,9 @@ printf '%s\n' "$review_json" | grep -F '"passed": true' >/dev/null
 printf '%s\n' "$review_json" | grep -F '"integration_authorized": false' >/dev/null
 printf '%s\n' "$review_json" | grep -F '"result.txt"' >/dev/null
 
-[[ "$(git -C "$fixture_repository" rev-parse HEAD)" == "$source_head" ]]
-[[ "$(git -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)" == "$source_status" ]]
+acceptance_step="source immutability and private state verification"
+[[ "$("${fixture_git[@]}" -C "$fixture_repository" rev-parse HEAD)" == "$source_head" ]]
+[[ "$("${fixture_git[@]}" -C "$fixture_repository" status --porcelain=v1 --untracked-files=all)" == "$source_status" ]]
 [[ ! -e "$fixture_repository/result.txt" ]]
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
