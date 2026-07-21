@@ -27,6 +27,7 @@ These documents contain the design baseline and phased implementation evidence. 
 | [CLI MVP exit report](cli-mvp-exit-report.md) | Final source-run CLI acceptance, platform/live evidence, security boundary, and deferred release work |
 | [Installation and packaging](installation.md) | Source installation, native archives, checksums, state, upgrades, uninstall, and release limitations |
 | [CLI operator guide](operator-guide.md) | Task-oriented fixture, Codex subscription, paid API, dashboard, backup, and recovery workflows |
+| [Distributable CLI MVP exit report](cli-package-exit-report.md) | Clean-tree macOS, native-Linux, and WSL2 native archive acceptance and residual release scope |
 | [ADRs](decisions/README.md) | Decisions that constrain implementation |
 
 Every material change to these boundaries requires an ADR amendment or a superseding ADR. Documentation may describe a future capability only when it is clearly labelled as planned.

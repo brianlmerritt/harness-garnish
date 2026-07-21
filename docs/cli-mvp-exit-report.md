@@ -45,17 +45,17 @@ No automatic subscription-to-API fallback was enabled or exercised.
 
 ## Deferred work
 
-- Binary packaging, installation, upgrades, versioned release artifacts, and end-user operator documentation.
 - Browser-based mutation with CSRF protection, confirmations, typed inputs, policy checks, and durable evidence.
 - Executable MCP and other controlled-extension acceptance work.
 - Claude Code, Antigravity, AoE, and arbitrary CLI task execution.
 - Semantic agent review, automatic Git integration, remote approval, and production hardening.
+- Signed/notarized public releases, package-manager distribution, service integration, and automatic updates.
 - A broader Phase 4 exit report. The API evidence limitation and unfinished controlled extensions prevent this CLI milestone from being used as a Phase 4 completion claim.
 
 ## Conclusion
 
-The repository now has an accepted CLI MVP for source-based local operation. The next practical product milestone is packaging plus concise operator workflows; executable MCP and additional agent systems remain later, separately accepted capabilities.
+The repository has an accepted CLI MVP for source-based local operation. Packaging and operator workflows were completed subsequently; executable MCP and additional agent systems remain later, separately accepted capabilities.
 
 ## Subsequent distributable slice
 
-After this source-run exit, ADR 0015 added native versioned archives, checksum manifests, installation instructions, task-oriented operator instructions, and a quota-free acceptance script that executes the extracted binary. The macOS Apple Silicon package acceptance passes locally. Native-Linux and WSL2 package acceptance remain required before recording a complete initial packaging matrix; this later work does not alter the revision-specific source-run result above.
+After this source-run exit, ADR 0015 added native versioned archives, checksum manifests, installation instructions, task-oriented operator instructions, and a quota-free acceptance script that executes the extracted binary. Clean-tree package acceptance subsequently passed on Apple Silicon macOS, native x86-64 Linux, and x86-64 WSL2. [`cli-package-exit-report.md`](cli-package-exit-report.md) records the complete distributable matrix; this later work does not alter the revision-specific source-run result above.

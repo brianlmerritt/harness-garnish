@@ -51,6 +51,8 @@ Placeholders: none.
 
 The accepted initial package targets are Apple Silicon macOS and x86-64 GNU/Linux, including x86-64 WSL2. Archives are checksummed but not signed or notarized. ADR 0015 records the release boundary.
 
+Clean-tree extracted-binary acceptance passed on all three supported environments on 2026-07-21. The exact matrix and remaining public-release limitations are recorded in the [distributable CLI MVP exit report](docs/cli-package-exit-report.md).
+
 ## Phase 1 quick start
 
 Rust 1.97 or newer and Git are required. All normal tests use fake agents and consume no provider quota or API budget.
