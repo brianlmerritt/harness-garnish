@@ -1029,7 +1029,7 @@ fn operational_controls_status_and_backup_are_stable_json() {
     );
     let value: Value = serde_json::from_slice(&backup.stdout).unwrap();
     assert_eq!(value["integrity"], "ok");
-    assert_eq!(value["schema_version"], 20);
+    assert_eq!(value["schema_version"], 21);
     assert!(backup_path.exists());
 
     let resume = cargo_bin_cmd!("garnish")

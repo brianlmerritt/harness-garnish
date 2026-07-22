@@ -326,15 +326,26 @@ mod tests {
     #[test]
     fn cancellation_and_output_are_bounded() {
         let dir = tempdir().unwrap();
-        let argv = vec!["-c".into(), "while :; do printf x; done".into()];
+        let ready = dir.path().join("output-ready");
+        let script = format!(
+            "i=0; while [ \"$i\" -lt 1024 ]; do printf x; i=$((i + 1)); done; touch '{}'; sleep 5",
+            ready.display()
+        );
+        let argv = vec!["-c".into(), script.into()];
         let environment = BTreeMap::new();
         let cancelled = Arc::new(AtomicBool::new(false));
         let trigger = cancelled.clone();
+        let ready_for_trigger = ready.clone();
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready_for_trigger.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
             trigger.store(true, Ordering::SeqCst);
         });
-        let outcome = supervise(spec(dir.path(), &argv, &environment), cancelled).unwrap();
+        let mut process_spec = spec(dir.path(), &argv, &environment);
+        process_spec.timeout = Duration::from_secs(3);
+        let outcome = supervise(process_spec, cancelled).unwrap();
         assert_eq!(outcome.classification, ExitClassification::Cancelled);
         assert!(
             outcome

@@ -306,6 +306,70 @@ pub fn head(worktree: &Path) -> Result<String> {
         .to_owned())
 }
 
+pub fn cleanup_owned_task_worktrees(
+    repository: &Path,
+    implementation: &Worktree,
+    verifier_path: &Path,
+) -> Result<()> {
+    if !implementation.branch.starts_with("garnish/task-") {
+        bail!("cleanup refused a branch not owned by Garnish");
+    }
+    let before = snapshot(repository)?;
+    let listing = git_text(repository, &["worktree", "list", "--porcelain"])?;
+    let implementation_path = Path::new(&implementation.path);
+    let canonical_implementation = implementation_path
+        .canonicalize()
+        .with_context(|| format!("resolving owned worktree {}", implementation.path))?;
+    if !listing.contains(&format!("worktree {}", canonical_implementation.display()))
+        || !listing.contains(&format!("branch refs/heads/{}", implementation.branch))
+    {
+        bail!("cleanup could not prove implementation worktree ownership");
+    }
+    if verifier_path.exists() {
+        let canonical_verifier = verifier_path.canonicalize()?;
+        if !listing.contains(&format!("worktree {}", canonical_verifier.display())) {
+            bail!("cleanup could not prove verifier worktree ownership");
+        }
+        let verifier = canonical_verifier.to_string_lossy().into_owned();
+        let removed = git_output(repository, &["worktree", "remove", "--force", &verifier])?;
+        if !removed.status.success() {
+            bail!(
+                "git verifier worktree cleanup failed: {}",
+                String::from_utf8_lossy(&removed.stderr).trim()
+            );
+        }
+    }
+    let implementation_arg = canonical_implementation.to_string_lossy().into_owned();
+    let removed = git_output(
+        repository,
+        &["worktree", "remove", "--force", &implementation_arg],
+    )?;
+    if !removed.status.success() {
+        bail!(
+            "git implementation worktree cleanup failed: {}",
+            String::from_utf8_lossy(&removed.stderr).trim()
+        );
+    }
+    let deleted = git_output(
+        repository,
+        &["branch", "--delete", "--force", &implementation.branch],
+    )?;
+    if !deleted.status.success() {
+        bail!(
+            "git owned branch cleanup failed: {}",
+            String::from_utf8_lossy(&deleted.stderr).trim()
+        );
+    }
+    let after = snapshot(repository)?;
+    if before.base_commit != after.base_commit
+        || before.branch != after.branch
+        || before.status_porcelain_v2 != after.status_porcelain_v2
+    {
+        bail!("source checkout changed during owned worktree cleanup");
+    }
+    Ok(())
+}
+
 pub fn run_argv(cwd: &Path, argv: &[String]) -> Result<Output> {
     let (program, args) = argv
         .split_first()
@@ -488,5 +552,28 @@ mod tests {
         fs::write(destination.join("dirty.txt"), "dirty\n").unwrap();
         let patch = b"diff --git a/result.txt b/result.txt\nnew file mode 100644\n--- /dev/null\n+++ b/result.txt\n@@ -0,0 +1 @@\n+done\n";
         assert!(apply_untrusted_patch(&destination, patch).is_err());
+    }
+
+    #[test]
+    fn owned_task_and_verifier_worktrees_and_branch_are_cleaned_without_source_change() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        init_repo(&source);
+        let before = snapshot(&source).unwrap();
+        let task = create_task_worktree(&source, &dir.path().join("task"), "01CLEAN").unwrap();
+        fs::write(dir.path().join("task/result.txt"), "captured\n").unwrap();
+        let task_patch = patch(Path::new(&task.path)).unwrap();
+        let verifier_path = dir.path().join("verifier");
+        create_verification_worktree(&source, &verifier_path, &task.base_commit, &task_patch)
+            .unwrap();
+        cleanup_owned_task_worktrees(&source, &task, &verifier_path).unwrap();
+        assert!(!dir.path().join("task").exists());
+        assert!(!verifier_path.exists());
+        let branches = git_text(&source, &["branch", "--list", &task.branch]).unwrap();
+        assert!(branches.trim().is_empty());
+        let after = snapshot(&source).unwrap();
+        assert_eq!(before.base_commit, after.base_commit);
+        assert_eq!(before.branch, after.branch);
+        assert_eq!(before.status_porcelain_v2, after.status_porcelain_v2);
     }
 }

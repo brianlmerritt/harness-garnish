@@ -1,6 +1,6 @@
 # TB-0 schema and data migration plan
 
-Status: design plan only. Schema 20 remains current. TB-1 must implement each migration with pre-migration backup, fixture upgrade tests, integrity checks, and a clean-install equivalence test before increasing `SCHEMA_VERSION`.
+Status: frozen migration plan. Schema 21 was implemented by TB-1 under [ADR 0018](decisions/0018-tb1-fixture-supervisor.md), including verified pre-migration backup, inert upgrade, integrity, and clean-install equivalence evidence. Schemas 22–25 remain planned.
 
 ## 1. Migration principles
 
@@ -136,4 +136,3 @@ Required quota-free fixtures include:
 12. restored schema-20 backup successfully reopened by the old compatibility binary fixture.
 
 Every fixture asserts that project source checkouts, Git refs, provider quota, API budgets, keyrings, notification systems, and container runtimes are untouched.
-

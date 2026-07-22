@@ -40,6 +40,8 @@ erDiagram
 
 ## Core entities
 
+Schema 21 adds the executable TB-1 project-supervisor subset. `project_supervision` holds lifecycle, affinity, calendar, backlog, and review-only integration policy without reinterpreting the historical `projects` row. `objectives` and `objective_tasks` expose the user backlog while retaining internal task/run compatibility. Calendar and exception revisions add `B` shared-day semantics. Narrow fixture-only setting, agent-profile, handoff, review-result, cleanup, and supervisor-cycle tables provide the evidence required by ADR 0018; they do not claim the complete schema 22–24 contracts.
+
 ### `projects`
 
 `id`, `slug`, `title`, `purpose`, `root_path`, `status`, `scheduler_paused`, `scheduler_pause_reason`, `default_policy_revision_id`, `created_at`, `updated_at`, `version`.

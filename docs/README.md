@@ -32,6 +32,9 @@ These documents contain the design baseline and phased implementation evidence. 
 | [TB-0 schema migration](tb0-schema-migration.md) | Staged schema-20 migration, inert activation, data mapping, rollback, and fixture requirements |
 | [TB-0 acceptance](tb0-acceptance.md) | Quota-free machine evidence required before TB-1 runtime work begins |
 | [TB-0 exit report](tb0-exit-report.md) | Passing contract/parser, formatting, strict Clippy, full quota-free regression, and precise residual implementation boundary |
+| [TB-1 acceptance](tb1-acceptance.md) | Quota-free machine evidence for schema 21, project/objective supervision, calendars, handoff, review, and cleanup |
+| [TB-1 CLI testing](tb1-cli-testing.md) | Exact operator exercises using a real temporary Git repository and fake Codex/Claude profiles |
+| [TB-1 exit report](tb1-exit-report.md) | Passing schema-21, strict-build, full-regression, and project-first CLI evidence with explicit fake/real boundary |
 | [Installation and packaging](installation.md) | Source installation, native archives, checksums, state, upgrades, uninstall, and release limitations |
 | [CLI operator guide](operator-guide.md) | Task-oriented fixture, Codex subscription, paid API, dashboard, backup, and recovery workflows |
 | [Distributable CLI MVP exit report](cli-package-exit-report.md) | Clean-tree macOS, native-Linux, and WSL2 native archive acceptance and residual release scope |

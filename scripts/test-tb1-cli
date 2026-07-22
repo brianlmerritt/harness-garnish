@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$repository_root"
+
+quota_free_env=(
+  env
+  -u OPENAI_API_KEY
+  -u ANTHROPIC_API_KEY
+  -u ANTHROPIC_AUTH_TOKEN
+  -u GARNISH_DATA_DIR
+  -u GARNISH_REAL_API_PROVIDER
+  -u GARNISH_REAL_API_MODEL
+  -u GARNISH_REAL_API_SECRET_REFERENCE
+  -u GARNISH_ACKNOWLEDGE_PAID_API
+  -u GARNISH_ACKNOWLEDGE_PAID_API_PATCH
+  -u GARNISH_API_SMOKE_RECEIPT_DIR
+  -u GARNISH_REAL_CODEX_REMAINING_PERCENT
+  -u GARNISH_ACKNOWLEDGE_CODEX_SUBSCRIPTION
+  -u GARNISH_CODEX_SMOKE_RECEIPT_DIR
+  -u GARNISH_REAL_DOCKER_IMAGE
+  -u GARNISH_REAL_PODMAN_IMAGE
+)
+
+echo "TB-1 PROJECT SUPERVISOR ACCEPTANCE"
+echo "provider credentials and live-test acknowledgements: removed from test processes"
+echo "provider/API/container/keyring/notification use: none; fake agents only"
+echo "Git effects: temporary repositories only; owned fixture worktrees and branches are removed"
+echo "persistent Garnish state and registered user repositories: unchanged"
+echo "local loopback: existing deterministic AoE and web UI regression fixtures only"
+
+./scripts/check-command-placeholders
+cargo fmt --all -- --check
+"${quota_free_env[@]}" cargo test --test tb1_project_supervisor --locked
+"${quota_free_env[@]}" cargo test --lib db::tests::schema_twenty_one --locked
+"${quota_free_env[@]}" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+"${quota_free_env[@]}" cargo test --workspace --locked
+
+echo "TB-1 project supervisor acceptance passed"

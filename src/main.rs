@@ -6,13 +6,14 @@ use harness_garnish::{
     adapters::AgentKind,
     domain::{
         DayAffinity, DayKind, NewApiBudget, NewApiModelPrice, NewApiRequestPlan,
-        NewMcpServerRevision, NewTask, RouteTarget, SchedulerDaemonConfig,
+        NewMcpServerRevision, NewTask, ProjectAffinity, RouteTarget, SchedulerDaemonConfig,
     },
     web_ui::{UiServerConfig, serve_ui},
 };
 use serde::Serialize;
 use serde_json::json;
 use std::{
+    ffi::OsString,
     io::Write,
     path::PathBuf,
     str::FromStr,
@@ -37,36 +38,62 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Init,
+    Init(InitArgs),
     Doctor,
+    Status {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    Calendar {
+        #[command(subcommand)]
+        command: CalendarCommand,
+    },
     Project {
         #[command(subcommand)]
         command: ProjectCommand,
     },
+    #[command(hide = true)]
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+    Objective {
+        #[command(subcommand)]
+        command: ObjectiveCommand,
     },
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
     },
+    #[command(hide = true)]
     Api {
         #[command(subcommand)]
         command: ApiCommand,
     },
+    #[command(hide = true)]
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
     },
+    #[command(hide = true)]
     Schedule {
         #[command(subcommand)]
         command: ScheduleCommand,
     },
+    #[command(hide = true)]
     Scheduler {
         #[command(subcommand)]
         command: SchedulerCommand,
     },
+    #[command(hide = true)]
     Runtime {
         #[command(subcommand)]
         command: RuntimeCommand,
@@ -87,11 +114,118 @@ enum Command {
         #[command(subcommand)]
         command: ApprovalCommand,
     },
+    Route {
+        #[command(subcommand)]
+        command: RouteCommand,
+    },
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
+    #[command(hide = true)]
     Ui {
         #[command(subcommand)]
         command: UiCommand,
     },
+    #[command(hide = true)]
     Recover,
+    Advanced {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
+}
+
+#[derive(Args)]
+struct InitArgs {
+    #[arg(long, default_value = "WWWOOBB")]
+    calendar_pattern: String,
+    #[arg(long, default_value = "Etc/UTC")]
+    timezone: String,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    Run {
+        #[arg(
+            long,
+            help = "Stop after this many cycles; omitted means run until interrupted"
+        )]
+        max_cycles: Option<usize>,
+        #[arg(long, default_value_t = 1000)]
+        poll_milliseconds: u64,
+        #[arg(long, help = "Fixture-only RFC3339 evaluation instant")]
+        at: Option<String>,
+    },
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    Explain {
+        path: String,
+    },
+    Set {
+        path: String,
+        value: String,
+        #[arg(long, default_value = "operator configuration")]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalendarCommand {
+    List,
+    Show {
+        calendar: String,
+    },
+    Set {
+        calendar: String,
+        #[arg(long)]
+        timezone: String,
+        #[arg(long)]
+        pattern: String,
+    },
+    Preview {
+        calendar: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "from",
+            hide = true,
+            help = "Fixture-only single RFC3339 instant"
+        )]
+        at: Option<String>,
+        #[arg(long, help = "First local date as YYYY-MM-DD")]
+        from: Option<String>,
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+    },
+    Assign {
+        project: String,
+        calendar: String,
+    },
+    Exception {
+        #[command(subcommand)]
+        command: CalendarExceptionCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalendarExceptionCommand {
+    Set {
+        calendar: String,
+        date: String,
+        kind: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Remove {
+        calendar: String,
+        date: String,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -114,14 +248,57 @@ struct UiServeArgs {
 enum ProjectCommand {
     Add(ProjectAdd),
     List,
-    Pause {
-        #[arg(long)]
+    Show {
         project: String,
+    },
+    Configure {
+        project: String,
+        setting: String,
+        value: String,
+        #[arg(long, default_value = "operator configuration")]
+        reason: String,
+    },
+    Start {
+        project: String,
+        #[arg(long, default_value = "operator started project supervision")]
+        reason: String,
+    },
+    Pause {
+        project: Option<String>,
+        #[arg(long = "project", conflicts_with = "project")]
+        legacy_project: Option<String>,
         #[arg(long)]
         reason: String,
     },
     Resume {
+        project: Option<String>,
+        #[arg(long = "project", conflicts_with = "project")]
+        legacy_project: Option<String>,
+        #[arg(long, default_value = "operator resumed project supervision")]
+        reason: String,
+    },
+    Stop {
+        project: String,
         #[arg(long)]
+        reason: String,
+    },
+    Status {
+        project: String,
+    },
+    Review {
+        project: String,
+    },
+    Apply {
+        result: String,
+        #[arg(long, default_value = "operator accepted verified result")]
+        reason: String,
+    },
+    Discard {
+        result: String,
+        #[arg(long)]
+        reason: String,
+    },
+    Archive {
         project: String,
         #[arg(long)]
         reason: String,
@@ -139,12 +316,69 @@ enum ProjectCommand {
 
 #[derive(Args)]
 struct ProjectAdd {
+    #[arg(value_name = "PATH")]
+    root: Option<PathBuf>,
+    #[arg(long = "path", conflicts_with = "root")]
+    legacy_path: Option<PathBuf>,
     #[arg(long)]
-    slug: String,
+    slug: Option<String>,
     #[arg(long)]
-    title: String,
-    #[arg(long)]
-    path: PathBuf,
+    title: Option<String>,
+    #[arg(long, default_value = "both")]
+    affinity: String,
+    #[arg(long, default_value = "default")]
+    calendar: String,
+}
+
+#[derive(Subcommand)]
+enum ObjectiveCommand {
+    Add {
+        project: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        goal: String,
+        #[arg(long = "accept", required = true)]
+        acceptance: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i64,
+        #[arg(
+            long,
+            requires = "fixture_write_content",
+            help = "TB-1 fake backend only: write this relative path"
+        )]
+        fixture_write_path: Option<String>,
+        #[arg(
+            long,
+            requires = "fixture_write_path",
+            help = "TB-1 fake backend only: exact one-line content"
+        )]
+        fixture_write_content: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Show {
+        objective: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RouteCommand {
+    Explain { project: String },
+}
+
+#[derive(Subcommand)]
+enum MaintenanceCommand {
+    Preview {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Reconcile {
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -810,6 +1044,17 @@ struct QuotaOverride {
 
 #[derive(Subcommand)]
 enum AgentCommand {
+    List,
+    Show {
+        agent: String,
+    },
+    Configure {
+        agent: String,
+        setting: String,
+        value: String,
+        #[arg(long, default_value = "operator fixture configuration")]
+        reason: String,
+    },
     Probe,
     Refresh {
         #[arg(long, default_value_t = 300)]
@@ -893,23 +1138,230 @@ fn run() -> Result<()> {
     let data_dir = cli.data_dir.unwrap_or(default_data_dir()?);
     let mut garnish = Garnish::open(&data_dir)?;
     match cli.command {
-        Command::Init => print_json(&json!({
-            "ok": true,
-            "data_dir": data_dir,
-            "database": data_dir.join("state.db"),
-        })),
+        Command::Init(args) => {
+            let supervisor =
+                garnish.initialize_supervisor_defaults(&args.timezone, &args.calendar_pattern)?;
+            print_json(&json!({
+                "ok": true,
+                "data_dir": data_dir,
+                "database": data_dir.join("state.db"),
+                "supervisor": supervisor,
+            }))
+        }
         Command::Doctor => print_json(&garnish.doctor()),
+        Command::Status { project } => {
+            if let Some(project) = project {
+                print_json(&garnish.project_status_at(&project, Utc::now())?)
+            } else {
+                print_json(&garnish.supervisor_status_at(Utc::now())?)
+            }
+        }
+        Command::Service { command } => match command {
+            ServiceCommand::Run {
+                max_cycles,
+                poll_milliseconds,
+                at,
+            } => {
+                if max_cycles.is_some_and(|cycles| cycles == 0 || cycles > 100) {
+                    bail!("--max-cycles must be in 1..=100");
+                }
+                if !(10..=60_000).contains(&poll_milliseconds) {
+                    bail!("--poll-milliseconds must be in 10..=60000");
+                }
+                let evaluated_at = parse_optional_time(at.as_deref())?;
+                if evaluated_at.is_some() && max_cycles.is_none() {
+                    bail!("fixture --at requires bounded --max-cycles");
+                }
+                if let Some(max_cycles) = max_cycles {
+                    let mut cycles = Vec::with_capacity(max_cycles);
+                    for _ in 0..max_cycles {
+                        cycles.push(match evaluated_at {
+                            Some(at) => garnish.run_supervisor_cycle_at(at)?,
+                            None => garnish.run_supervisor_cycle()?,
+                        });
+                    }
+                    print_json(&json!({"mode": "tb1_fixture", "cycles": cycles}))
+                } else {
+                    SCHEDULER_SHUTDOWN.store(false, Ordering::SeqCst);
+                    install_scheduler_signal_handlers()?;
+                    let mut completed_cycles = 0_u64;
+                    while !SCHEDULER_SHUTDOWN.load(Ordering::SeqCst) {
+                        print_json(&garnish.run_supervisor_cycle()?)?;
+                        completed_cycles += 1;
+                        std::thread::sleep(StdDuration::from_millis(poll_milliseconds));
+                    }
+                    print_json(&json!({
+                        "mode": "tb1_fixture",
+                        "status": "stopped",
+                        "completed_cycles": completed_cycles,
+                    }))
+                }
+            }
+            ServiceCommand::Status => print_json(&garnish.supervisor_status_at(Utc::now())?),
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::Explain { path } => print_json(&garnish.explain_setting(&path)?),
+            ConfigCommand::Set {
+                path,
+                value,
+                reason,
+            } => {
+                let value =
+                    serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
+                print_json(&garnish.configure_setting(&path, value, &reason)?)
+            }
+        },
+        Command::Calendar { command } => match command {
+            CalendarCommand::List => print_json(&garnish.calendars()?),
+            CalendarCommand::Show { calendar } => print_json(&garnish.calendar(&calendar)?),
+            CalendarCommand::Set {
+                calendar,
+                timezone,
+                pattern,
+            } => print_json(&garnish.configure_calendar(&calendar, &timezone, &pattern)?),
+            CalendarCommand::Preview {
+                calendar,
+                project,
+                at,
+                from,
+                days,
+            } => {
+                if let Some(at) = parse_optional_time(at.as_deref())? {
+                    if let Some(project) = project {
+                        let supervised = garnish.supervised_project(&project)?;
+                        if supervised.calendar != calendar {
+                            bail!("project is assigned to calendar {}", supervised.calendar);
+                        }
+                        print_json(&garnish.project_schedule_at(&project, at)?)
+                    } else {
+                        print_json(&json!({
+                            "calendar": garnish.calendar(&calendar)?,
+                            "at": at,
+                            "hint": "pass --project to evaluate project affinity",
+                        }))
+                    }
+                } else {
+                    if !(1..=366).contains(&days) {
+                        bail!("--days must be in 1..=366");
+                    }
+                    let from = from
+                        .as_deref()
+                        .map(|value| chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d"))
+                        .transpose()
+                        .context("--from must be YYYY-MM-DD")?;
+                    print_json(&garnish.calendar_preview(
+                        &calendar,
+                        project.as_deref(),
+                        from,
+                        days,
+                        Utc::now(),
+                    )?)
+                }
+            }
+            CalendarCommand::Assign { project, calendar } => {
+                garnish.assign_project_calendar(&project, &calendar)?;
+                print_json(&garnish.supervised_project(&project)?)
+            }
+            CalendarCommand::Exception { command } => match command {
+                CalendarExceptionCommand::Set {
+                    calendar,
+                    date,
+                    kind,
+                    reason,
+                } => {
+                    let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                        .context("date must be YYYY-MM-DD")?;
+                    print_json(&garnish.set_calendar_exception(
+                        &calendar,
+                        date,
+                        DayKind::from_str(&kind)?,
+                        &reason,
+                    )?)
+                }
+                CalendarExceptionCommand::Remove {
+                    calendar,
+                    date,
+                    reason,
+                } => {
+                    let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                        .context("date must be YYYY-MM-DD")?;
+                    print_json(&garnish.remove_calendar_exception(&calendar, date, &reason)?)
+                }
+            },
+        },
         Command::Project { command } => match command {
             ProjectCommand::Add(args) => {
-                let project = garnish.add_project(&args.slug, &args.title, &args.path)?;
+                let path = args
+                    .root
+                    .or(args.legacy_path)
+                    .context("project path is required")?;
+                let slug = args.slug.unwrap_or_else(|| derive_project_slug(&path));
+                let title = args.title.unwrap_or_else(|| slug.replace('-', " "));
+                let affinity = ProjectAffinity::from_str(&args.affinity)?;
+                let project = garnish.add_supervised_project(
+                    &slug,
+                    &title,
+                    &path,
+                    affinity,
+                    &args.calendar,
+                )?;
                 print_json(&project)
             }
-            ProjectCommand::List => print_json(&garnish.projects()?),
-            ProjectCommand::Pause { project, reason } => {
-                print_json(&garnish.set_project_scheduler_pause(&project, true, &reason)?)
+            ProjectCommand::List => print_json(&garnish.supervised_projects()?),
+            ProjectCommand::Show { project } => print_json(&garnish.supervised_project(&project)?),
+            ProjectCommand::Configure {
+                project,
+                setting,
+                value,
+                reason,
+            } => match setting.as_str() {
+                "affinity" => print_json(&garnish.set_project_affinity(
+                    &project,
+                    ProjectAffinity::from_str(&value)?,
+                    &reason,
+                )?),
+                "calendar" => {
+                    garnish.assign_project_calendar(&project, &value)?;
+                    print_json(&garnish.supervised_project(&project)?)
+                }
+                _ => bail!("TB-1 project settings are affinity and calendar"),
+            },
+            ProjectCommand::Start { project, reason } => {
+                print_json(&garnish.start_project(&project, &reason)?)
             }
-            ProjectCommand::Resume { project, reason } => {
-                print_json(&garnish.set_project_scheduler_pause(&project, false, &reason)?)
+            ProjectCommand::Pause {
+                project,
+                legacy_project,
+                reason,
+            } => {
+                let project = project.or(legacy_project).context("project is required")?;
+                print_json(&garnish.pause_project(&project, &reason)?)
+            }
+            ProjectCommand::Resume {
+                project,
+                legacy_project,
+                reason,
+            } => {
+                let project = project.or(legacy_project).context("project is required")?;
+                print_json(&garnish.start_project(&project, &reason)?)
+            }
+            ProjectCommand::Stop { project, reason } => {
+                print_json(&garnish.stop_project(&project, &reason)?)
+            }
+            ProjectCommand::Status { project } => {
+                print_json(&garnish.project_status_at(&project, Utc::now())?)
+            }
+            ProjectCommand::Review { project } => {
+                print_json(&garnish.review_results(Some(&project))?)
+            }
+            ProjectCommand::Apply { result, reason } => {
+                print_json(&garnish.apply_review_result(&result, &reason)?)
+            }
+            ProjectCommand::Discard { result, reason } => {
+                print_json(&garnish.discard_review_result(&result, &reason)?)
+            }
+            ProjectCommand::Archive { project, reason } => {
+                print_json(&garnish.archive_project(&project, &reason)?)
             }
             ProjectCommand::Link {
                 parent,
@@ -989,6 +1441,29 @@ fn run() -> Result<()> {
                 &args.provider,
                 &args.account,
             )?),
+        },
+        Command::Objective { command } => match command {
+            ObjectiveCommand::Add {
+                project,
+                title,
+                goal,
+                acceptance,
+                priority,
+                fixture_write_path,
+                fixture_write_content,
+            } => print_json(&garnish.add_objective(
+                &project,
+                &title,
+                &goal,
+                &acceptance,
+                priority,
+                fixture_write_path,
+                fixture_write_content,
+            )?),
+            ObjectiveCommand::List { project } => {
+                print_json(&garnish.objectives(project.as_deref())?)
+            }
+            ObjectiveCommand::Show { objective } => print_json(&garnish.objective(&objective)?),
         },
         Command::Quota { command } => match command {
             QuotaCommand::Set(args) => print_json(&garnish.set_quota(
@@ -1312,6 +1787,29 @@ fn run() -> Result<()> {
             }
         },
         Command::Agent { command } => match command {
+            AgentCommand::List => print_json(&garnish.supervisor_agent_profiles()?),
+            AgentCommand::Show { agent } => {
+                let profile = garnish
+                    .supervisor_agent_profiles()?
+                    .into_iter()
+                    .find(|profile| profile["name"] == agent)
+                    .with_context(|| format!("agent profile not found: {agent}"))?;
+                print_json(&profile)
+            }
+            AgentCommand::Configure {
+                agent,
+                setting,
+                value,
+                reason,
+            } => {
+                if setting != "quota.remaining_percent" {
+                    bail!("TB-1 fixture agent setting is quota.remaining_percent");
+                }
+                let value: f64 = value
+                    .parse()
+                    .context("quota.remaining_percent must be a number")?;
+                print_json(&garnish.set_fixture_agent_quota(&agent, value, &reason)?)
+            }
             AgentCommand::Probe => print_json(&garnish.doctor().probes),
             AgentCommand::Refresh { valid_seconds } => print_json(
                 &garnish
@@ -1364,6 +1862,27 @@ fn run() -> Result<()> {
                 print_json(&json!({"id": id, "status": "consumed"}))
             }
         },
+        Command::Route { command } => match command {
+            RouteCommand::Explain { project } => print_json(&json!({
+                "mode": "tb1_fixture",
+                "project_status": garnish.project_status_at(&project, Utc::now())?,
+                "agents": garnish.supervisor_agent_profiles()?,
+                "note": "the bounded service cycle records exact internal route decisions",
+            })),
+        },
+        Command::Maintenance { command } => match command {
+            MaintenanceCommand::Preview { project } => print_json(&json!({
+                "mode": "tb1_fixture",
+                "cleanup_records": garnish.cleanup_records(project.as_deref())?,
+                "automatic": true,
+            })),
+            MaintenanceCommand::Reconcile { project } => print_json(&json!({
+                "mode": "tb1_fixture",
+                "cleanup_records": garnish.cleanup_records(project.as_deref())?,
+                "action": "inspection_only",
+                "reason": "TB-1 automatically attempts owned cleanup at terminal review",
+            })),
+        },
         Command::Ui { command } => match command {
             UiCommand::Serve(args) => {
                 serve_ui(
@@ -1387,6 +1906,48 @@ fn run() -> Result<()> {
             }
         },
         Command::Recover => print_json(&json!({"recovered_task_ids": garnish.recover()?})),
+        Command::Advanced { arguments } => {
+            let executable = std::env::current_exe().context("resolving garnish executable")?;
+            let output = std::process::Command::new(executable)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .args(arguments)
+                .output()
+                .context("running advanced compatibility command")?;
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                bail!("advanced compatibility command failed")
+            }
+        }
+    }
+}
+
+fn derive_project_slug(path: &std::path::Path) -> String {
+    let candidate = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project");
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for character in candidate.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "project".into()
+    } else {
+        slug
     }
 }
 

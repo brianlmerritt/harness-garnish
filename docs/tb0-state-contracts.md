@@ -1,6 +1,6 @@
 # TB-0 state-machine contracts
 
-Status: to-be state contract for the project-supervisor boundary. Existing schema-20 task/run transitions remain authoritative for the compatibility build until the migrations and services described here are implemented and accepted.
+Status: frozen state contract for the project-supervisor boundary. TB-1 implements its schema-21 project, objective, calendar, fixture handoff, review, and cleanup subset under [ADR 0018](decisions/0018-tb1-fixture-supervisor.md). Later approval, notification, secret, sandbox, and real-agent transitions remain to-be.
 
 ## 1. Common transition rules
 
@@ -158,4 +158,3 @@ States: `pending`, `applied`, `discarded`, `conflicted`, `expired`.
 - A mismatch creates `conflicted` and preserves the result for rebase/rework; it does not leave a half-applied checkout.
 - `discarded` records actor/reason and releases retention according to policy.
 - Apply never commits, pushes, merges, changes branches, or deploys.
-

@@ -14,6 +14,8 @@ The historical narrow source-run CLI compatibility slice is complete. Its implem
 
 The TB-0 pivot contract phase has exited with a frozen [CLI and JSON contract](docs/tb0-command-contract.md), [state-machine contracts](docs/tb0-state-contracts.md), [current gap matrix](docs/tb0-gap-matrix.md), [schema migration plan](docs/tb0-schema-migration.md), and [passing quota-free evidence](docs/tb0-exit-report.md). These specify the target and protect the compatibility build; they do not yet implement the project-supervisor runtime.
 
+TB-1 now provides the first executable project-first supervisor slice: schema 21, `WWWOOBB` calendars and project affinity, project/objective lifecycle, a foreground multi-project service, fake quota-driven Codex-to-Claude handoff, explicit result review/apply, and owned worktree cleanup. The [TB-1 exit report](docs/tb1-exit-report.md) and [acceptance boundary](docs/tb1-acceptance.md) state exactly what is real and what remains fake; [TB-1 CLI testing](docs/tb1-cli-testing.md) gives copyable exercises that use a temporary Git repository and no provider quota.
+
 ## Confirmed direction
 
 - `garnish` will be a small Rust control plane with SQLite as canonical state.

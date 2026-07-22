@@ -9,6 +9,8 @@ pub enum DayKind {
     Work,
     #[serde(rename = "O")]
     Off,
+    #[serde(rename = "B")]
+    Both,
 }
 
 impl fmt::Display for DayKind {
@@ -16,6 +18,7 @@ impl fmt::Display for DayKind {
         formatter.write_str(match self {
             Self::Work => "W",
             Self::Off => "O",
+            Self::Both => "B",
         })
     }
 }
@@ -27,8 +30,9 @@ impl FromStr for DayKind {
         match value.to_ascii_uppercase().as_str() {
             "W" => Ok(Self::Work),
             "O" => Ok(Self::Off),
+            "B" => Ok(Self::Both),
             _ => Err(DomainError::InvalidSchedule(
-                "day kind must be W or O".into(),
+                "day kind must be W, O, or B".into(),
             )),
         }
     }
@@ -203,6 +207,138 @@ pub struct ProjectLink {
     pub child_project_id: String,
     pub relationship: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectAffinity {
+    Work,
+    NonWork,
+    Both,
+}
+
+impl fmt::Display for ProjectAffinity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Work => "work",
+            Self::NonWork => "non_work",
+            Self::Both => "both",
+        })
+    }
+}
+
+impl FromStr for ProjectAffinity {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().replace('-', "_").as_str() {
+            "work" => Ok(Self::Work),
+            "non_work" | "off" => Ok(Self::NonWork),
+            "both" => Ok(Self::Both),
+            _ => Err(DomainError::InvalidProject(
+                "project affinity must be work, non-work, or both".into(),
+            )),
+        }
+    }
+}
+
+impl From<ProjectAffinity> for DayAffinity {
+    fn from(value: ProjectAffinity) -> Self {
+        match value {
+            ProjectAffinity::Work => Self::Work,
+            ProjectAffinity::NonWork => Self::Off,
+            ProjectAffinity::Both => Self::Both,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisedProject {
+    #[serde(flatten)]
+    pub project: Project,
+    pub status: String,
+    pub affinity: ProjectAffinity,
+    pub calendar: String,
+    pub backlog_source: String,
+    pub integration_policy: String,
+    pub lifecycle_reason: Option<String>,
+    pub version: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Objective {
+    pub id: String,
+    pub project_id: String,
+    pub title: String,
+    pub goal: String,
+    pub acceptance: Vec<String>,
+    pub priority: i64,
+    pub status: String,
+    pub source: String,
+    pub task_id: Option<String>,
+    pub version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingExplanation {
+    pub path: String,
+    pub effective_value: serde_json::Value,
+    pub source: String,
+    pub revision_id: Option<String>,
+    pub scope: String,
+    pub restart_required: bool,
+    pub reschedule_required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewResult {
+    pub id: String,
+    pub project_id: String,
+    pub objective_id: String,
+    pub task_id: String,
+    pub run_id: String,
+    pub status: String,
+    pub adapter: String,
+    pub base_commit: String,
+    pub patch_path: String,
+    pub manifest_path: String,
+    pub verification_path: String,
+    pub handoff_path: String,
+    pub cleanup_status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupRecord {
+    pub id: String,
+    pub project_id: String,
+    pub objective_id: String,
+    pub run_id: String,
+    pub implementation_worktree: String,
+    pub verifier_worktree: String,
+    pub branch: String,
+    pub status: String,
+    pub detail: String,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorCycle {
+    pub evaluated_at: DateTime<Utc>,
+    pub project_id: Option<String>,
+    pub objective_id: Option<String>,
+    pub task_id: Option<String>,
+    pub selected_agent: Option<String>,
+    pub previous_agent: Option<String>,
+    pub action: String,
+    pub reason_code: String,
+    pub review_result_id: Option<String>,
+    pub next_wake_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1041,6 +1177,8 @@ pub struct RunRecord {
 
 #[derive(Debug, Error)]
 pub enum DomainError {
+    #[error("invalid project: {0}")]
+    InvalidProject(String),
     #[error("invalid task: {0}")]
     InvalidTask(String),
     #[error("invalid task status: {0}")]

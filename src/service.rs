@@ -18,13 +18,15 @@ use crate::{
         ApiClaimReservationRequest, ApiDispatchAttempt, ApiModelPrice, ApiRequestPlan,
         ApiReservationRequest, ApiSettlement, ApiSpend, ApprovalRequest, BackupRecord,
         CalendarException, CalendarProfile, CheckpointAction, CircuitBreaker, ControlState,
-        DayKind, EmergencyStopResult, FailureCategory, LocalNotification, McpServerRevision,
-        NewApiBudget, NewApiModelPrice, NewApiRequestPlan, NewMcpServerRevision, NewTask, Project,
-        ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample,
-        RetryPlan, RetryState, RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint,
-        RunRecord, RunSummary, ScheduleEvaluation, SchedulerApiClaim, SchedulerClaim,
-        SchedulerClaimRejection, SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader,
-        SchedulerPreview, SchedulerTick, SchedulerWake, Task, TaskStatus, UsageForecast,
+        DayAffinity, DayKind, EmergencyStopResult, FailureCategory, LocalNotification,
+        McpServerRevision, NewApiBudget, NewApiModelPrice, NewApiRequestPlan, NewMcpServerRevision,
+        NewTask, Objective, Project, ProjectAffinity, ProjectLink, QuotaCollectionAttempt,
+        QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan, RetryState, ReviewResult,
+        RouteCandidate, RouteDecision, RouteTarget, RunCheckpoint, RunRecord, RunSummary,
+        ScheduleEvaluation, SchedulerApiClaim, SchedulerClaim, SchedulerClaimRejection,
+        SchedulerDaemonConfig, SchedulerDaemonSummary, SchedulerLeader, SchedulerPreview,
+        SchedulerTick, SchedulerWake, SettingExplanation, SupervisedProject, SupervisorCycle, Task,
+        TaskStatus, UsageForecast,
     },
     evidence::{Handoff, RunEvidence, RunManifest, verification_evidence},
     git,
@@ -39,7 +41,8 @@ use crate::{
     schedule,
 };
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -112,7 +115,7 @@ impl Garnish {
 
     pub fn doctor(&self) -> DoctorReport {
         DoctorReport {
-            schema_version: 20,
+            schema_version: 21,
             data_dir: self.data_dir.to_string_lossy().into_owned(),
             database: self.db.path().to_string_lossy().into_owned(),
             probes: vec![
@@ -219,6 +222,665 @@ impl Garnish {
         self.db.list_projects()
     }
 
+    pub fn add_supervised_project(
+        &mut self,
+        slug: &str,
+        title: &str,
+        root: &Path,
+        affinity: ProjectAffinity,
+        calendar: &str,
+    ) -> Result<SupervisedProject> {
+        let project = self.add_project(slug, title, root)?;
+        self.db
+            .set_project_affinity(&project.id, affinity, "project registration", Utc::now())?;
+        self.assign_project_calendar(&project.id, calendar)?;
+        self.db.supervised_project(&project.id)
+    }
+
+    pub fn supervised_project(&self, project: &str) -> Result<SupervisedProject> {
+        self.db.supervised_project(project)
+    }
+
+    pub fn supervised_projects(&self) -> Result<Vec<SupervisedProject>> {
+        self.db.list_supervised_projects()
+    }
+
+    pub fn set_project_affinity(
+        &mut self,
+        project: &str,
+        affinity: ProjectAffinity,
+        reason: &str,
+    ) -> Result<SupervisedProject> {
+        self.db
+            .set_project_affinity(project, affinity, reason, Utc::now())
+    }
+
+    pub fn start_project(&mut self, project: &str, reason: &str) -> Result<SupervisedProject> {
+        self.db
+            .transition_supervised_project(project, "active", reason, Utc::now())
+    }
+
+    pub fn pause_project(&mut self, project: &str, reason: &str) -> Result<SupervisedProject> {
+        self.db
+            .transition_supervised_project(project, "paused", reason, Utc::now())
+    }
+
+    pub fn stop_project(&mut self, project: &str, reason: &str) -> Result<SupervisedProject> {
+        self.db
+            .transition_supervised_project(project, "stopped", reason, Utc::now())
+    }
+
+    pub fn archive_project(&mut self, project: &str, reason: &str) -> Result<SupervisedProject> {
+        self.db
+            .transition_supervised_project(project, "archived", reason, Utc::now())
+    }
+
+    pub fn project_schedule_at(
+        &self,
+        project: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ScheduleEvaluation> {
+        let project = self.db.supervised_project(project)?;
+        let calendar = self.db.project_calendar(&project.project.id)?;
+        let exceptions = self.db.calendar_exceptions(&calendar.id)?;
+        schedule::evaluate(
+            &calendar,
+            &exceptions,
+            DayAffinity::from(project.affinity),
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_objective(
+        &mut self,
+        project: &str,
+        title: &str,
+        goal: &str,
+        acceptance: &[String],
+        priority: i64,
+        fixture_write_path: Option<String>,
+        fixture_write_content: Option<String>,
+    ) -> Result<Objective> {
+        if fixture_write_path.is_some() != fixture_write_content.is_some() {
+            bail!("fixture write path and content must be supplied together");
+        }
+        if fixture_write_content.as_deref().is_some_and(|content| {
+            content.is_empty() || content.contains('\r') || content.contains('\n')
+        }) {
+            bail!("fixture write content must be one non-empty line");
+        }
+        let objective =
+            self.db
+                .add_objective(project, title, goal, acceptance, priority, Utc::now())?;
+        let supervised = self.db.supervised_project(&objective.project_id)?;
+        let scope = fixture_write_path.iter().cloned().collect::<Vec<_>>();
+        let verification_argv = match (&fixture_write_path, &fixture_write_content) {
+            (Some(path), Some(content)) => {
+                vec!["grep".into(), "-Fqx".into(), content.clone(), path.clone()]
+            }
+            _ => vec!["true".into()],
+        };
+        let task = match self.add_task(&NewTask {
+            project_id: objective.project_id.clone(),
+            title: objective.title.clone(),
+            goal: objective.goal.clone(),
+            rationale: "generated deterministically from local objective".into(),
+            scope,
+            non_scope: vec!["Git integration and external effects".into()],
+            acceptance: objective.acceptance.clone(),
+            verification_argv,
+            dependencies: vec![],
+            priority: objective.priority,
+            risk_class: 0,
+            estimated_seconds: 60,
+            uncertainty_percent: 25,
+            checkpoint_seconds: 60,
+            day_affinity: DayAffinity::from(supervised.affinity),
+            deadline_at: None,
+            required_capabilities: vec![],
+            pinned_adapter: None,
+            pinned_provider: None,
+            pinned_account: None,
+            fake_write_path: fixture_write_path,
+            fake_write_content: fixture_write_content,
+        }) {
+            Ok(task) => task,
+            Err(error) => {
+                self.db.set_objective_status(
+                    &objective.id,
+                    "blocked",
+                    "internal task generation failed",
+                    Utc::now(),
+                )?;
+                return Err(error);
+            }
+        };
+        self.db
+            .link_objective_task(&objective.id, &task.id, Utc::now())
+    }
+
+    pub fn objective(&self, id: &str) -> Result<Objective> {
+        self.db.objective(id)
+    }
+
+    pub fn objectives(&self, project: Option<&str>) -> Result<Vec<Objective>> {
+        self.db.list_objectives(project)
+    }
+
+    pub fn configure_setting(
+        &mut self,
+        path: &str,
+        value: serde_json::Value,
+        reason: &str,
+    ) -> Result<SettingExplanation> {
+        if matches!(
+            path,
+            "calendar.default.pattern" | "calendar.default.timezone"
+        ) {
+            let value = value
+                .as_str()
+                .context("calendar settings must be JSON strings or plain string values")?;
+            let calendar = self.db.calendar("default")?;
+            let (timezone, pattern) = if path == "calendar.default.pattern" {
+                (calendar.timezone.as_str(), value)
+            } else {
+                (value, calendar.weekly_pattern.as_str())
+            };
+            self.db.configure_calendar("default", timezone, pattern)?;
+            return self.db.explain_setting("global", None, path);
+        }
+        self.db
+            .set_setting("global", None, path, &value, reason, Utc::now())
+    }
+
+    pub fn explain_setting(&self, path: &str) -> Result<SettingExplanation> {
+        self.db.explain_setting("global", None, path)
+    }
+
+    pub fn initialize_supervisor_defaults(
+        &mut self,
+        timezone: &str,
+        pattern: &str,
+    ) -> Result<serde_json::Value> {
+        let calendar = self.configure_calendar("default", timezone, pattern)?;
+        Ok(serde_json::json!({
+            "calendar": calendar,
+            "agent_profiles": self.db.supervisor_agent_profiles()?,
+            "execution_mode": "fixture",
+        }))
+    }
+
+    pub fn supervisor_agent_profiles(&self) -> Result<Vec<serde_json::Value>> {
+        self.db.supervisor_agent_profiles()
+    }
+
+    pub fn set_fixture_agent_quota(
+        &mut self,
+        agent: &str,
+        remaining_percent: f64,
+        reason: &str,
+    ) -> Result<QuotaSurface> {
+        if !(0.0..=100.0).contains(&remaining_percent) || !remaining_percent.is_finite() {
+            bail!("remaining percentage must be finite and in 0..=100");
+        }
+        if reason.trim().is_empty() {
+            bail!("changing fixture quota requires a reason");
+        }
+        let profile = self.db.supervisor_agent_profile(agent)?;
+        if profile["mode"] != "fixture" {
+            bail!("only fixture agent quota can be set in TB-1");
+        }
+        self.set_quota(
+            profile["provider"]
+                .as_str()
+                .context("fixture agent provider is missing")?,
+            profile["account"]
+                .as_str()
+                .context("fixture agent account is missing")?,
+            "five_hour",
+            Some(remaining_percent),
+            20.0,
+            None,
+            &format!("tb1_fixture:{reason}"),
+            None,
+        )
+    }
+
+    pub fn project_status_at(
+        &self,
+        project: &str,
+        now: DateTime<Utc>,
+    ) -> Result<serde_json::Value> {
+        let project = self.db.supervised_project(project)?;
+        let schedule = self.project_schedule_at(&project.project.id, now)?;
+        let objectives = self.db.list_objectives(Some(&project.project.id))?;
+        let reviews = self.db.review_results(Some(&project.project.id))?;
+        let cleanup = self.db.cleanup_records(Some(&project.project.id))?;
+        Ok(serde_json::json!({
+            "project": project,
+            "schedule": schedule,
+            "objectives": objectives,
+            "review_results": reviews,
+            "cleanup": cleanup,
+            "next_action": if !schedule.eligible {
+                "wait_for_calendar"
+            } else if objectives.iter().any(|objective| objective.status == "review") {
+                "review_result"
+            } else if objectives.iter().any(|objective| objective.status == "ready") {
+                "run_supervisor_cycle"
+            } else {
+                "none"
+            },
+            "next_wake_at": schedule.next_eligible_at,
+        }))
+    }
+
+    pub fn supervisor_status_at(&self, now: DateTime<Utc>) -> Result<serde_json::Value> {
+        let projects = self.db.list_supervised_projects()?;
+        let mut project_status = Vec::with_capacity(projects.len());
+        for project in &projects {
+            project_status.push(self.project_status_at(&project.project.id, now)?);
+        }
+        Ok(serde_json::json!({
+            "mode": "tb1_fixture",
+            "evaluated_at": now,
+            "control": self.db.control_state()?,
+            "projects": project_status,
+            "agents": self.db.supervisor_agent_profiles()?,
+            "quota": self.db.list_quota()?.into_iter().filter(|surface| {
+                matches!(surface.provider.as_str(), "fake-codex" | "fake-claude")
+            }).collect::<Vec<_>>(),
+            "pending_approvals": self.db.list_approvals(20)?.into_iter()
+                .filter(|approval| approval.decision == "pending")
+                .collect::<Vec<_>>(),
+            "notifications": self.db.local_notifications(false, 20)?,
+        }))
+    }
+
+    pub fn run_supervisor_cycle(&mut self) -> Result<SupervisorCycle> {
+        self.run_supervisor_cycle_at(Utc::now())
+    }
+
+    pub fn run_supervisor_cycle_at(&mut self, now: DateTime<Utc>) -> Result<SupervisorCycle> {
+        let projects = self.db.list_supervised_projects()?;
+        for project in projects.iter().filter(|project| project.status == "active") {
+            let schedule = self.project_schedule_at(&project.project.id, now)?;
+            if !schedule.eligible {
+                continue;
+            }
+            let Some(objective) = self
+                .db
+                .list_objectives(Some(&project.project.id))?
+                .into_iter()
+                .find(|objective| objective.status == "ready")
+            else {
+                continue;
+            };
+            let task_id = objective
+                .task_id
+                .clone()
+                .context("ready objective has no generated internal task")?;
+            let codex = RouteTarget {
+                adapter: "fake-codex".into(),
+                provider: "fake-codex".into(),
+                account: "subscription".into(),
+            };
+            let claude = RouteTarget {
+                adapter: "fake-claude".into(),
+                provider: "fake-claude".into(),
+                account: "subscription".into(),
+            };
+            let codex_readiness = self.task_readiness_at(
+                &task_id,
+                &codex.adapter,
+                &codex.provider,
+                &codex.account,
+                now,
+            )?;
+            let (selected, previous_agent, handoff_reason) = if codex_readiness.allowed {
+                (codex, None, None)
+            } else {
+                let claude_readiness = self.task_readiness_at(
+                    &task_id,
+                    &claude.adapter,
+                    &claude.provider,
+                    &claude.account,
+                    now,
+                )?;
+                if !claude_readiness.allowed {
+                    let cycle = SupervisorCycle {
+                        evaluated_at: now,
+                        project_id: Some(project.project.id.clone()),
+                        objective_id: Some(objective.id.clone()),
+                        task_id: Some(task_id),
+                        selected_agent: None,
+                        previous_agent: Some("codex-subscription".into()),
+                        action: "waiting".into(),
+                        reason_code: "route.no_subscription_capacity".into(),
+                        review_result_id: None,
+                        next_wake_at: claude_readiness
+                            .next_wake_at
+                            .or(codex_readiness.next_wake_at),
+                    };
+                    self.db.record_supervisor_cycle(&cycle)?;
+                    return Ok(cycle);
+                }
+                self.db.record_supervisor_handoff(
+                    &project.project.id,
+                    &objective.id,
+                    &task_id,
+                    "codex-subscription",
+                    "claude-subscription",
+                    &codex_readiness.reason_code,
+                    now,
+                )?;
+                (
+                    claude,
+                    Some("codex-subscription".into()),
+                    Some(codex_readiness.reason_code),
+                )
+            };
+            let selected_agent = if selected.adapter == "fake-codex" {
+                "codex-subscription"
+            } else {
+                "claude-subscription"
+            };
+            self.db.set_objective_status(
+                &objective.id,
+                "running",
+                "supervisor selected an eligible fixture route",
+                now,
+            )?;
+            let run = match self.run_task_at(
+                &task_id,
+                &selected.adapter,
+                &selected.provider,
+                &selected.account,
+                now,
+            ) {
+                Ok(run) => run,
+                Err(error) => {
+                    self.db.set_objective_status(
+                        &objective.id,
+                        "blocked",
+                        "fixture execution failed",
+                        Utc::now(),
+                    )?;
+                    let cleanup_detail =
+                        self.cleanup_failed_supervisor_attempt(project, &objective, &task_id);
+                    let cycle = SupervisorCycle {
+                        evaluated_at: now,
+                        project_id: Some(project.project.id.clone()),
+                        objective_id: Some(objective.id.clone()),
+                        task_id: Some(task_id),
+                        selected_agent: Some(selected_agent.into()),
+                        previous_agent,
+                        action: "blocked".into(),
+                        reason_code: format!("execution.failed:{error}; cleanup:{cleanup_detail}"),
+                        review_result_id: None,
+                        next_wake_at: None,
+                    };
+                    self.db.record_supervisor_cycle(&cycle)?;
+                    return Ok(cycle);
+                }
+            };
+            let review = self.db.create_review_result(
+                &project.project.id,
+                &objective.id,
+                &task_id,
+                &run.run_id,
+                &run.adapter,
+                &run.base_commit,
+                &run.patch_path,
+                &run.manifest_path,
+                &run.verification_path,
+                &run.handoff_path,
+                Utc::now(),
+            )?;
+            self.db.set_objective_status(
+                &objective.id,
+                "review",
+                "independent fixture verification passed",
+                Utc::now(),
+            )?;
+            let verifier_path = self.data_dir.join("verifiers").join(&run.run_id);
+            let cleanup = self.db.create_cleanup_record(
+                &project.project.id,
+                &objective.id,
+                &run.run_id,
+                &run.worktree,
+                verifier_path.to_string_lossy().as_ref(),
+                &run.branch,
+                Utc::now(),
+            )?;
+            let worktree = crate::git::Worktree {
+                path: run.worktree.clone(),
+                branch: run.branch.clone(),
+                base_commit: run.base_commit.clone(),
+            };
+            match git::cleanup_owned_task_worktrees(
+                Path::new(&project.project.root_path),
+                &worktree,
+                &verifier_path,
+            ) {
+                Ok(()) => {
+                    self.db.finish_cleanup_record(
+                        &cleanup.id,
+                        "complete",
+                        "captured review evidence; removed owned implementation/verifier worktrees and branch",
+                        Utc::now(),
+                    )?;
+                }
+                Err(error) => {
+                    self.db.finish_cleanup_record(
+                        &cleanup.id,
+                        "quarantined",
+                        &format!("owned cleanup requires operator review: {error}"),
+                        Utc::now(),
+                    )?;
+                }
+            }
+            let cycle = SupervisorCycle {
+                evaluated_at: now,
+                project_id: Some(project.project.id.clone()),
+                objective_id: Some(objective.id),
+                task_id: Some(task_id),
+                selected_agent: Some(selected_agent.into()),
+                previous_agent,
+                action: "review".into(),
+                reason_code: handoff_reason
+                    .map(|reason| format!("handoff:{reason}"))
+                    .unwrap_or_else(|| "route.codex_preferred".into()),
+                review_result_id: Some(review.id),
+                next_wake_at: None,
+            };
+            self.db.record_supervisor_cycle(&cycle)?;
+            return Ok(cycle);
+        }
+        let next_wake_at = projects
+            .iter()
+            .filter(|project| project.status == "active")
+            .filter_map(|project| {
+                self.project_schedule_at(&project.project.id, now)
+                    .ok()
+                    .and_then(|schedule| schedule.next_eligible_at)
+            })
+            .min();
+        let cycle = SupervisorCycle {
+            evaluated_at: now,
+            project_id: None,
+            objective_id: None,
+            task_id: None,
+            selected_agent: None,
+            previous_agent: None,
+            action: "idle".into(),
+            reason_code: "supervisor.no_eligible_objective".into(),
+            review_result_id: None,
+            next_wake_at,
+        };
+        self.db.record_supervisor_cycle(&cycle)?;
+        Ok(cycle)
+    }
+
+    fn cleanup_failed_supervisor_attempt(
+        &mut self,
+        project: &SupervisedProject,
+        objective: &Objective,
+        task_id: &str,
+    ) -> String {
+        let worktree_path = self
+            .data_dir
+            .join("worktrees")
+            .join(&project.project.slug)
+            .join(task_id);
+        if !worktree_path.exists() {
+            return "no_owned_worktree_created".into();
+        }
+        let suffix: String = task_id
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .take(16)
+            .collect();
+        let branch = format!("garnish/task-{suffix}");
+        let runs = match self.db.run_records_for_task(task_id) {
+            Ok(runs) => runs,
+            Err(error) => return format!("quarantined:run_inventory_failed:{error}"),
+        };
+        let implementer = runs.iter().rev().find(|run| run.role == "implementer");
+        let verifier_path = implementer.map_or_else(
+            || {
+                self.data_dir
+                    .join("verifiers")
+                    .join(format!("no-run-{task_id}"))
+            },
+            |run| self.data_dir.join("verifiers").join(&run.id),
+        );
+        let base_commit = match git::snapshot(Path::new(&project.project.root_path)) {
+            Ok(snapshot) => snapshot.base_commit,
+            Err(error) => return format!("quarantined:source_snapshot_failed:{error}"),
+        };
+        let worktree = crate::git::Worktree {
+            path: worktree_path.to_string_lossy().into_owned(),
+            branch: branch.clone(),
+            base_commit,
+        };
+        let cleanup_record = implementer.and_then(|run| {
+            self.db
+                .create_cleanup_record(
+                    &project.project.id,
+                    &objective.id,
+                    &run.id,
+                    &worktree.path,
+                    verifier_path.to_string_lossy().as_ref(),
+                    &branch,
+                    Utc::now(),
+                )
+                .ok()
+        });
+        match git::cleanup_owned_task_worktrees(
+            Path::new(&project.project.root_path),
+            &worktree,
+            &verifier_path,
+        ) {
+            Ok(()) => {
+                if let Some(record) = cleanup_record {
+                    let _ = self.db.finish_cleanup_record(
+                        &record.id,
+                        "complete",
+                        "failed fixture attempt; removed exactly owned worktrees and branch",
+                        Utc::now(),
+                    );
+                }
+                "complete".into()
+            }
+            Err(error) => {
+                if let Some(record) = cleanup_record {
+                    let _ = self.db.finish_cleanup_record(
+                        &record.id,
+                        "quarantined",
+                        &format!("failed fixture cleanup requires operator review: {error}"),
+                        Utc::now(),
+                    );
+                }
+                format!("quarantined:{error}")
+            }
+        }
+    }
+
+    pub fn review_results(&self, project: Option<&str>) -> Result<Vec<ReviewResult>> {
+        self.db.review_results(project)
+    }
+
+    pub fn cleanup_records(
+        &self,
+        project: Option<&str>,
+    ) -> Result<Vec<crate::domain::CleanupRecord>> {
+        self.db.cleanup_records(project)
+    }
+
+    pub fn apply_review_result(&mut self, id: &str, reason: &str) -> Result<ReviewResult> {
+        let result = self.db.review_result(id)?;
+        let project = self.db.project(&result.project_id)?;
+        let source = git::snapshot(Path::new(&project.root_path))?;
+        if source.base_commit != result.base_commit {
+            self.db.set_review_result_status(
+                id,
+                "conflicted",
+                "source base changed",
+                Utc::now(),
+            )?;
+            bail!("review result base no longer matches the registered source checkout");
+        }
+        let patch = fs::read(&result.patch_path)?;
+        if !patch.is_empty() {
+            git::apply_untrusted_patch(Path::new(&project.root_path), &patch)?;
+        }
+        let applied = self
+            .db
+            .set_review_result_status(id, "applied", reason, Utc::now())?;
+        let task = self.db.task(&result.task_id)?;
+        if task.status == TaskStatus::Review {
+            self.complete_task(&task.id)?;
+        }
+        let objective = self.db.objective(&result.objective_id)?;
+        if objective.status == "review" {
+            self.db.set_objective_status(
+                &objective.id,
+                "completed",
+                "review result applied",
+                Utc::now(),
+            )?;
+        }
+        Ok(applied)
+    }
+
+    pub fn discard_review_result(&mut self, id: &str, reason: &str) -> Result<ReviewResult> {
+        let result = self.db.review_result(id)?;
+        let discarded = self
+            .db
+            .set_review_result_status(id, "discarded", reason, Utc::now())?;
+        let task = self.db.task(&result.task_id)?;
+        if task.status == TaskStatus::Review {
+            self.db.transition_task(
+                &task.id,
+                TaskStatus::Review,
+                TaskStatus::Cancelled,
+                "review result discarded",
+            )?;
+        }
+        let objective = self.db.objective(&result.objective_id)?;
+        if objective.status == "review" {
+            self.db.set_objective_status(
+                &objective.id,
+                "cancelled",
+                "review result discarded",
+                Utc::now(),
+            )?;
+        }
+        Ok(discarded)
+    }
+
     pub fn set_project_scheduler_pause(
         &mut self,
         project: &str,
@@ -251,6 +913,69 @@ impl Garnish {
         self.db.configure_calendar(slug, timezone, weekly_pattern)
     }
 
+    pub fn calendar(&self, calendar: &str) -> Result<CalendarProfile> {
+        self.db.calendar(calendar)
+    }
+
+    pub fn calendars(&self) -> Result<Vec<CalendarProfile>> {
+        self.db.calendars()
+    }
+
+    pub fn calendar_preview(
+        &self,
+        calendar: &str,
+        project: Option<&str>,
+        from: Option<NaiveDate>,
+        days: u32,
+        now: DateTime<Utc>,
+    ) -> Result<serde_json::Value> {
+        let calendar = self.db.calendar(calendar)?;
+        let timezone = calendar
+            .timezone
+            .parse::<Tz>()
+            .with_context(|| format!("unknown IANA timezone: {}", calendar.timezone))?;
+        let (affinity, project_id) = if let Some(project) = project {
+            let project = self.db.supervised_project(project)?;
+            if project.calendar != calendar.slug {
+                bail!("project is assigned to calendar {}", project.calendar);
+            }
+            (
+                DayAffinity::from(project.affinity),
+                Some(project.project.id),
+            )
+        } else {
+            (DayAffinity::Both, None)
+        };
+        let from = from.unwrap_or_else(|| now.with_timezone(&timezone).date_naive());
+        let exceptions = self.db.calendar_exceptions(&calendar.id)?;
+        let mut preview = Vec::with_capacity(days as usize);
+        for offset in 0..days {
+            let local_date = from + Duration::days(i64::from(offset));
+            let local_noon = local_date
+                .and_hms_opt(12, 0, 0)
+                .context("calendar preview date is outside supported range")?;
+            let instant = timezone
+                .from_local_datetime(&local_noon)
+                .single()
+                .context("calendar preview local noon is ambiguous")?
+                .with_timezone(&Utc);
+            let evaluation = schedule::evaluate(&calendar, &exceptions, affinity, instant)?;
+            preview.push(serde_json::json!({
+                "local_date": evaluation.local_date,
+                "day_kind": evaluation.day_kind,
+                "source": evaluation.day_source,
+                "eligible": project_id.as_ref().map(|_| evaluation.eligible),
+                "reason_code": project_id.as_ref().map(|_| evaluation.reason_code),
+            }));
+        }
+        Ok(serde_json::json!({
+            "calendar": calendar,
+            "project_id": project_id,
+            "from": from,
+            "days": preview,
+        }))
+    }
+
     pub fn assign_project_calendar(
         &mut self,
         project: &str,
@@ -268,6 +993,16 @@ impl Garnish {
     ) -> Result<CalendarException> {
         self.db
             .set_calendar_exception(calendar, local_date, day_kind, reason)
+    }
+
+    pub fn remove_calendar_exception(
+        &mut self,
+        calendar: &str,
+        local_date: NaiveDate,
+        reason: &str,
+    ) -> Result<serde_json::Value> {
+        self.db
+            .remove_calendar_exception(calendar, local_date, reason)
     }
 
     pub fn evaluate_task_schedule_at(
@@ -1425,6 +2160,26 @@ impl Garnish {
                 account: account.into(),
             }],
             Utc::now(),
+        )?;
+        Ok(decision)
+    }
+
+    pub fn task_readiness_at(
+        &mut self,
+        task_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RouteDecision> {
+        let (decision, _) = self.route_task_candidates_at(
+            task_id,
+            &[RouteTarget {
+                adapter: adapter.into(),
+                provider: provider.into(),
+                account: account.into(),
+            }],
+            now,
         )?;
         Ok(decision)
     }
@@ -2754,12 +3509,23 @@ impl Garnish {
         provider: &str,
         account: &str,
     ) -> Result<RunSummary> {
+        self.run_task_at(task_id, adapter, provider, account, Utc::now())
+    }
+
+    pub fn run_task_at(
+        &mut self,
+        task_id: &str,
+        adapter: &str,
+        provider: &str,
+        account: &str,
+        now: DateTime<Utc>,
+    ) -> Result<RunSummary> {
         if !adapter.starts_with("fake") {
             bail!(
                 "real agent execution is opt-in and requires a real secure backend; use `garnish agent invocation` to inspect the pinned argv or run the labelled smoke tests"
             );
         }
-        let route = self.route_task(task_id, adapter, provider, account)?;
+        let route = self.route_task_at(task_id, adapter, provider, account, now)?;
         if !route.allowed {
             bail!("route declined: {}", route.reason);
         }

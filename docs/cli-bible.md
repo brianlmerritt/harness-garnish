@@ -420,6 +420,8 @@ TB-0 machine evidence and its exact non-implementation boundary are recorded in 
 
 ### TB-1 — Project-oriented supervisor with fake execution
 
+Implementation status: exited on 2026-07-21 with the quota-free evidence recorded in the [TB-1 exit report](tb1-exit-report.md). The fixture-only and deferred boundaries in that report remain controlling; this status does not imply completion of TB-2 or real-agent execution.
+
 Deliver:
 
 - system configuration and `config explain`;

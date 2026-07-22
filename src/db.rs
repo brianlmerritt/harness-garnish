@@ -3,12 +3,13 @@ use crate::{
         AgentCapabilityProbe, ApiBudget, ApiBudgetReservation, ApiClaimReservationRequest,
         ApiDispatchAttempt, ApiModelPrice, ApiRequestPlan, ApiReservationRequest, ApiSettlement,
         ApiSpend, ApprovalRequest, BackupRecord, CalendarException, CalendarProfile,
-        CheckpointAction, CircuitBreaker, ClaimedRunStart, ControlState, DayKind,
+        CheckpointAction, CircuitBreaker, ClaimedRunStart, CleanupRecord, ControlState, DayKind,
         EmergencyStopResult, FailureCategory, LocalNotification, McpServerRevision, NewApiBudget,
-        NewApiModelPrice, NewApiRequestPlan, NewMcpServerRevision, NewTask, Project, ProjectLink,
-        QuotaCollectionAttempt, QuotaReservation, QuotaSurface, QuotaUsageSample, RetryPlan,
-        RetryState, RouteDecision, RunCheckpoint, RunRecord, SchedulerClaim,
-        SchedulerClaimRejection, SchedulerLeader, SchedulerWake, Task, TaskStatus,
+        NewApiModelPrice, NewApiRequestPlan, NewMcpServerRevision, NewTask, Objective, Project,
+        ProjectAffinity, ProjectLink, QuotaCollectionAttempt, QuotaReservation, QuotaSurface,
+        QuotaUsageSample, RetryPlan, RetryState, ReviewResult, RouteDecision, RunCheckpoint,
+        RunRecord, SchedulerClaim, SchedulerClaimRejection, SchedulerLeader, SchedulerWake,
+        SettingExplanation, SupervisedProject, Task, TaskStatus,
     },
     quota::QuotaObservation,
     schedule,
@@ -26,7 +27,7 @@ use std::{
 };
 use ulid::Ulid;
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 
 pub struct Database {
     path: PathBuf,
@@ -44,6 +45,15 @@ pub(crate) struct ApiRouteCapacity {
 
 impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_at_schema(path, SCHEMA_VERSION)
+    }
+
+    #[cfg(test)]
+    fn open_for_migration_test(path: impl AsRef<Path>, schema_version: i64) -> Result<Self> {
+        Self::open_at_schema(path, schema_version)
+    }
+
+    fn open_at_schema(path: impl AsRef<Path>, schema_version: i64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -56,7 +66,7 @@ impl Database {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mut db = Self { path, conn };
-        db.migrate()?;
+        db.migrate(schema_version)?;
         Ok(db)
     }
 
@@ -66,6 +76,13 @@ impl Database {
 
     pub fn schema_version(&self) -> i64 {
         SCHEMA_VERSION
+    }
+
+    #[cfg(test)]
+    fn actual_schema_version(&self) -> i64 {
+        self.conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("test database schema version")
     }
 
     pub fn control_state(&self) -> Result<ControlState> {
@@ -427,81 +444,87 @@ impl Database {
         })
     }
 
-    fn migrate(&mut self) -> Result<()> {
+    fn migrate(&mut self, target: i64) -> Result<()> {
+        if !(1..=SCHEMA_VERSION).contains(&target) {
+            bail!("unsupported migration target: {target}");
+        }
         let current: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if current > SCHEMA_VERSION {
-            bail!("database schema {current} is newer than supported schema {SCHEMA_VERSION}");
+        if current > target {
+            bail!("database schema {current} is newer than requested schema {target}");
         }
-        if current == SCHEMA_VERSION {
+        if current == target {
             return Ok(());
         }
         if current > 0 {
             self.backup_before_migration(current)?;
         }
         let tx = self.conn.transaction()?;
-        if current < 1 {
+        if current < 1 && target >= 1 {
             tx.execute_batch(MIGRATION_1)?;
         }
-        if current < 2 {
+        if current < 2 && target >= 2 {
             tx.execute_batch(MIGRATION_2)?;
         }
-        if current < 3 {
+        if current < 3 && target >= 3 {
             tx.execute_batch(MIGRATION_3)?;
         }
-        if current < 4 {
+        if current < 4 && target >= 4 {
             tx.execute_batch(MIGRATION_4)?;
         }
-        if current < 5 {
+        if current < 5 && target >= 5 {
             tx.execute_batch(MIGRATION_5)?;
         }
-        if current < 6 {
+        if current < 6 && target >= 6 {
             tx.execute_batch(MIGRATION_6)?;
         }
-        if current < 7 {
+        if current < 7 && target >= 7 {
             tx.execute_batch(MIGRATION_7)?;
         }
-        if current < 8 {
+        if current < 8 && target >= 8 {
             tx.execute_batch(MIGRATION_8)?;
         }
-        if current < 9 {
+        if current < 9 && target >= 9 {
             tx.execute_batch(MIGRATION_9)?;
         }
-        if current < 10 {
+        if current < 10 && target >= 10 {
             tx.execute_batch(MIGRATION_10)?;
         }
-        if current < 11 {
+        if current < 11 && target >= 11 {
             tx.execute_batch(MIGRATION_11)?;
         }
-        if current < 12 {
+        if current < 12 && target >= 12 {
             tx.execute_batch(MIGRATION_12)?;
         }
-        if current < 13 {
+        if current < 13 && target >= 13 {
             tx.execute_batch(MIGRATION_13)?;
         }
-        if current < 14 {
+        if current < 14 && target >= 14 {
             tx.execute_batch(MIGRATION_14)?;
         }
-        if current < 15 {
+        if current < 15 && target >= 15 {
             tx.execute_batch(MIGRATION_15)?;
         }
-        if current < 16 {
+        if current < 16 && target >= 16 {
             tx.execute_batch(MIGRATION_16)?;
         }
-        if current < 17 {
+        if current < 17 && target >= 17 {
             tx.execute_batch(MIGRATION_17)?;
         }
-        if current < 18 {
+        if current < 18 && target >= 18 {
             tx.execute_batch(MIGRATION_18)?;
         }
-        if current < 19 {
+        if current < 19 && target >= 19 {
             tx.execute_batch(MIGRATION_19)?;
         }
-        if current < 20 {
+        if current < 20 && target >= 20 {
             tx.execute_batch(MIGRATION_20)?;
         }
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if current < 21 && target >= 21 {
+            tx.execute_batch(MIGRATION_21)?;
+        }
+        tx.pragma_update(None, "user_version", target)?;
         tx.commit()?;
         Ok(())
     }
@@ -536,6 +559,14 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1)",
             params![id, slug, title, root_path, now.to_rfc3339()],
         )?;
+        tx.execute(
+            "INSERT INTO project_supervision(
+                project_id, status, affinity, calendar_slug, backlog_source,
+                integration_policy, lifecycle_reason, version, updated_at
+             ) VALUES (?1, 'stopped', 'both', 'default', 'local', 'review',
+                       'registered; start explicitly to supervise', 1, ?2)",
+            params![id, now.to_rfc3339()],
+        )?;
         append_event_tx(
             &tx,
             Some(&id),
@@ -566,6 +597,699 @@ impl Database {
         let rows = stmt.query_map([], map_project)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn supervised_project(&self, id_or_slug: &str) -> Result<SupervisedProject> {
+        self.conn
+            .query_row(
+                "SELECT p.id, p.slug, p.title, p.root_path, p.scheduler_paused,
+                        p.scheduler_pause_reason, p.created_at,
+                        s.status, s.affinity, s.calendar_slug, s.backlog_source,
+                        s.integration_policy, s.lifecycle_reason, s.version, s.updated_at
+                 FROM projects p
+                 JOIN project_supervision s ON s.project_id = p.id
+                 WHERE p.id = ?1 OR p.slug = ?1",
+                [id_or_slug],
+                map_supervised_project,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("project not found: {id_or_slug}"))
+    }
+
+    pub fn list_supervised_projects(&self) -> Result<Vec<SupervisedProject>> {
+        let mut statement = self.conn.prepare(
+            "SELECT p.id, p.slug, p.title, p.root_path, p.scheduler_paused,
+                    p.scheduler_pause_reason, p.created_at,
+                    s.status, s.affinity, s.calendar_slug, s.backlog_source,
+                    s.integration_policy, s.lifecycle_reason, s.version, s.updated_at
+             FROM projects p
+             JOIN project_supervision s ON s.project_id = p.id
+             ORDER BY p.slug",
+        )?;
+        let rows = statement.query_map([], map_supervised_project)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn set_project_affinity(
+        &mut self,
+        id_or_slug: &str,
+        affinity: ProjectAffinity,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SupervisedProject> {
+        if reason.trim().is_empty() {
+            bail!("changing project affinity requires a reason");
+        }
+        let project = self.supervised_project(id_or_slug)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE project_supervision SET affinity = ?2, lifecycle_reason = ?3,
+             version = version + 1, updated_at = ?4 WHERE project_id = ?1",
+            params![
+                project.project.id,
+                affinity.to_string(),
+                reason,
+                now.to_rfc3339()
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&project.project.id),
+            None,
+            None,
+            "project.affinity_changed",
+            "user",
+            &serde_json::json!({"affinity": affinity, "reason": reason}),
+        )?;
+        tx.commit()?;
+        self.supervised_project(&project.project.id)
+    }
+
+    pub fn transition_supervised_project(
+        &mut self,
+        id_or_slug: &str,
+        target: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SupervisedProject> {
+        if reason.trim().is_empty() {
+            bail!("project lifecycle change requires a reason");
+        }
+        let project = self.supervised_project(id_or_slug)?;
+        let allowed = matches!(
+            (project.status.as_str(), target),
+            ("registered" | "stopped" | "paused" | "blocked", "active")
+                | ("active", "paused")
+                | ("active" | "paused" | "blocked", "stopped")
+                | (
+                    "registered" | "paused" | "stopped" | "completed",
+                    "archived"
+                )
+                | ("active", "blocked")
+                | ("active" | "paused" | "stopped", "completed")
+        );
+        if !allowed && project.status != target {
+            bail!("illegal project transition: {} -> {target}", project.status);
+        }
+        let scheduler_paused = !matches!(target, "active");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE project_supervision SET status = ?2, lifecycle_reason = ?3,
+             version = version + 1, updated_at = ?4 WHERE project_id = ?1",
+            params![project.project.id, target, reason, now.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE projects SET scheduler_paused = ?2, scheduler_pause_reason = ?3,
+             version = version + 1, updated_at = ?4 WHERE id = ?1",
+            params![
+                project.project.id,
+                scheduler_paused,
+                scheduler_paused.then_some(reason),
+                now.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&project.project.id),
+            None,
+            None,
+            "project.lifecycle_changed",
+            "user",
+            &serde_json::json!({
+                "from": project.status,
+                "to": target,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        self.supervised_project(&project.project.id)
+    }
+
+    pub fn add_objective(
+        &mut self,
+        project_id_or_slug: &str,
+        title: &str,
+        goal: &str,
+        acceptance: &[String],
+        priority: i64,
+        now: DateTime<Utc>,
+    ) -> Result<Objective> {
+        if title.trim().is_empty() || goal.trim().is_empty() {
+            bail!("objective title and goal are required");
+        }
+        if acceptance.is_empty() || acceptance.iter().any(|value| value.trim().is_empty()) {
+            bail!("objective requires at least one non-empty acceptance criterion");
+        }
+        let project = self.supervised_project(project_id_or_slug)?;
+        if project.status == "archived" {
+            bail!("cannot add an objective to an archived project");
+        }
+        let id = Ulid::new().to_string();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO objectives(
+                id, project_id, title, goal, acceptance_json, priority,
+                status, source, version, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', 'local', 1, ?7, ?7)",
+            params![
+                id,
+                project.project.id,
+                title,
+                goal,
+                to_json(acceptance)?,
+                priority,
+                now.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&project.project.id),
+            None,
+            None,
+            "objective.created",
+            "user",
+            &serde_json::json!({"objective_id": id, "title": title}),
+        )?;
+        tx.commit()?;
+        self.objective(&id)
+    }
+
+    pub fn link_objective_task(
+        &mut self,
+        objective_id: &str,
+        task_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Objective> {
+        let objective = self.objective(objective_id)?;
+        let task = self.task(task_id)?;
+        if objective.project_id != task.project_id {
+            bail!("objective and internal task belong to different projects");
+        }
+        self.conn.execute(
+            "INSERT INTO objective_tasks(objective_id, task_id, role, created_at)
+             VALUES (?1, ?2, 'implementer', ?3)",
+            params![objective.id, task.id, now.to_rfc3339()],
+        )?;
+        self.objective(&objective.id)
+    }
+
+    pub fn objective(&self, id: &str) -> Result<Objective> {
+        self.conn
+            .query_row(
+                "SELECT o.id, o.project_id, o.title, o.goal, o.acceptance_json,
+                        o.priority, o.status, o.source,
+                        (SELECT ot.task_id FROM objective_tasks ot
+                         WHERE ot.objective_id = o.id ORDER BY ot.created_at LIMIT 1),
+                        o.version, o.created_at, o.updated_at
+                 FROM objectives o WHERE o.id = ?1",
+                [id],
+                map_objective,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("objective not found: {id}"))
+    }
+
+    pub fn list_objectives(&self, project: Option<&str>) -> Result<Vec<Objective>> {
+        let project_id = project
+            .map(|value| self.project(value).map(|project| project.id))
+            .transpose()?;
+        let sql = "SELECT o.id, o.project_id, o.title, o.goal, o.acceptance_json,
+                          o.priority, o.status, o.source,
+                          (SELECT ot.task_id FROM objective_tasks ot
+                           WHERE ot.objective_id = o.id ORDER BY ot.created_at LIMIT 1),
+                          o.version, o.created_at, o.updated_at
+                   FROM objectives o";
+        let mut result = Vec::new();
+        if let Some(project_id) = project_id {
+            let mut statement = self.conn.prepare(&format!(
+                "{sql} WHERE o.project_id = ?1
+                 ORDER BY o.priority DESC, o.created_at, o.id"
+            ))?;
+            let rows = statement.query_map([project_id], map_objective)?;
+            for row in rows {
+                result.push(row?);
+            }
+        } else {
+            let mut statement = self.conn.prepare(&format!(
+                "{sql} ORDER BY o.priority DESC, o.created_at, o.id"
+            ))?;
+            let rows = statement.query_map([], map_objective)?;
+            for row in rows {
+                result.push(row?);
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn set_objective_status(
+        &mut self,
+        id: &str,
+        status: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Objective> {
+        let objective = self.objective(id)?;
+        let allowed = matches!(
+            (objective.status.as_str(), status),
+            ("ready", "running" | "cancelled")
+                | ("running", "blocked" | "review" | "cancelled")
+                | ("blocked", "ready" | "running" | "cancelled")
+                | ("review", "completed" | "cancelled")
+        );
+        if !allowed && objective.status != status {
+            bail!(
+                "illegal objective transition: {} -> {status}",
+                objective.status
+            );
+        }
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE objectives SET status = ?2, version = version + 1,
+             updated_at = ?3 WHERE id = ?1",
+            params![objective.id, status, now.to_rfc3339()],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&objective.project_id),
+            objective.task_id.as_deref(),
+            None,
+            "objective.status_changed",
+            "control_plane",
+            &serde_json::json!({
+                "objective_id": objective.id,
+                "from": objective.status,
+                "to": status,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        self.objective(&objective.id)
+    }
+
+    pub fn set_setting(
+        &mut self,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        path: &str,
+        value: &serde_json::Value,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<SettingExplanation> {
+        if path.trim().is_empty() || reason.trim().is_empty() {
+            bail!("setting path and reason are required");
+        }
+        let tx = self.conn.transaction()?;
+        append_setting_revision_tx(&tx, scope_kind, scope_id, path, value, "user", reason, now)?;
+        tx.commit()?;
+        self.explain_setting(scope_kind, scope_id, path)
+    }
+
+    pub fn explain_setting(
+        &self,
+        scope_kind: &str,
+        scope_id: Option<&str>,
+        path: &str,
+    ) -> Result<SettingExplanation> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, value_json, source
+             FROM setting_revisions
+             WHERE scope_kind = ?1 AND scope_id IS ?2 AND path = ?3
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )?;
+        let row: Option<(String, String, String)> = statement
+            .query_row(params![scope_kind, scope_id, path], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .optional()?;
+        let (revision_id, value_json, source) =
+            row.ok_or_else(|| anyhow!("setting not found: {path}"))?;
+        Ok(SettingExplanation {
+            path: path.into(),
+            effective_value: parse_json(value_json)?,
+            source,
+            revision_id: Some(revision_id),
+            scope: match scope_id {
+                Some(id) => format!("{scope_kind}:{id}"),
+                None => scope_kind.into(),
+            },
+            restart_required: path.starts_with("service."),
+            reschedule_required: path.starts_with("calendar.") || path.starts_with("routing."),
+        })
+    }
+
+    pub fn supervisor_agent_profiles(&self) -> Result<Vec<serde_json::Value>> {
+        let mut statement = self.conn.prepare(
+            "SELECT name, kind, adapter, provider, account, mode, priority, enabled
+             FROM supervisor_agent_profiles ORDER BY priority DESC, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(serde_json::json!({
+                "name": row.get::<_, String>(0)?,
+                "kind": row.get::<_, String>(1)?,
+                "adapter": row.get::<_, String>(2)?,
+                "provider": row.get::<_, String>(3)?,
+                "account": row.get::<_, String>(4)?,
+                "mode": row.get::<_, String>(5)?,
+                "priority": row.get::<_, i64>(6)?,
+                "enabled": row.get::<_, bool>(7)?,
+            }))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn supervisor_agent_profile(&self, name: &str) -> Result<serde_json::Value> {
+        self.supervisor_agent_profiles()?
+            .into_iter()
+            .find(|profile| profile["name"] == name)
+            .ok_or_else(|| anyhow!("agent profile not found: {name}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_supervisor_handoff(
+        &mut self,
+        project_id: &str,
+        objective_id: &str,
+        task_id: &str,
+        from_agent: &str,
+        to_agent: &str,
+        reason_code: &str,
+        now: DateTime<Utc>,
+    ) -> Result<String> {
+        let id = Ulid::new().to_string();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO supervisor_handoffs(
+                id, project_id, objective_id, task_id, from_agent,
+                to_agent, reason_code, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                project_id,
+                objective_id,
+                task_id,
+                from_agent,
+                to_agent,
+                reason_code,
+                now.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(project_id),
+            Some(task_id),
+            None,
+            "supervisor.handoff",
+            "control_plane",
+            &serde_json::json!({
+                "handoff_id": id,
+                "objective_id": objective_id,
+                "from_agent": from_agent,
+                "to_agent": to_agent,
+                "reason_code": reason_code,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_review_result(
+        &mut self,
+        project_id: &str,
+        objective_id: &str,
+        task_id: &str,
+        run_id: &str,
+        adapter: &str,
+        base_commit: &str,
+        patch_path: &str,
+        manifest_path: &str,
+        verification_path: &str,
+        handoff_path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ReviewResult> {
+        let id = Ulid::new().to_string();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO review_results(
+                id, project_id, objective_id, task_id, run_id, status, adapter,
+                base_commit, patch_path, manifest_path, verification_path,
+                handoff_path, cleanup_status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8, ?9,
+                       ?10, ?11, 'pending', ?12, ?12)",
+            params![
+                id,
+                project_id,
+                objective_id,
+                task_id,
+                run_id,
+                adapter,
+                base_commit,
+                patch_path,
+                manifest_path,
+                verification_path,
+                handoff_path,
+                now.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(project_id),
+            Some(task_id),
+            Some(run_id),
+            "review_result.created",
+            "control_plane",
+            &serde_json::json!({"review_result_id": id, "objective_id": objective_id}),
+        )?;
+        tx.commit()?;
+        self.review_result(&id)
+    }
+
+    pub fn review_result(&self, id: &str) -> Result<ReviewResult> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, objective_id, task_id, run_id, status,
+                        adapter, base_commit, patch_path, manifest_path,
+                        verification_path, handoff_path, cleanup_status,
+                        created_at, updated_at
+                 FROM review_results WHERE id = ?1",
+                [id],
+                map_review_result,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("review result not found: {id}"))
+    }
+
+    pub fn review_results(&self, project: Option<&str>) -> Result<Vec<ReviewResult>> {
+        let project_id = project
+            .map(|value| self.project(value).map(|project| project.id))
+            .transpose()?;
+        let base = "SELECT id, project_id, objective_id, task_id, run_id, status,
+                           adapter, base_commit, patch_path, manifest_path,
+                           verification_path, handoff_path, cleanup_status,
+                           created_at, updated_at
+                    FROM review_results";
+        let mut values = Vec::new();
+        if let Some(project_id) = project_id {
+            let mut statement = self.conn.prepare(&format!(
+                "{base} WHERE project_id = ?1 ORDER BY created_at DESC, id DESC"
+            ))?;
+            let rows = statement.query_map([project_id], map_review_result)?;
+            for row in rows {
+                values.push(row?);
+            }
+        } else {
+            let mut statement = self
+                .conn
+                .prepare(&format!("{base} ORDER BY created_at DESC, id DESC"))?;
+            let rows = statement.query_map([], map_review_result)?;
+            for row in rows {
+                values.push(row?);
+            }
+        }
+        Ok(values)
+    }
+
+    pub fn set_review_result_status(
+        &mut self,
+        id: &str,
+        status: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ReviewResult> {
+        if !matches!(status, "applied" | "discarded" | "conflicted") {
+            bail!("review result status must be applied, discarded, or conflicted");
+        }
+        let result = self.review_result(id)?;
+        if result.status != "pending" {
+            bail!("review result is already {}", result.status);
+        }
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE review_results SET status = ?2, updated_at = ?3
+             WHERE id = ?1 AND status = 'pending'",
+            params![id, status, now.to_rfc3339()],
+        )?;
+        if changed != 1 {
+            bail!("review result changed concurrently");
+        }
+        append_event_tx(
+            &tx,
+            Some(&result.project_id),
+            Some(&result.task_id),
+            Some(&result.run_id),
+            "review_result.disposition",
+            "user",
+            &serde_json::json!({
+                "review_result_id": id,
+                "status": status,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        self.review_result(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_cleanup_record(
+        &mut self,
+        project_id: &str,
+        objective_id: &str,
+        run_id: &str,
+        implementation_worktree: &str,
+        verifier_worktree: &str,
+        branch: &str,
+        now: DateTime<Utc>,
+    ) -> Result<CleanupRecord> {
+        let id = Ulid::new().to_string();
+        self.conn.execute(
+            "INSERT INTO cleanup_records(
+                id, project_id, objective_id, run_id, implementation_worktree,
+                verifier_worktree, branch, status, detail, created_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending',
+                       'awaiting owned resource cleanup', ?8, NULL)",
+            params![
+                id,
+                project_id,
+                objective_id,
+                run_id,
+                implementation_worktree,
+                verifier_worktree,
+                branch,
+                now.to_rfc3339(),
+            ],
+        )?;
+        self.cleanup_record(&id)
+    }
+
+    pub fn finish_cleanup_record(
+        &mut self,
+        id: &str,
+        status: &str,
+        detail: &str,
+        now: DateTime<Utc>,
+    ) -> Result<CleanupRecord> {
+        if !matches!(status, "complete" | "quarantined") {
+            bail!("cleanup terminal status must be complete or quarantined");
+        }
+        let cleanup = self.cleanup_record(id)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE cleanup_records SET status = ?2, detail = ?3, completed_at = ?4
+             WHERE id = ?1 AND status = 'pending'",
+            params![id, status, detail, now.to_rfc3339()],
+        )?;
+        tx.execute(
+            "UPDATE review_results SET cleanup_status = ?2, updated_at = ?3
+             WHERE run_id = ?1",
+            params![cleanup.run_id, status, now.to_rfc3339()],
+        )?;
+        append_event_tx(
+            &tx,
+            Some(&cleanup.project_id),
+            None,
+            Some(&cleanup.run_id),
+            "cleanup.finished",
+            "control_plane",
+            &serde_json::json!({"cleanup_id": id, "status": status, "detail": detail}),
+        )?;
+        tx.commit()?;
+        self.cleanup_record(id)
+    }
+
+    pub fn cleanup_record(&self, id: &str) -> Result<CleanupRecord> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, objective_id, run_id,
+                        implementation_worktree, verifier_worktree, branch,
+                        status, detail, created_at, completed_at
+                 FROM cleanup_records WHERE id = ?1",
+                [id],
+                map_cleanup_record,
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("cleanup record not found: {id}"))
+    }
+
+    pub fn cleanup_records(&self, project: Option<&str>) -> Result<Vec<CleanupRecord>> {
+        let project_id = project
+            .map(|value| self.project(value).map(|project| project.id))
+            .transpose()?;
+        let base = "SELECT id, project_id, objective_id, run_id,
+                           implementation_worktree, verifier_worktree, branch,
+                           status, detail, created_at, completed_at
+                    FROM cleanup_records";
+        let mut values = Vec::new();
+        if let Some(project_id) = project_id {
+            let mut statement = self.conn.prepare(&format!(
+                "{base} WHERE project_id = ?1 ORDER BY created_at DESC, id DESC"
+            ))?;
+            let rows = statement.query_map([project_id], map_cleanup_record)?;
+            for row in rows {
+                values.push(row?);
+            }
+        } else {
+            let mut statement = self
+                .conn
+                .prepare(&format!("{base} ORDER BY created_at DESC, id DESC"))?;
+            let rows = statement.query_map([], map_cleanup_record)?;
+            for row in rows {
+                values.push(row?);
+            }
+        }
+        Ok(values)
+    }
+
+    pub fn record_supervisor_cycle(
+        &mut self,
+        cycle: &crate::domain::SupervisorCycle,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO supervisor_cycles(
+                id, evaluated_at, project_id, objective_id, task_id,
+                selected_agent, previous_agent, action, reason_code,
+                review_result_id, next_wake_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                Ulid::new().to_string(),
+                cycle.evaluated_at.to_rfc3339(),
+                cycle.project_id,
+                cycle.objective_id,
+                cycle.task_id,
+                cycle.selected_agent,
+                cycle.previous_agent,
+                cycle.action,
+                cycle.reason_code,
+                cycle.review_result_id,
+                cycle.next_wake_at.map(|value| value.to_rfc3339()),
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn record_agent_capability_probe(&mut self, probe: &AgentCapabilityProbe) -> Result<()> {
@@ -760,6 +1484,57 @@ impl Database {
                 updated_at = excluded.updated_at",
             params![id, slug, timezone, weekly_pattern, now.to_rfc3339()],
         )?;
+        let (profile_id, version): (String, i64) = tx.query_row(
+            "SELECT id, version FROM calendar_profiles WHERE slug = ?1",
+            [slug],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT id FROM calendar_profile_revisions
+                 WHERE profile_id = ?1 ORDER BY version DESC LIMIT 1",
+                [&profile_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        tx.execute(
+            "INSERT INTO calendar_profile_revisions(
+                id, profile_id, version, timezone, weekly_pattern, source,
+                reason, supersedes_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'user',
+                       'calendar configured', ?6, ?7)",
+            params![
+                Ulid::new().to_string(),
+                profile_id,
+                version,
+                timezone,
+                weekly_pattern,
+                previous,
+                now.to_rfc3339(),
+            ],
+        )?;
+        if slug == "default" {
+            append_setting_revision_tx(
+                &tx,
+                "global",
+                None,
+                "calendar.default.pattern",
+                &serde_json::json!(weekly_pattern),
+                "user",
+                "calendar configured",
+                now,
+            )?;
+            append_setting_revision_tx(
+                &tx,
+                "global",
+                None,
+                "calendar.default.timezone",
+                &serde_json::json!(timezone),
+                "user",
+                "calendar configured",
+                now,
+            )?;
+        }
         append_event_tx(
             &tx,
             None,
@@ -790,6 +1565,16 @@ impl Database {
             .ok_or_else(|| anyhow!("calendar not found: {id_or_slug}"))
     }
 
+    pub fn calendars(&self) -> Result<Vec<CalendarProfile>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, slug, timezone, weekly_pattern, version, created_at, updated_at
+             FROM calendar_profiles ORDER BY slug",
+        )?;
+        let rows = statement.query_map([], map_calendar)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn assign_project_calendar(
         &mut self,
         project_id_or_slug: &str,
@@ -805,6 +1590,11 @@ impl Database {
         if changed != 1 {
             bail!("project calendar assignment failed");
         }
+        self.conn.execute(
+            "UPDATE project_supervision SET calendar_slug = ?2,
+             version = version + 1, updated_at = ?3 WHERE project_id = ?1",
+            params![project.id, calendar.slug, Utc::now().to_rfc3339()],
+        )?;
         Ok(calendar)
     }
 
@@ -836,21 +1626,52 @@ impl Database {
         let calendar = self.calendar(calendar_id_or_slug)?;
         let now = Utc::now();
         let tx = self.conn.transaction()?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT id FROM calendar_exception_revisions
+                 WHERE profile_id = ?1 AND local_date = ?2
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![calendar.id, local_date.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
         tx.execute(
-            "INSERT INTO calendar_exceptions(profile_id, local_date, day_kind, reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(profile_id, local_date) DO UPDATE SET
-                day_kind = excluded.day_kind,
-                reason = excluded.reason,
-                created_at = excluded.created_at",
+            "INSERT INTO calendar_exception_revisions(
+                id, profile_id, local_date, day_kind, active, reason,
+                supersedes_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
             params![
+                Ulid::new().to_string(),
                 calendar.id,
                 local_date.to_string(),
                 day_kind.to_string(),
                 reason,
+                previous,
                 now.to_rfc3339(),
             ],
         )?;
+        if day_kind == DayKind::Both {
+            tx.execute(
+                "DELETE FROM calendar_exceptions WHERE profile_id = ?1 AND local_date = ?2",
+                params![calendar.id, local_date.to_string()],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO calendar_exceptions(profile_id, local_date, day_kind, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(profile_id, local_date) DO UPDATE SET
+                    day_kind = excluded.day_kind,
+                    reason = excluded.reason,
+                    created_at = excluded.created_at",
+                params![
+                    calendar.id,
+                    local_date.to_string(),
+                    day_kind.to_string(),
+                    reason,
+                    now.to_rfc3339(),
+                ],
+            )?;
+        }
         append_event_tx(
             &tx,
             None,
@@ -875,10 +1696,86 @@ impl Database {
         })
     }
 
+    pub fn remove_calendar_exception(
+        &mut self,
+        calendar_id_or_slug: &str,
+        local_date: chrono::NaiveDate,
+        reason: &str,
+    ) -> Result<serde_json::Value> {
+        if reason.trim().is_empty() {
+            bail!("calendar exception removal reason is required");
+        }
+        let calendar = self.calendar(calendar_id_or_slug)?;
+        let current: Option<(String, String, bool)> = self
+            .conn
+            .query_row(
+                "SELECT id, day_kind, active FROM calendar_exception_revisions
+                 WHERE profile_id = ?1 AND local_date = ?2
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![calendar.id, local_date.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let (previous, day_kind, active) =
+            current.ok_or_else(|| anyhow!("calendar exception not found for {local_date}"))?;
+        if !active {
+            bail!("calendar exception is already removed for {local_date}");
+        }
+        let now = Utc::now();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO calendar_exception_revisions(
+                id, profile_id, local_date, day_kind, active, reason,
+                supersedes_id, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+            params![
+                Ulid::new().to_string(),
+                calendar.id,
+                local_date.to_string(),
+                day_kind,
+                reason,
+                previous,
+                now.to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM calendar_exceptions WHERE profile_id = ?1 AND local_date = ?2",
+            params![calendar.id, local_date.to_string()],
+        )?;
+        append_event_tx(
+            &tx,
+            None,
+            None,
+            None,
+            "calendar.exception_removed",
+            "user",
+            &serde_json::json!({
+                "calendar_id": calendar.id,
+                "local_date": local_date,
+                "reason": reason,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(serde_json::json!({
+            "calendar": calendar.slug,
+            "local_date": local_date,
+            "status": "removed",
+            "reason": reason,
+        }))
+    }
+
     pub fn calendar_exceptions(&self, profile_id: &str) -> Result<Vec<CalendarException>> {
         let mut stmt = self.conn.prepare(
             "SELECT profile_id, local_date, day_kind, reason, created_at
-             FROM calendar_exceptions WHERE profile_id = ?1 ORDER BY local_date",
+             FROM calendar_exception_revisions current
+             WHERE profile_id = ?1 AND active = 1
+               AND id = (
+                   SELECT latest.id FROM calendar_exception_revisions latest
+                   WHERE latest.profile_id = current.profile_id
+                     AND latest.local_date = current.local_date
+                   ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
+               )
+             ORDER BY local_date",
         )?;
         let rows = stmt.query_map([profile_id], |row| {
             let date: String = row.get(1)?;
@@ -2110,6 +3007,12 @@ impl Database {
                 now.to_rfc3339(),
             ],
         )?;
+        let surface_id: String = tx.query_row(
+            "SELECT id FROM quota_surfaces
+             WHERE provider = ?1 AND account = ?2 AND surface_key = ?3",
+            params![provider, account, surface],
+            |row| row.get(0),
+        )?;
         tx.execute(
             "INSERT INTO quota_observations(
                 id, surface_id, observed_remaining_percent, reserve_percent, reset_at,
@@ -2119,7 +3022,7 @@ impl Database {
                        'manual-v1', NULL, NULL)",
             params![
                 Ulid::new().to_string(),
-                id,
+                surface_id,
                 remaining_percent,
                 reserve_percent,
                 reset_at.map(|v| v.to_rfc3339()),
@@ -2224,6 +3127,16 @@ impl Database {
                     observation.payload_sha256,
                 ],
             )?;
+            let canonical_surface_id: String = tx.query_row(
+                "SELECT id FROM quota_surfaces
+                 WHERE provider = ?1 AND account = ?2 AND surface_key = ?3",
+                params![
+                    observation.provider,
+                    observation.account,
+                    observation.surface
+                ],
+                |row| row.get(0),
+            )?;
             tx.execute(
                 "INSERT INTO quota_observations(
                     id, surface_id, observed_remaining_percent, reserve_percent, reset_at,
@@ -2232,7 +3145,7 @@ impl Database {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     Ulid::new().to_string(),
-                    surface_id,
+                    canonical_surface_id,
                     observation.remaining_percent,
                     observation.reserve_percent,
                     observation.reset_at.map(|value| value.to_rfc3339()),
@@ -5459,7 +6372,7 @@ fn release_scheduler_claims_for_instance_tx(
     Ok(claims.into_iter().map(|(_, task_id)| task_id).collect())
 }
 
-fn to_json<T: Serialize>(value: &T) -> Result<String> {
+fn to_json<T: Serialize + ?Sized>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(Into::into)
 }
 
@@ -5494,6 +6407,89 @@ fn map_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         scheduler_paused: row.get(4)?,
         scheduler_pause_reason: row.get(5)?,
         created_at: parse_time(row.get(6)?)?,
+    })
+}
+
+fn map_supervised_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<SupervisedProject> {
+    let affinity: String = row.get(8)?;
+    Ok(SupervisedProject {
+        project: Project {
+            id: row.get(0)?,
+            slug: row.get(1)?,
+            title: row.get(2)?,
+            root_path: row.get(3)?,
+            scheduler_paused: row.get(4)?,
+            scheduler_pause_reason: row.get(5)?,
+            created_at: parse_time(row.get(6)?)?,
+        },
+        status: row.get(7)?,
+        affinity: ProjectAffinity::from_str(&affinity).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                affinity.len(),
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        calendar: row.get(9)?,
+        backlog_source: row.get(10)?,
+        integration_policy: row.get(11)?,
+        lifecycle_reason: row.get(12)?,
+        version: row.get(13)?,
+        updated_at: parse_time(row.get(14)?)?,
+    })
+}
+
+fn map_objective(row: &rusqlite::Row<'_>) -> rusqlite::Result<Objective> {
+    Ok(Objective {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        title: row.get(2)?,
+        goal: row.get(3)?,
+        acceptance: parse_json(row.get(4)?)?,
+        priority: row.get(5)?,
+        status: row.get(6)?,
+        source: row.get(7)?,
+        task_id: row.get(8)?,
+        version: row.get(9)?,
+        created_at: parse_time(row.get(10)?)?,
+        updated_at: parse_time(row.get(11)?)?,
+    })
+}
+
+fn map_review_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewResult> {
+    Ok(ReviewResult {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        objective_id: row.get(2)?,
+        task_id: row.get(3)?,
+        run_id: row.get(4)?,
+        status: row.get(5)?,
+        adapter: row.get(6)?,
+        base_commit: row.get(7)?,
+        patch_path: row.get(8)?,
+        manifest_path: row.get(9)?,
+        verification_path: row.get(10)?,
+        handoff_path: row.get(11)?,
+        cleanup_status: row.get(12)?,
+        created_at: parse_time(row.get(13)?)?,
+        updated_at: parse_time(row.get(14)?)?,
+    })
+}
+
+fn map_cleanup_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanupRecord> {
+    let completed_at: Option<String> = row.get(10)?;
+    Ok(CleanupRecord {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        objective_id: row.get(2)?,
+        run_id: row.get(3)?,
+        implementation_worktree: row.get(4)?,
+        verifier_worktree: row.get(5)?,
+        branch: row.get(6)?,
+        status: row.get(7)?,
+        detail: row.get(8)?,
+        created_at: parse_time(row.get(9)?)?,
+        completed_at: completed_at.map(parse_time).transpose()?,
     })
 }
 
@@ -6741,6 +7737,54 @@ fn append_event_tx<T: Serialize>(
     Ok(id)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_setting_revision_tx(
+    tx: &Transaction<'_>,
+    scope_kind: &str,
+    scope_id: Option<&str>,
+    path: &str,
+    value: &serde_json::Value,
+    source: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    if !matches!(scope_kind, "global" | "project" | "agent") {
+        bail!("setting scope must be global, project, or agent");
+    }
+    if scope_kind == "global" && scope_id.is_some() || scope_kind != "global" && scope_id.is_none()
+    {
+        bail!("setting scope identity does not match its kind");
+    }
+    let previous: Option<String> = tx
+        .query_row(
+            "SELECT id FROM setting_revisions
+             WHERE scope_kind = ?1 AND scope_id IS ?2 AND path = ?3
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+            params![scope_kind, scope_id, path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let id = Ulid::new().to_string();
+    tx.execute(
+        "INSERT INTO setting_revisions(
+            id, scope_kind, scope_id, path, value_json, source, reason,
+            supersedes_id, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            id,
+            scope_kind,
+            scope_id,
+            path,
+            to_json(value)?,
+            source,
+            reason,
+            previous,
+            now.to_rfc3339(),
+        ],
+    )?;
+    Ok(id)
+}
+
 const MIGRATION_1: &str = r#"
 CREATE TABLE projects (
     id TEXT PRIMARY KEY,
@@ -7461,6 +8505,264 @@ CREATE INDEX idx_mcp_server_revisions_latest
     ON mcp_server_revisions(project_id, name, created_at DESC, id DESC);
 "#;
 
+const MIGRATION_21: &str = r#"
+CREATE TABLE calendar_profile_revisions (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL REFERENCES calendar_profiles(id),
+    version INTEGER NOT NULL CHECK(version > 0),
+    timezone TEXT NOT NULL,
+    weekly_pattern TEXT NOT NULL CHECK(length(weekly_pattern) = 7),
+    source TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    supersedes_id TEXT REFERENCES calendar_profile_revisions(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(profile_id, version)
+);
+
+INSERT INTO calendar_profile_revisions(
+    id, profile_id, version, timezone, weekly_pattern, source, reason,
+    supersedes_id, created_at
+)
+SELECT id || ':v' || version, id, version, timezone, weekly_pattern,
+       'schema20_migration', 'preserve existing calendar without reinterpretation',
+       NULL, updated_at
+FROM calendar_profiles;
+
+CREATE TABLE calendar_exception_revisions (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL REFERENCES calendar_profiles(id),
+    local_date TEXT NOT NULL,
+    day_kind TEXT NOT NULL CHECK(day_kind IN ('W', 'O', 'B')),
+    active INTEGER NOT NULL CHECK(active IN (0, 1)),
+    reason TEXT NOT NULL,
+    supersedes_id TEXT REFERENCES calendar_exception_revisions(id),
+    created_at TEXT NOT NULL
+);
+
+INSERT INTO calendar_exception_revisions(
+    id, profile_id, local_date, day_kind, active, reason, supersedes_id, created_at
+)
+SELECT profile_id || ':' || local_date || ':v1', profile_id, local_date,
+       day_kind, 1, reason, NULL, created_at
+FROM calendar_exceptions;
+
+CREATE INDEX idx_calendar_exception_revisions_latest
+    ON calendar_exception_revisions(profile_id, local_date, created_at DESC, id DESC);
+
+CREATE TABLE project_supervision (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN (
+        'registered', 'active', 'pausing', 'paused', 'stopping', 'stopped',
+        'blocked', 'completed', 'archived'
+    )),
+    affinity TEXT NOT NULL CHECK(affinity IN ('work', 'non_work', 'both')),
+    calendar_slug TEXT NOT NULL,
+    backlog_source TEXT NOT NULL CHECK(backlog_source IN ('local', 'legacy_task')),
+    integration_policy TEXT NOT NULL CHECK(integration_policy IN ('review')),
+    lifecycle_reason TEXT,
+    version INTEGER NOT NULL CHECK(version > 0),
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO project_supervision(
+    project_id, status, affinity, calendar_slug, backlog_source,
+    integration_policy, lifecycle_reason, version, updated_at
+)
+SELECT p.id,
+       CASE WHEN p.scheduler_paused = 1 THEN 'paused' ELSE 'stopped' END,
+       CASE
+           WHEN EXISTS(SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.day_affinity = 'W')
+            AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.day_affinity = 'O')
+               THEN 'work'
+           WHEN EXISTS(SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.day_affinity = 'O')
+            AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.project_id = p.id AND t.day_affinity = 'W')
+               THEN 'non_work'
+           ELSE 'both'
+       END,
+       COALESCE((SELECT c.slug FROM calendar_profiles c WHERE c.id = p.calendar_profile_id), 'default'),
+       CASE WHEN EXISTS(SELECT 1 FROM tasks t WHERE t.project_id = p.id)
+            THEN 'legacy_task' ELSE 'local' END,
+       'review',
+       'schema-21 migration leaves projects inert until explicitly started',
+       1, p.updated_at
+FROM projects p;
+
+CREATE TABLE objectives (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 300),
+    goal TEXT NOT NULL CHECK(length(goal) BETWEEN 1 AND 4000),
+    acceptance_json TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN (
+        'proposed', 'ready', 'running', 'blocked', 'review',
+        'completed', 'cancelled', 'superseded'
+    )),
+    source TEXT NOT NULL CHECK(source IN ('local', 'legacy_task')),
+    version INTEGER NOT NULL CHECK(version > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE objective_tasks (
+    objective_id TEXT NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+    role TEXT NOT NULL CHECK(role IN ('implementer')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(objective_id, task_id)
+);
+
+INSERT INTO objectives(
+    id, project_id, title, goal, acceptance_json, priority, status,
+    source, version, created_at, updated_at
+)
+SELECT 'legacy-objective-' || t.id, t.project_id, t.title, t.goal,
+       t.acceptance_json, t.priority,
+       CASE t.status
+           WHEN 'review' THEN 'review'
+           WHEN 'completed' THEN 'completed'
+           WHEN 'cancelled' THEN 'cancelled'
+           WHEN 'superseded' THEN 'superseded'
+           WHEN 'failed' THEN 'blocked'
+           WHEN 'blocked' THEN 'blocked'
+           WHEN 'paused' THEN 'blocked'
+           WHEN 'draft' THEN 'ready'
+           WHEN 'ready' THEN 'ready'
+           ELSE 'running'
+       END,
+       'legacy_task', 1, t.created_at, t.updated_at
+FROM tasks t
+WHERE t.status != 'superseded';
+
+INSERT INTO objective_tasks(objective_id, task_id, role, created_at)
+SELECT 'legacy-objective-' || t.id, t.id, 'implementer', t.created_at
+FROM tasks t
+WHERE t.status != 'superseded';
+
+CREATE INDEX idx_objectives_project_status
+    ON objectives(project_id, status, priority DESC, created_at, id);
+
+CREATE TABLE setting_revisions (
+    id TEXT PRIMARY KEY,
+    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('global', 'project', 'agent')),
+    scope_id TEXT,
+    path TEXT NOT NULL CHECK(length(path) BETWEEN 1 AND 300),
+    value_json TEXT NOT NULL,
+    source TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    supersedes_id TEXT REFERENCES setting_revisions(id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_setting_revisions_latest
+    ON setting_revisions(scope_kind, scope_id, path, created_at DESC, id DESC);
+
+INSERT INTO setting_revisions(
+    id, scope_kind, scope_id, path, value_json, source, reason,
+    supersedes_id, created_at
+)
+SELECT 'builtin-calendar-pattern', 'global', NULL, 'calendar.default.pattern',
+       json_quote(weekly_pattern), 'schema20_migration',
+       'preserve existing default calendar', NULL, updated_at
+FROM calendar_profiles WHERE slug = 'default';
+
+INSERT INTO setting_revisions(
+    id, scope_kind, scope_id, path, value_json, source, reason,
+    supersedes_id, created_at
+)
+SELECT 'builtin-calendar-timezone', 'global', NULL, 'calendar.default.timezone',
+       json_quote(timezone), 'schema20_migration',
+       'preserve existing default calendar', NULL, updated_at
+FROM calendar_profiles WHERE slug = 'default';
+
+CREATE TABLE supervisor_agent_profiles (
+    name TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('codex', 'claude')),
+    adapter TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    account TEXT NOT NULL,
+    mode TEXT NOT NULL CHECK(mode IN ('fixture')),
+    priority INTEGER NOT NULL,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1))
+);
+
+INSERT INTO supervisor_agent_profiles(
+    name, kind, adapter, provider, account, mode, priority, enabled
+) VALUES
+    ('codex-subscription', 'codex', 'fake-codex', 'fake-codex', 'subscription', 'fixture', 100, 1),
+    ('claude-subscription', 'claude', 'fake-claude', 'fake-claude', 'subscription', 'fixture', 90, 1);
+
+INSERT INTO quota_surfaces(
+    id, provider, account, surface_key, observed_remaining_percent,
+    reserve_percent, reset_at, source, unknown_reason, observed_at,
+    valid_until, confidence, collector_contract, provider_version, payload_sha256
+) VALUES
+    ('tb1:fake-codex:subscription:five_hour', 'fake-codex', 'subscription', 'five_hour',
+     90.0, 20.0, NULL, 'tb1_fixture', NULL, '1970-01-01T00:00:00Z',
+     NULL, 'user_reported', 'tb1-fixture-v1', NULL, NULL),
+    ('tb1:fake-claude:subscription:five_hour', 'fake-claude', 'subscription', 'five_hour',
+     90.0, 20.0, NULL, 'tb1_fixture', NULL, '1970-01-01T00:00:00Z',
+     NULL, 'user_reported', 'tb1-fixture-v1', NULL, NULL)
+ON CONFLICT(provider, account, surface_key) DO NOTHING;
+
+CREATE TABLE supervisor_handoffs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    objective_id TEXT NOT NULL REFERENCES objectives(id),
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    from_agent TEXT NOT NULL,
+    to_agent TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE review_results (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    objective_id TEXT NOT NULL REFERENCES objectives(id),
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+    status TEXT NOT NULL CHECK(status IN ('pending', 'applied', 'discarded', 'conflicted')),
+    adapter TEXT NOT NULL,
+    base_commit TEXT NOT NULL,
+    patch_path TEXT NOT NULL,
+    manifest_path TEXT NOT NULL,
+    verification_path TEXT NOT NULL,
+    handoff_path TEXT NOT NULL,
+    cleanup_status TEXT NOT NULL CHECK(cleanup_status IN ('pending', 'complete', 'quarantined')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE cleanup_records (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    objective_id TEXT NOT NULL REFERENCES objectives(id),
+    run_id TEXT NOT NULL REFERENCES runs(id),
+    implementation_worktree TEXT NOT NULL,
+    verifier_worktree TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'complete', 'quarantined')),
+    detail TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE supervisor_cycles (
+    id TEXT PRIMARY KEY,
+    evaluated_at TEXT NOT NULL,
+    project_id TEXT REFERENCES projects(id),
+    objective_id TEXT REFERENCES objectives(id),
+    task_id TEXT REFERENCES tasks(id),
+    selected_agent TEXT,
+    previous_agent TEXT,
+    action TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    review_result_id TEXT REFERENCES review_results(id),
+    next_wake_at TEXT
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7947,8 +9249,8 @@ mod tests {
             .unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), SCHEMA_VERSION);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         assert_eq!(migrated.list_quota_collection_attempts().unwrap().len(), 1);
         assert!(migrated.list_quota_usage_samples(10).unwrap().is_empty());
         let backup = fs::read_dir(dir.path())
@@ -7987,8 +9289,8 @@ mod tests {
         connection.pragma_update(None, "user_version", 13).unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), SCHEMA_VERSION);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         assert!(migrated.run_records_for_task("missing").unwrap().is_empty());
         let column_count: i64 = migrated
             .conn
@@ -8024,8 +9326,8 @@ mod tests {
         connection.pragma_update(None, "user_version", 14).unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 20);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         assert!(migrated.list_latest_api_budgets(None).unwrap().is_empty());
         assert!(migrated.list_api_reservations(None).unwrap().is_empty());
         assert!(migrated.list_api_spend(None).unwrap().is_empty());
@@ -8066,8 +9368,8 @@ mod tests {
         connection.pragma_update(None, "user_version", 15).unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 20);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         assert!(migrated.list_api_model_prices().unwrap().is_empty());
         let column_count: i64 = migrated
             .conn
@@ -8120,8 +9422,8 @@ mod tests {
         connection.pragma_update(None, "user_version", 16).unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 20);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         let column_count: i64 = migrated
             .conn
             .query_row(
@@ -8183,8 +9485,8 @@ mod tests {
         connection.pragma_update(None, "user_version", 17).unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 20);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         let plan_table: bool = migrated
             .conn
             .query_row(
@@ -8233,8 +9535,8 @@ mod tests {
         connection.pragma_update(None, "user_version", 18).unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 20);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         let attempt_table: bool = migrated
             .conn
             .query_row(
@@ -8269,8 +9571,8 @@ mod tests {
         connection.pragma_update(None, "user_version", 19).unwrap();
         drop(connection);
 
-        let migrated = Database::open(&database_path).unwrap();
-        assert_eq!(migrated.schema_version(), 20);
+        let migrated = Database::open_for_migration_test(&database_path, 20).unwrap();
+        assert_eq!(migrated.actual_schema_version(), 20);
         let table_exists: bool = migrated.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mcp_server_revisions')",
             [], |row| row.get(0),
@@ -8294,6 +9596,99 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(backup_version, 19);
+    }
+
+    #[test]
+    fn schema_twenty_one_migration_is_inert_backed_up_and_clean_install_equivalent() {
+        let upgraded_dir = tempdir().unwrap();
+        let upgraded_path = upgraded_dir.path().join("state.db");
+        let legacy = Database::open_for_migration_test(&upgraded_path, 20).unwrap();
+        let now = Utc::now().to_rfc3339();
+        legacy
+            .conn
+            .execute(
+                "INSERT INTO projects(
+                    id, slug, title, root_path, created_at, updated_at, version,
+                    scheduler_paused, scheduler_pause_reason
+                 ) VALUES ('legacy-active', 'legacy-active', 'Legacy active',
+                           '/fixture/legacy-active', ?1, ?1, 1, 0, NULL)",
+                [&now],
+            )
+            .unwrap();
+        legacy
+            .conn
+            .execute(
+                "INSERT INTO projects(
+                    id, slug, title, root_path, created_at, updated_at, version,
+                    scheduler_paused, scheduler_pause_reason
+                 ) VALUES ('legacy-paused', 'legacy-paused', 'Legacy paused',
+                           '/fixture/legacy-paused', ?1, ?1, 1, 1, 'operator pause')",
+                [&now],
+            )
+            .unwrap();
+        drop(legacy);
+
+        let upgraded = Database::open(&upgraded_path).unwrap();
+        assert_eq!(upgraded.actual_schema_version(), 21);
+        assert_eq!(
+            upgraded.supervised_project("legacy-active").unwrap().status,
+            "stopped"
+        );
+        assert_eq!(
+            upgraded.supervised_project("legacy-paused").unwrap().status,
+            "paused"
+        );
+        assert_eq!(
+            upgraded.calendar("default").unwrap().weekly_pattern,
+            "WWWWWOO"
+        );
+        assert_eq!(upgraded.supervisor_agent_profiles().unwrap().len(), 2);
+
+        let backup = fs::read_dir(upgraded_dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("v20") && name.ends_with("backup.db"))
+            })
+            .expect("schema-20 backup");
+        let backup = Connection::open(backup).unwrap();
+        assert_eq!(
+            backup
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            20
+        );
+        assert_eq!(
+            backup
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+
+        let clean_dir = tempdir().unwrap();
+        let clean = Database::open(clean_dir.path().join("state.db")).unwrap();
+        let schema_rows = |connection: &Connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT type, name, COALESCE(sql, '') FROM sqlite_schema
+                     WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(schema_rows(&upgraded.conn), schema_rows(&clean.conn));
     }
 
     #[test]

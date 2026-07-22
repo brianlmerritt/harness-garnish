@@ -8,8 +8,12 @@ pub fn validate_profile(timezone: &str, weekly_pattern: &str) -> Result<()> {
         .parse::<Tz>()
         .with_context(|| format!("unknown IANA timezone: {timezone}"))?;
     let bytes = weekly_pattern.as_bytes();
-    if bytes.len() != 7 || !bytes.iter().all(|value| matches!(value, b'W' | b'O')) {
-        bail!("weekly pattern must contain exactly seven W/O characters in Monday-Sunday order");
+    if bytes.len() != 7
+        || !bytes
+            .iter()
+            .all(|value| matches!(value, b'W' | b'O' | b'B'))
+    {
+        bail!("weekly pattern must contain exactly seven W/O/B characters in Monday-Sunday order");
     }
     Ok(())
 }
@@ -26,6 +30,7 @@ pub fn evaluate(
     let (day_kind, day_source) = resolve_day(profile, exceptions, local_date)?;
     let eligible = affinity_matches(affinity, day_kind);
     let reason_code = match (eligible, affinity, day_kind) {
+        (true, _, DayKind::Both) => "schedule.eligible_shared_day",
         (true, DayAffinity::Both, _) => "schedule.eligible_both",
         (true, DayAffinity::Work, DayKind::Work) => "schedule.eligible_workday",
         (true, DayAffinity::Off, DayKind::Off) => "schedule.eligible_off_day",
@@ -72,6 +77,7 @@ fn resolve_day(
     let day_kind = match profile.weekly_pattern.as_bytes()[index] {
         b'W' => DayKind::Work,
         b'O' => DayKind::Off,
+        b'B' => DayKind::Both,
         _ => bail!("weekly pattern contains an invalid day kind"),
     };
     Ok((day_kind, format!("weekly_pattern:{index}")))
@@ -80,7 +86,8 @@ fn resolve_day(
 fn affinity_matches(affinity: DayAffinity, day_kind: DayKind) -> bool {
     matches!(
         (affinity, day_kind),
-        (DayAffinity::Both, _)
+        (_, DayKind::Both)
+            | (DayAffinity::Both, _)
             | (DayAffinity::Work, DayKind::Work)
             | (DayAffinity::Off, DayKind::Off)
     )
@@ -192,5 +199,28 @@ mod tests {
         assert!(validate_profile("Mars/Olympus", "WWWWWOO").is_err());
         assert!(validate_profile("Etc/UTC", "WWWWWBQ").is_err());
         assert!(validate_profile("Etc/UTC", "WWWWW").is_err());
+    }
+
+    #[test]
+    fn wwwoobb_allows_each_project_on_shared_days_only_as_configured() {
+        let calendar = profile("WWWOOBB");
+        let monday = Utc.with_ymd_and_hms(2026, 7, 20, 12, 0, 0).unwrap();
+        let expected = [
+            (DayKind::Work, true, false),
+            (DayKind::Work, true, false),
+            (DayKind::Work, true, false),
+            (DayKind::Off, false, true),
+            (DayKind::Off, false, true),
+            (DayKind::Both, true, true),
+            (DayKind::Both, true, true),
+        ];
+        for (offset, (kind, work, non_work)) in expected.into_iter().enumerate() {
+            let now = monday + Duration::days(offset as i64);
+            let work_result = evaluate(&calendar, &[], DayAffinity::Work, now).unwrap();
+            let non_work_result = evaluate(&calendar, &[], DayAffinity::Off, now).unwrap();
+            assert_eq!(work_result.day_kind, kind);
+            assert_eq!(work_result.eligible, work);
+            assert_eq!(non_work_result.eligible, non_work);
+        }
     }
 }
