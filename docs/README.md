@@ -24,6 +24,8 @@ These documents contain the design baseline and phased implementation evidence. 
 | [Phase 4 live API checkpoint](phase-4-live-api-checkpoint.md) | Operator-reported one-request response and isolated-patch smoke results for OpenAI and Anthropic |
 | [Phase 4 live Codex checkpoint](phase-4-live-codex-checkpoint.md) | Codex 0.144.6 compatibility regression and passing one-task subscription patch evidence |
 | [CLI Bible](cli-bible.md) | Authoritative to-be project-supervisor product, command, settings, calendar, routing, approval, notification, secret, sandbox, lifecycle, and phased-delivery contract |
+| [CLI acceptance plan](cli-acceptance.md) | Living cross-phase operator-journey, interface, negative-case, platform, and evidence ledger for the project-supervisor CLI |
+| [CLI user acceptance](cli-user-acceptance.md) | Phase-by-phase hands-on commands, expected observations, working scope, and remaining gaps for users testing the project-supervisor CLI |
 | [Archived narrow CLI MVP boundary](archive/cli-mvp.md) | Historical implemented Codex subscription/API task-oriented compatibility boundary and evidence context; not the intended product interface |
 | [CLI MVP exit report](cli-mvp-exit-report.md) | Final source-run CLI acceptance, platform/live evidence, security boundary, and deferred release work |
 | [TB-0 CLI and JSON contract](tb0-command-contract.md) | Exact normal/advanced grammar, stable JSON/exit semantics, project review/apply, agent boundaries, and retention defaults |

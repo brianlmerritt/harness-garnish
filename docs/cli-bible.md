@@ -2,6 +2,8 @@
 
 Status: authoritative **to-be product and operator contract** under [ADR 0016](decisions/0016-project-supervisor-cli.md). This document describes the intended Harness Garnish experience and phased route from the current implementation. A capability described here is not implemented merely because it is specified. Machine evidence in the applicable acceptance plan or exit report remains mandatory before any phase is called complete.
 
+The [living CLI acceptance plan](cli-acceptance.md) tracks cross-phase operator journeys, interface obligations, current machine coverage, and remaining evidence without rewriting dated phase exit reports. The separate [CLI user acceptance guide](cli-user-acceptance.md) gives users exact phase-end commands, expected observations, and the honest boundary still to be built.
+
 The archived narrow task-oriented CLI boundary is retained at [`archive/cli-mvp.md`](archive/cli-mvp.md). Its evidence remains valid for that compatibility slice, but it does not define the intended product interface.
 
 ## 1. Product purpose
